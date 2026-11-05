@@ -1,6 +1,9 @@
 /*
  * For HakiOS: bsd/dev/sweet_mpss.c of ios-sunfish, where this chain ran on this phone started by ABL, up to pings over Wi-Fi.
- * Boot-arg mpss=1. Status: THIS FILE not yet run; through U-Boot it never has been.
+ * Boot-arg mpss=1. Status: RUN ON THE PHONE through U-Boot, iOS 16.5, 2026-11-05 (logs/054549-run.log, mpss=1 wlanprobe=8):
+ * modem up, WLFW, a scan of 34 access points, a WPA2 join asked for in Settings (4-way handshake, keys), DHCP, en0 up with an
+ * address, traffic both ways. What made it go was taking the 16 MB host pool early (hakios_mpss_sm7150_go). Not seen: DNS and
+ * internet through en0, a join after a reboot (the root is in RAM: nothing is kept), other wlanprobe levels.
  */
 /*
  * The modem (MPSS, a Hexagon DSP) of the SM7150, started through TrustZone. The Pixel 4a's Wi-Fi
