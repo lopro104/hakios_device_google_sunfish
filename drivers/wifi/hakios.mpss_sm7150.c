@@ -2,8 +2,11 @@
  * For HakiOS: bsd/dev/sweet_mpss.c of ios-sunfish, where this chain ran on this phone started by ABL, up to pings over Wi-Fi.
  * Boot-arg mpss=1. Status: RUN ON THE PHONE through U-Boot, iOS 16.5, 2026-11-05 (logs/054549-run.log, mpss=1 wlanprobe=8):
  * modem up, WLFW, a scan of 34 access points, a WPA2 join asked for in Settings (4-way handshake, keys), DHCP, en0 up with an
- * address, traffic both ways. What made it go was taking the 16 MB host pool early (hakios_mpss_sm7150_go). Not seen: DNS and
- * internet through en0, a join after a reboot (the root is in RAM: nothing is kept), other wlanprobe levels.
+ * address, traffic both ways. What made it go was taking the 16 MB host pool early (hakios_mpss_sm7150_go).
+ * 2026-11-05 later: en0 now made by drivers/net/hakios.net.c (this file is its link: transmit, input, link state), the IOKit
+ * objects by HakiosWLAN (hakios.wifi_sm7150.cpp), DHCP and the route by configd (wlan_kdhcp=1 brings back the in-kernel DHCP).
+ * Run logs/060524-run.log: link up, 22k frames / 30 MB received over en0 by the end. Not seen by me: what the user saw in
+ * Settings and Safari (asked), a join after a reboot (the root is in RAM: nothing is kept), other wlanprobe levels.
  */
 /*
  * The modem (MPSS, a Hexagon DSP) of the SM7150, started through TrustZone. The Pixel 4a's Wi-Fi
@@ -55,6 +58,7 @@ extern kern_return_t kernel_thread_start_priority(thread_continue_t, void *, int
 #include <net/if_media.h>
 #include <net/dlil.h>
 #include <sys/kern_event.h>
+#include <sys/hakios.net.h>
 #include <sys/hakios.wlan_util_sm7150.h>
 
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
@@ -4688,7 +4692,7 @@ jn_join(void)
 #define EW_FRAME_MAX    1600u
 
 static struct {
-	ifnet_t ifp;
+	bool attached;                  /* en0 was made by hakios.net.c on top of this link */
 	lck_mtx_t *lock;
 	uint8_t *txq;
 	uint16_t txq_len[EW_TXQ];
@@ -4700,29 +4704,25 @@ static struct {
 	uint8_t cur_ip[4];
 } ew;
 
-/* iokit/Kernel/arm/SweetWiFi.cpp: the IORegistry entry Apple's IO80211 library looks for */
-extern void sweet_io80211_publish(const char *ifname, const uint8_t mac[6]);
+/* iokit/Kernel/hakios.wifi_sm7150.cpp (HakiOS's HakiosWLAN): the IORegistry entries wifid and SystemConfiguration look for */
+extern void HakiosWLANStart(const char *interface, const uint8_t *address);
+static uint32_t g_kdhcp;                /* boot-arg wlan_kdhcp=1: DHCP in the kernel, as the old tree did; else configd does it */
 
-static errno_t
-ew_if_output(ifnet_t ifp, mbuf_t m)
+/* hakios_net_link.transmit: one Ethernet frame to the radio's queue; the packet stays hakios.net.c's */
+static bool
+ew_net_transmit(mbuf_t m, size_t len)
 {
-	size_t len = mbuf_pkthdr_len(m);
-
 	lck_mtx_lock(ew.lock);
 	if (!ew.up || ew.n >= EW_TXQ || len > EW_FRAME_MAX || len < 14) {
 		lck_mtx_unlock(ew.lock);
-		mbuf_freem(m);
-		ifnet_stat_increment_out(ifp, 0, 0, 1);
 		ew.tx_drop++;
-		return 0;
+		return false;
 	}
 	mbuf_copydata(m, 0, len, ew.txq + (size_t)((ew.head + ew.n) % EW_TXQ) * EW_FRAME_MAX);
 	ew.txq_len[(ew.head + ew.n) % EW_TXQ] = (uint16_t)len;
 	ew.n++;
 	lck_mtx_unlock(ew.lock);
-	ifnet_stat_increment_out(ifp, 1, (u_int32_t)len, 0);
-	mbuf_freem(m);
-	return 0;
+	return true;
 }
 
 /*
@@ -5350,118 +5350,73 @@ ew_a80211(bool set, struct sweet_a80211req *rq)
 	return err;
 }
 
-static errno_t
-ew_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
+/* what hakios.net.c passes on of en0's ioctls for a radio: Darwin's Wi-Fi side (wifid, Settings) and its requests */
+errno_t
+hakios_apple80211_ioctl(u_long command, void *data)
 {
-	switch (cmd) {
-	case SWEET_SIOCSA80211:
-	case SWEET_SIOCGA80211:
-		return ew_a80211(cmd == SWEET_SIOCSA80211, (struct sweet_a80211req *)data);
-	case SIOCGIFMEDIA32:
-	case SIOCGIFMEDIA64: {
-		struct ifmediareq *ifmr = (struct ifmediareq *)data;
-		user_addr_t list = (cmd == SIOCGIFMEDIA64) ? ((struct ifmediareq64 *)ifmr)->ifmu_ulist :
-		    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
-		int media = IFM_IEEE80211 | IFM_AUTO;                   /* Apple80211GetIfListCopy lists only media type IEEE 802.11 */
-
-		ifmr->ifm_current = media;
-		ifmr->ifm_active = ew.up ? (IFM_IEEE80211 | 8 /* IFM_IEEE80211_11N */) : media;
-		ifmr->ifm_mask = 0;
-		ifmr->ifm_status = IFM_AVALID | (ew.up ? IFM_ACTIVE : 0);
-		if (list != USER_ADDR_NULL && ifmr->ifm_count > 0) {
-			ifmr->ifm_count = 1;
-			return copyout(&media, list, sizeof(media));
-		}
-		ifmr->ifm_count = 1;
-		return 0;
+	if (command == SWEET_SIOCSA80211 || command == SWEET_SIOCGA80211) {
+		return ew_a80211(command == SWEET_SIOCSA80211, (struct sweet_a80211req *)data);
 	}
-	case SIOCSIFADDR:
-	case SIOCAIFADDR:
-		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
-		return 0;
-	case SIOCSIFFLAGS:
-	case SIOCADDMULTI:
-	case SIOCDELMULTI:
-		return 0;
-	default:
-		return EOPNOTSUPP;
-	}
+	return EOPNOTSUPP;
 }
 
-static void
-ew_if_detach(ifnet_t ifp __unused)
-{
-}
+static struct hakios_net_link ew_link = {
+	.name = "sunfish-wlan",
+	.unit = 0,
+	.wireless = true,
+	.up = false,
+	.transmit = ew_net_transmit,
+	.poll = NULL,
+};
 
 static void
 ew_if_create(void)
 {
-	struct ifnet_init_eparams init;
 	static lck_grp_t *grp;
 
-	if (ew.ifp != NULL) {
+	if (ew.attached) {
 		return;
 	}
 	grp = lck_grp_alloc_init("sweet_wlan_if", LCK_GRP_ATTR_NULL);
 	ew.lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
 	g_bss_lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
 	ew.txq = kalloc_data(EW_TXQ * EW_FRAME_MAX, Z_WAITOK | Z_ZERO);
-	bzero(&init, sizeof(init));
-	init.ver = IFNET_INIT_CURRENT_VERSION;
-	init.len = sizeof(init);
-	init.flags = IFNET_INIT_LEGACY;
-	init.uniqueid = "sweet-wlan";
-	init.uniqueid_len = sizeof("sweet-wlan") - 1;
-	init.name = "en";
-	init.unit = 0;
-	init.family = IFNET_FAMILY_ETHERNET;
-	init.type = IFT_ETHER;
-	init.output = ew_if_output;
-	init.demux = ether_demux;
-	init.add_proto = ether_add_proto;
-	init.del_proto = ether_del_proto;
-	init.check_multi = ether_check_multi;
-	init.framer_extended = ether_frameout_extended;
-	init.ioctl = ew_if_ioctl;
-	init.detach = ew_if_detach;
-	init.broadcast_addr = etherbroadcastaddr;
-	init.broadcast_len = ETHER_ADDR_LEN;
-	if (ew.txq == NULL || ifnet_allocate_extended(&init, &ew.ifp) != 0) {
-		ev("EW: ifnet_allocate failed");
-		ew.ifp = NULL;
+	memcpy(ew_link.address, wp_mac, ETHER_ADDR_LEN);
+	if (ew.txq == NULL || !hakios_net_attach(&ew_link)) {
+		ev("EW: hakios_net_attach failed");
 		return;
 	}
-	ifnet_set_addrlen(ew.ifp, ETHER_ADDR_LEN);
-	ifnet_set_hdrlen(ew.ifp, sizeof(struct ether_header));
-	ifnet_set_mtu(ew.ifp, ETHERMTU);
-	ifnet_set_baudrate(ew.ifp, 54000000);
-	ifnet_set_flags(ew.ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
-	if (ifnet_attach(ew.ifp, NULL) != 0) {
-		ev("EW: ifnet_attach failed");
-		ew.ifp = NULL;
-		return;
-	}
-	ifnet_set_lladdr(ew.ifp, wp_mac, ETHER_ADDR_LEN);
-	ev("EW: interface en0 created");
-	sweet_io80211_publish("en0", wp_mac);
+	ew.attached = true;
+	ev("EW: interface en0 created by hakios.net.c");
+	HakiosWLANStart("en0", wp_mac);
 }
 
 static void
 ew_link_event(bool up)
 {
-	if (ew.ifp != NULL) {
-		dlil_post_msg(ew.ifp, KEV_DL_SUBCLASS, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
+	if (ew.attached) {
+		hakios_net_link_state(up);
 	}
+}
+
+/* the link is up (associated, keys set): configd starts DHCP on it, and wifid is told */
+static void
+ew_link_up(void)
+{
+	ew.up = true;
+	ew_link_event(true);
+	ew_a80211_link_events();
+	ev("EW: en0 link up: configd runs DHCP");
 }
 
 /* give ew0 the leased address and mark the link up (sweet_usb.c's ue0 does it the same way) */
 static void
 ew_configure(const uint8_t ip[4], const uint8_t mask[4])
 {
-	errno_t err = proto_plumb(PF_INET, ew.ifp);
+	errno_t err = 0;
 	socket_t so = NULL;
 
-	if (ew.ifp == NULL) {
+	if (!ew.attached) {
 		return;
 	}
 	if (err == 0 || err == EEXIST) {
@@ -5498,7 +5453,6 @@ ew_configure(const uint8_t ip[4], const uint8_t mask[4])
 	memcpy(ew.cur_ip, ip, 4);
 	ew.have_ip = true;
 	ew.up = true;
-	ifnet_set_flags(ew.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
 	ew_link_event(true);
 	ew_a80211_link_events();
 	ev("EW: en0 %u.%u.%u.%u %s (err %d)", ip[0], ip[1], ip[2], ip[3], err ? "NOT configured" : "up", err);
@@ -5508,34 +5462,11 @@ ew_configure(const uint8_t ip[4], const uint8_t mask[4])
 static void
 ew_rx(const uint8_t *eth, size_t len)
 {
-	mbuf_t m = NULL;
-
-	if (!ew.up || ew.ifp == NULL || len < ETHER_HDR_LEN || len > ETHER_MAX_LEN) {
+	if (!ew.up || !ew.attached || len < ETHER_HDR_LEN || len > ETHER_MAX_LEN) {
 		return;
 	}
-	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 && mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
-	    (mbuf_flags(m) & MBUF_EXT) && mbuf_maxlen(m) >= len) {
-		struct ifnet_stat_increment_param stats = {};
-		void *frame_header;
-
-		memcpy(mbuf_data(m), eth, len);
-		mbuf_setlen(m, len);
-		mbuf_pkthdr_setlen(m, len);
-		frame_header = mbuf_data(m);
-		mbuf_pkthdr_setrcvif(m, ew.ifp);
-		mbuf_pkthdr_setheader(m, frame_header);
-		mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
-		(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
-		stats.packets_in = 1;
-		stats.bytes_in = (u_int32_t)len;
-		ew.rx_frames++;
-		ifnet_input(ew.ifp, m, &stats);
-	} else {
-		ew.rx_drop++;
-		if (m != NULL) {
-			mbuf_freem(m);
-		}
-	}
+	ew.rx_frames++;
+	hakios_net_input(eth, len);              /* copied there; this is the radio's service thread, not an interrupt */
 }
 
 static int
@@ -6261,10 +6192,14 @@ wlan_station_loop(void)
 		if (g_ujoin_valid && g_join_result == 0) {
 			g_join_result = 1;
 		}
-		jn_net_test();                                  /* DHCP, then ew0 gets the address (service mode) */
-		if (nt.state != 4) {
-			ev("EW: no lease: joining again");      /* otherwise the link sits here for ever without an address */
-			jn.kicked = true;
+		if (g_kdhcp) {
+			jn_net_test();                          /* DHCP in the kernel, then en0 gets the address */
+			if (nt.state != 4) {
+				ev("EW: no lease: joining again");      /* otherwise the link sits here for ever without an address */
+				jn.kicked = true;
+			}
+		} else {
+			ew_link_up();                           /* configd does DHCP, makes the route, tells mDNSResponder */
 		}
 		ev("EW: service running");
 		next_mon = nt_us() + 5000000;
@@ -6334,7 +6269,6 @@ wlan_station_loop(void)
 		}
 		if (ew.up) {
 			ew.up = false;
-			ifnet_set_flags(ew.ifp, 0, IFF_RUNNING);
 			ew_link_event(false);
 			ew_a80211_link_down();
 		}
@@ -6376,7 +6310,7 @@ wlfw_wmi_bringup(volatile uint32_t *regs)
 		ew.head = 0;
 	}
 	g_wlan_crashed = false;
-	if (g_wlan_probe >= 8 && ew.ifp == NULL) {
+	if (g_wlan_probe >= 8 && !ew.attached) {
 		wlan_rails_on();
 		ew_if_create();
 	}
@@ -7550,6 +7484,7 @@ hakios_mpss_sm7150_start(void)
 	started = true;
 	PE_parse_boot_argn("wlanprobe", &g_wlan_probe, sizeof(g_wlan_probe));
 	PE_parse_boot_argn("mpss_log", &g_ev_log, sizeof(g_ev_log));
+	PE_parse_boot_argn("wlan_kdhcp", &g_kdhcp, sizeof(g_kdhcp));
 	PE_parse_boot_argn("mpss_dump", &g_ev_dump, sizeof(g_ev_dump));
 	PE_parse_boot_argn("wlannoht", &swu_no_ht, sizeof(swu_no_ht));
 	if (kernel_thread_start_priority(mpss_thread, NULL, SWEET_WLAN_PRI, &thread) == KERN_SUCCESS) {
