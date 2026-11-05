@@ -122,6 +122,7 @@ static bool g_crash_seen;
 static size_t g_events_length;
 static uint32_t g_events_second;
 
+static uint32_t g_ev_dump;       /* boot-arg mpss_dump=N: the event ring every N seconds */
 static uint32_t g_ev_log;        /* boot-arg mpss_log=1: every event in the kernel's log as well */
 
 static void
@@ -7394,6 +7395,29 @@ mpss_run(void)
 					if (sec <= 30 || sec % 10 == 0) {
 						printf("mpss: alive %d s: %s\n", sec, report);
 					}
+					/* boot-arg mpss_dump=N: every N seconds of the modem's life, the event ring one event a line (the
+					 * alive line above is cut after about 2 KB and the middle of a long run's log is dropped) */
+					if (g_ev_dump != 0 && sec % (int)g_ev_dump == 0) {
+						static char copy[sizeof(g_events)];
+						char *line = copy, *end;
+
+						memcpy(copy, g_events, g_events_length);
+						copy[g_events_length] = 0;
+						printf("mpss-ring: at %d s, %zu bytes of events\n", sec, g_events_length);
+						while (*line != 0) {
+							end = strchr(line, '\n');
+							if (end != NULL) {
+								*end = 0;
+							}
+							if (strncmp(line, "GLINK DATA", 10) != 0 && strnstr(line, "A80211: scan", 64) == NULL) {
+								printf("mpss-ring: %s\n", line);
+							}
+							if (end == NULL) {
+								break;
+							}
+							line = end + 1;
+						}
+					}
 				}
 			}
 			ml_io_unmap((vm_offset_t)part_win, map_sz);
@@ -7523,6 +7547,7 @@ hakios_mpss_sm7150_start(void)
 	started = true;
 	PE_parse_boot_argn("wlanprobe", &g_wlan_probe, sizeof(g_wlan_probe));
 	PE_parse_boot_argn("mpss_log", &g_ev_log, sizeof(g_ev_log));
+	PE_parse_boot_argn("mpss_dump", &g_ev_dump, sizeof(g_ev_dump));
 	PE_parse_boot_argn("wlannoht", &swu_no_ht, sizeof(swu_no_ht));
 	if (kernel_thread_start_priority(mpss_thread, NULL, SWEET_WLAN_PRI, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
@@ -7537,6 +7562,24 @@ static thread_call_t hakios_mpss_call;
 static void
 hakios_mpss_sm7150_go(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
+	vm_offset_t mem = 0;
+	uint32_t enable = 0;
+
+	/*
+	 * The host memory the Wi-Fi firmware works in (WP_POOL, 16 MB, physically contiguous) is taken now, 2 s into the kernel: asked
+	 * for later, when the modem has loaded (about 100 s in, with iOS's user space running) there was no run of free pages that
+	 * long and the driver gave up with "WMI: no contiguous pool". wp_rings() keeps a pool that is there already.
+	 */
+	if (PE_parse_boot_argn("mpss", &enable, sizeof(enable)) && enable != 0) {
+		if (kmem_alloc_contig(kernel_map, &mem, WP_POOL, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
+		    VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
+			wp.pool = (uint8_t *)mem;
+			wp.pa = kvtophys(mem);
+			printf("mpss: the Wi-Fi's host memory (%u MB) kept early, at pa %#llx\n", WP_POOL >> 20, wp.pa);
+		} else {
+			printf("mpss: no %u MB of contiguous memory even this early\n", WP_POOL >> 20);
+		}
+	}
 	hakios_mpss_sm7150_start();
 }
 
