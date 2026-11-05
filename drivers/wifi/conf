@@ -1,0 +1,7 @@
+# devices/sunfish/drivers/wifi/conf: what only the Pixel 4a has.
+
+driver MPSS_SM7150
+	file    bsd/dev/hakios.mpss_sm7150.c
+	file    bsd/dev/hakios.wlan_util_sm7150.c
+	file    iokit/Kernel/hakios.wifi_sm7150.cpp iokitcpp
+	help    Wi-Fi of the WCN3990, whose firmware runs on the modem: the modem started, its channels, the WLFW protocol, ath10k's rings (mpss=1)
