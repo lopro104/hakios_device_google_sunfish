@@ -1,0 +1,6 @@
+id=hakios_ios
+name=HakiOS iOS for the Pixel 4a
+version=0.1
+versionCode=1
+author=ios-sunfish
+description=Boot iOS 16.5 (HakiOS) from this phone's other boot slot, and back to Android. Commands: ios-boot status | ios-boot | android-boot | ios-boot install IMAGE

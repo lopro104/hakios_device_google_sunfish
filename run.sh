@@ -9,11 +9,12 @@
 # (GL=1 REST=1 userland/build.sh) are built, and u-boot for this device is built: CROSS_COMPILE=aarch64-linux-gnu- uefi/u-boot/build.sh sunfish_storage
 # The log goes to logs/<time>-run.log (git-ignored; it holds whatever the radio saw, so mask before pasting anywhere).
 cd "$(dirname "$(readlink -f "$0")")/../.." || exit 1
-ARGS="vtimer_intid=19 iowatchdog=1 wdt=-1 cpus=8 bootcpu=7 touchscreen=1 touch_delay=3 thermal=1 thermal_slow=80 panel_autorefresh=1 panel_brightness=100 gpu=1 cpufreq=1 pm6150_battery=1 mpss=1 wifi=1 wlanprobe=8 $1"
+. devices/sunfish/boot-args.sh
+ARGS="$BOOT_ARGS_BASE $1"
 SECS=${2:-90}      # how long the kernel runs before the loader gets the phone back; the boot itself is about a minute with FLASH=1
 # FLASH=1: the root is the Darwin volume in the phone's darwin partition (userland/build.sh CRYPTEXES=flash FLASHBOOT=1): a 4 MB RAM image instead of 2.4 GB
 RAMDISK=userland/system.apfs
-[ -n "$FLASH" ] && { RAMDISK=userland/flashboot.apfs; ARGS="$ARGS root_apfs=ufs_darwin ufs=2"; }
+[ -n "$FLASH" ] && { RAMDISK=userland/flashboot.apfs; ARGS="$ARGS $FLASH_ARGS"; }
 timeout 2 fastboot getvar product 2>&1 | grep -q 'product: sunfish' || timeout 5 fastboot reboot >/dev/null 2>&1   # already in the bootloader: no reset
 for i in $(seq 1 120); do sleep 2; timeout 2 fastboot getvar product 2>&1 | grep -q 'product: sunfish' && break; done
 timeout 2 fastboot getvar product 2>&1 | grep -q 'product: sunfish' || { echo "run.sh: the phone did not reach its bootloader"; exit 1; }

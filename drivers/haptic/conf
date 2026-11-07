@@ -1,0 +1,5 @@
+# devices/sunfish/drivers/haptic/conf: what only the Pixel 4a has.
+
+driver HAPTIC_DRV2624
+	file    bsd/dev/hakios.haptic_drv2624.c
+	help    the vibration motor: a TI DRV2624 driving a linear resonant actuator, I2C by hand on GPIO 46/47 (haptic=N)

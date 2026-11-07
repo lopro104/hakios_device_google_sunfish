@@ -1,0 +1,73 @@
+#!/system/bin/sh
+# ios-boot: switch this phone between Android and iOS (HakiOS), which live in the two boot slots. Run as root (KernelSU).
+#
+#   ios-boot status             which slot Android runs from, which slot holds iOS, whether it is installed
+#   ios-boot                    make the iOS slot the one to start and reboot
+#   android-boot                make Android's slot the one to start and reboot
+#   ios-boot install IMAGE      write the iOS boot image into the iOS slot's boot partition (asks first; backs up the slot first)
+#
+# The iOS slot is the one Android is NOT running from. Only that slot's "boot" partition is ever written, and only by "install".
+# Nothing else on the phone is changed: no other partition, no bootloader, no modem. Changing the active slot is done by
+# Android's own boot control (bootctl), the way the stock OS does it.
+BACKUPS=/sdcard/Download/ios-boot-backups
+MAGIC="ANDROID!"
+
+cur=$(getprop ro.boot.slot_suffix)               # _a or _b
+case "$cur" in
+	_a) other=_b; cur_n=0; other_n=1 ;;
+	_b) other=_a; cur_n=1; other_n=0 ;;
+	*) echo "ios-boot: cannot tell which slot Android runs from (ro.boot.slot_suffix='$cur')"; exit 1 ;;
+esac
+part=/dev/block/by-name/boot$other
+
+installed() {
+	# our image is an Android boot image whose ramdisk carries the HKUB container; look for the marker inside the slot's start
+	[ "$(dd if=$part bs=8 count=1 2>/dev/null)" = "$MAGIC" ] || return 1
+	dd if=$part bs=1048576 count=4 2>/dev/null | grep -qa 'HKUB' || dd if=$part bs=1048576 skip=1 count=3 2>/dev/null | grep -qa 'HKUB'
+}
+
+need_root() { [ "$(id -u)" = 0 ] || { echo "ios-boot: run as root (su)"; exit 1; }; }
+
+case "$1" in
+	status)
+		echo "Android runs from slot ${cur#_}; the iOS slot is ${other#_} ($part)"
+		if installed; then echo "iOS image: installed"; else echo "iOS image: NOT installed in slot ${other#_} (ios-boot install IMAGE)"; fi
+		echo "active slot: $(bootctl get-current-slot 2>/dev/null) now, next boot: slot $(getprop ro.boot.slot_suffix | tr -d _) unless changed"
+		;;
+	install)
+		need_root
+		img="$2"
+		[ -f "$img" ] || { echo "ios-boot install: no image '$img'"; exit 1; }
+		size=$(stat -c %s "$img")
+		[ "$size" -le 67108864 ] || { echo "ios-boot install: the image is $size bytes, the partition 67108864"; exit 1; }
+		[ "$(dd if="$img" bs=8 count=1 2>/dev/null)" = "$MAGIC" ] || { echo "ios-boot install: not an Android boot image"; exit 1; }
+		psize=$(blockdev --getsize64 $part)
+		[ "$psize" = 67108864 ] || { echo "ios-boot install: $part is $psize bytes, expected 67108864: not written"; exit 1; }
+		echo "This writes $img ($size bytes) over $part, the boot partition of slot ${other#_} (Android runs from slot ${cur#_}, which is not touched)."
+		echo "A copy of what is there now goes to $BACKUPS first."
+		printf "Type yes to go on: "; read answer
+		[ "$answer" = yes ] || { echo "not written"; exit 1; }
+		mkdir -p $BACKUPS
+		bk=$BACKUPS/boot${other}-$(date +%Y%m%d-%H%M%S).img
+		dd if=$part of=$bk bs=1048576 2>/dev/null || { echo "backup failed: not written"; exit 1; }
+		[ "$(sha256sum < $bk | cut -d' ' -f1)" = "$(dd if=$part bs=1048576 2>/dev/null | sha256sum | cut -d' ' -f1)" ] || { echo "backup does not match: not written"; exit 1; }
+		echo "backup: $bk"
+		dd if="$img" of=$part bs=1048576 conv=fsync 2>/dev/null || { echo "WRITE FAILED"; exit 1; }
+		sync
+		want=$(sha256sum < "$img" | cut -d' ' -f1)
+		got=$(dd if=$part bs=1048576 2>/dev/null | sha256sum | cut -d' ' -f1)
+		if [ "$want" = "$got" ]; then echo "written and read back: identical"; else echo "READ-BACK DIFFERS: restore with  dd if=$bk of=$part bs=1048576"; exit 1; fi
+		;;
+	""|ios)
+		need_root
+		installed || { echo "ios-boot: the iOS image is not in slot ${other#_} yet: ios-boot install IMAGE"; exit 1; }
+		echo "starting iOS from slot ${other#_}"
+		bootctl set-active-boot-slot $other_n && sync && reboot
+		;;
+	android)
+		need_root
+		echo "starting Android from slot ${cur#_}"
+		bootctl set-active-boot-slot $cur_n && sync && reboot
+		;;
+	*) echo "usage: ios-boot [status | install IMAGE]    (android-boot: back to Android)"; exit 1 ;;
+esac

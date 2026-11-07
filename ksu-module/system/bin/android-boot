@@ -1,0 +1,3 @@
+#!/system/bin/sh
+# android-boot: make Android's slot the one to start and reboot (see ios-boot)
+exec /system/bin/ios-boot android
