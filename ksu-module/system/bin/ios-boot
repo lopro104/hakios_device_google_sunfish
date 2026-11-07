@@ -1,41 +1,71 @@
 #!/system/bin/sh
 # ios-boot: switch this phone between Android and iOS (HakiOS), which live in the two boot slots. Run as root (KernelSU).
 #
+#   ios-boot set-slot a|b       choose the slot iOS lives in (asks; refuses the slot Android runs from). Do this once, by hand.
 #   ios-boot status             which slot Android runs from, which slot holds iOS, whether it is installed
 #   ios-boot                    make the iOS slot the one to start and reboot
 #   android-boot                make Android's slot the one to start and reboot
 #   ios-boot install IMAGE      write the iOS boot image into the iOS slot's boot partition (asks first; backs up the slot first)
 #
-# The iOS slot is the one Android is NOT running from. Only that slot's "boot" partition is ever written, and only by "install".
+# The iOS slot is the one you chose with "set-slot", never one guessed from the running slot (both slots may hold an Android).
+# Only that slot's "boot" partition is ever written, and only by "install".
 # Nothing else on the phone is changed: no other partition, no bootloader, no modem. Changing the active slot is done by
 # Android's own boot control (bootctl), the way the stock OS does it.
 BACKUPS=/sdcard/Download/ios-boot-backups
 MAGIC="ANDROID!"
 
-cur=$(getprop ro.boot.slot_suffix)               # _a or _b
+cur=$(getprop ro.boot.slot_suffix)               # _a or _b: the slot Android runs from now
+CONF=/data/adb/hakios_ios_slot                   # the slot iOS is installed in, written by "ios-boot set-slot"; never guessed
 case "$cur" in
-	_a) other=_b; cur_n=0; other_n=1 ;;
-	_b) other=_a; cur_n=1; other_n=0 ;;
+	_a) cur_n=0 ;;
+	_b) cur_n=1 ;;
 	*) echo "ios-boot: cannot tell which slot Android runs from (ro.boot.slot_suffix='$cur')"; exit 1 ;;
 esac
+other=""; other_n=""
+if [ -f "$CONF" ]; then
+	case "$(cat $CONF)" in
+		a) other=_a; other_n=0 ;;
+		b) other=_b; other_n=1 ;;
+	esac
+fi
 part=/dev/block/by-name/boot$other
 
 installed() {
 	# our image is an Android boot image whose ramdisk carries the HKUB container; look for the marker inside the slot's start
+	[ -n "$other" ] || return 1
 	[ "$(dd if=$part bs=8 count=1 2>/dev/null)" = "$MAGIC" ] || return 1
 	dd if=$part bs=1048576 count=4 2>/dev/null | grep -qa 'HKUB' || dd if=$part bs=1048576 skip=1 count=3 2>/dev/null | grep -qa 'HKUB'
+}
+
+# the slot must have been chosen, and must not be the one Android is running from
+need_slot() {
+	[ -n "$other" ] || { echo "ios-boot: no iOS slot chosen yet: ios-boot set-slot a   (or b)"; exit 1; }
+	[ "$other" != "$cur" ] || { echo "ios-boot: the iOS slot (${other#_}) is the slot Android runs from now: refused"; exit 1; }
 }
 
 need_root() { [ "$(id -u)" = 0 ] || { echo "ios-boot: run as root (su)"; exit 1; }; }
 
 case "$1" in
 	status)
-		echo "Android runs from slot ${cur#_}; the iOS slot is ${other#_} ($part)"
-		if installed; then echo "iOS image: installed"; else echo "iOS image: NOT installed in slot ${other#_} (ios-boot install IMAGE)"; fi
+		echo "Android runs from slot ${cur#_}"
+		if [ -z "$other" ]; then echo "iOS slot: NOT CHOSEN (ios-boot set-slot a|b)"; else
+			echo "iOS slot: ${other#_} ($part)"
+			if installed; then echo "iOS image: installed"; else echo "iOS image: NOT installed in slot ${other#_} (ios-boot install IMAGE)"; fi
+		fi
 		echo "active slot: $(bootctl get-current-slot 2>/dev/null) now, next boot: slot $(getprop ro.boot.slot_suffix | tr -d _) unless changed"
+		;;
+	set-slot)
+		need_root
+		case "$2" in a|b) ;; *) echo "usage: ios-boot set-slot a|b"; exit 1 ;; esac
+		[ "_$2" != "$cur" ] || { echo "ios-boot: slot $2 is the one Android runs from now: refused"; exit 1; }
+		echo "iOS will be installed in slot $2 (boot_$2). Android runs from slot ${cur#_} now. Make sure slot $2 holds nothing you need."
+		printf "Type the slot letter again to confirm: "; read answer
+		[ "$answer" = "$2" ] || { echo "not changed"; exit 1; }
+		echo "$2" > $CONF && echo "iOS slot: $2"
 		;;
 	install)
 		need_root
+		need_slot
 		img="$2"
 		[ -f "$img" ] || { echo "ios-boot install: no image '$img'"; exit 1; }
 		size=$(stat -c %s "$img")
@@ -60,6 +90,7 @@ case "$1" in
 		;;
 	""|ios)
 		need_root
+		need_slot
 		installed || { echo "ios-boot: the iOS image is not in slot ${other#_} yet: ios-boot install IMAGE"; exit 1; }
 		echo "starting iOS from slot ${other#_}"
 		bootctl set-active-boot-slot $other_n && sync && reboot
