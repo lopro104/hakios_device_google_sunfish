@@ -22,7 +22,7 @@ python3 -I xnuloader/mkpayload.py -o build/usb-payload.bin --usb >/dev/null || e
 python3 -I tools/mkubootimg.py -d sunfish -u u-boot/build-sunfish_storage/u-boot.bin -l xnuloader/loader.efi -p build/usb-payload.bin \
 	--header-version 2 --pagesize 4096 -o build/xnu-usb-storage.img >/dev/null || exit 1
 avbtool add_hash_footer --image build/xnu-usb-storage.img --partition_size 67108864 --partition_name boot --algorithm NONE >/dev/null 2>&1
-# (the active slot is never changed here: Android runs from slot b, and a run flashes nothing)
+fastboot set_active b >/dev/null 2>&1        # Android's slot, refilled: each fastboot boot spends one of the active slot's three boot tries (nothing marks it successful), and with none left the phone stops in the bootloader. The bootloader's own command; nothing is flashed.
 fastboot boot build/xnu-usb-storage.img >/dev/null 2>&1
 for i in $(seq 1 15); do sleep 2; timeout 3 fastboot getvar product 2>&1 | grep -q 'product: xnuloader' && break; done
 rm -f "${XDG_RUNTIME_DIR:-/tmp}/darwin-hakios-phone.ran"
