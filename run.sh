@@ -1,7 +1,7 @@
 #!/bin/bash
 # One test run of iOS 16.5 on the Pixel 4a from RAM, through U-Boot and the HakiOS loader. Nothing is written to the phone's storage.
 #
-#   devices/sunfish/run.sh ["extra boot-args" [SECONDS [NAME]]]        (run from ~/hakios; default 300 s)
+#   devices/sunfish/run.sh ["extra boot-args" [SECONDS [NAME]]]        (run from ~/hakios; default 90 s)
 #
 # It RESETS the phone first (the loader writes the PMIC's reboot-reason register, so the reset lands in the stock bootloader in
 # about 4 s; a loader older than 2026-11-06 goes through Android until slot b's retries run out, about 50 s). Warn whoever is
@@ -10,7 +10,7 @@
 # The log goes to logs/<time>-run.log (git-ignored; it holds whatever the radio saw, so mask before pasting anywhere).
 cd "$(dirname "$(readlink -f "$0")")/../.." || exit 1
 ARGS="vtimer_intid=19 iowatchdog=1 wdt=-1 cpus=8 bootcpu=7 touchscreen=1 touch_delay=3 thermal=1 panel_autorefresh=1 panel_brightness=100 gpu=1 cpufreq=1 pm6150_battery=1 mpss=1 wifi=1 wlanprobe=8 $1"
-SECS=${2:-300}
+SECS=${2:-90}      # how long the kernel runs before the loader gets the phone back; the boot itself is about a minute with FLASH=1
 # FLASH=1: the root is the Darwin volume in the phone's darwin partition (userland/build.sh CRYPTEXES=flash FLASHBOOT=1): a 4 MB RAM image instead of 2.4 GB
 RAMDISK=userland/system.apfs
 [ -n "$FLASH" ] && { RAMDISK=userland/flashboot.apfs; ARGS="$ARGS root_apfs=ufs_darwin ufs=2"; }
