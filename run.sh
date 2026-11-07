@@ -11,6 +11,9 @@
 cd "$(dirname "$(readlink -f "$0")")/../.." || exit 1
 ARGS="vtimer_intid=19 iowatchdog=1 wdt=-1 cpus=8 bootcpu=7 touchscreen=1 touch_delay=3 thermal=1 panel_autorefresh=1 panel_brightness=100 gpu=1 cpufreq=1 pm6150_battery=1 mpss=1 wifi=1 wlanprobe=8 $1"
 SECS=${2:-300}
+# FLASH=1: the root is the Darwin volume in the phone's darwin partition (userland/build.sh CRYPTEXES=flash FLASHBOOT=1): a 4 MB RAM image instead of 2.4 GB
+RAMDISK=userland/system.apfs
+[ -n "$FLASH" ] && { RAMDISK=userland/flashboot.apfs; ARGS="$ARGS root_apfs=ufs_darwin ufs=2"; }
 timeout 2 fastboot getvar product 2>&1 | grep -q 'product: sunfish' || timeout 5 fastboot reboot >/dev/null 2>&1   # already in the bootloader: no reset
 for i in $(seq 1 120); do sleep 2; timeout 2 fastboot getvar product 2>&1 | grep -q 'product: sunfish' && break; done
 timeout 2 fastboot getvar product 2>&1 | grep -q 'product: sunfish' || { echo "run.sh: the phone did not reach its bootloader"; exit 1; }
@@ -23,5 +26,5 @@ fastboot boot build/xnu-usb-storage.img >/dev/null 2>&1
 for i in $(seq 1 15); do sleep 2; timeout 3 fastboot getvar product 2>&1 | grep -q 'product: xnuloader' && break; done
 rm -f "${XDG_RUNTIME_DIR:-/tmp}/darwin-hakios-phone.ran"
 export DEVICE=sunfish XL_FIRMWARE=u-boot XL_HOME=fastboot
-./xl ramdisk userland/system.apfs 2>&1 | tail -1
+./xl ramdisk $RAMDISK 2>&1 | tail -1
 XL_SECS=$SECS XL_FOLLOW=10 XL_CMDLINE="$ARGS" ./xl run 2>&1 | tail -3
