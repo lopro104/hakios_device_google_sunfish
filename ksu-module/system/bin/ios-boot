@@ -59,8 +59,10 @@ case "$1" in
 		case "$2" in a|b) ;; *) echo "usage: ios-boot set-slot a|b"; exit 1 ;; esac
 		[ "_$2" != "$cur" ] || { echo "ios-boot: slot $2 is the one Android runs from now: refused"; exit 1; }
 		echo "iOS will be installed in slot $2 (boot_$2). Android runs from slot ${cur#_} now. Make sure slot $2 holds nothing you need."
-		printf "Type the slot letter again to confirm: "; read answer
-		[ "$answer" = "$2" ] || { echo "not changed"; exit 1; }
+		if [ "$3" != "--yes" ]; then        # (--yes: the Action button, after a volume key was pressed for it)
+			printf "Type the slot letter again to confirm: "; read answer
+			[ "$answer" = "$2" ] || { echo "not changed"; exit 1; }
+		fi
 		echo "$2" > $CONF && echo "iOS slot: $2"
 		;;
 	install)
