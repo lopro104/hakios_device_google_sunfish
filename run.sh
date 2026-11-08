@@ -15,6 +15,7 @@ SECS=${2:-90}      # how long the kernel runs before the loader gets the phone b
 # FLASH=1: the root is the Darwin volume in the phone's darwin partition (userland/build.sh CRYPTEXES=flash FLASHBOOT=1): a 4 MB RAM image instead of 2.4 GB
 RAMDISK=userland/system.apfs
 [ -n "$FLASH" ] && { RAMDISK=userland/flashboot.apfs; ARGS="$ARGS $FLASH_ARGS"; }
+[ -n "$METAL" ] && ARGS="$ARGS metal=1 ca_metallib=/redwood/share/ca-share/QuartzCore-default.metallib"   # the build: METAL=1 devices/sunfish/build-flash.sh
 timeout 2 fastboot getvar product 2>&1 | grep -q 'product: sunfish' || timeout 5 fastboot reboot >/dev/null 2>&1   # already in the bootloader: no reset
 for i in $(seq 1 120); do sleep 2; timeout 2 fastboot getvar product 2>&1 | grep -q 'product: sunfish' && break; done
 timeout 2 fastboot getvar product 2>&1 | grep -q 'product: sunfish' || { echo "run.sh: the phone did not reach its bootloader"; exit 1; }
