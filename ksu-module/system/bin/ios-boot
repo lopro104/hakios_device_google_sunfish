@@ -11,7 +11,7 @@
 # Only that slot's "boot" partition is ever written, and only by "install".
 # Nothing else on the phone is changed: no other partition, no bootloader, no modem. Changing the active slot is done by
 # Android's own boot control (bootctl), the way the stock OS does it.
-BACKUPS=/sdcard/Download/ios-boot-backups
+BACKUPS=/data/local/tmp/ios-boot-backups
 MAGIC="ANDROID!"
 
 cur=$(getprop ro.boot.slot_suffix)               # _a or _b: the slot Android runs from now
