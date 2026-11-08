@@ -34,6 +34,8 @@
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
+extern void loader_log_putc(char c);
+extern boolean_t ml_get_interrupts_enabled(void);
 extern void hakios_spmi_lock(void);
 extern void hakios_spmi_unlock(void);
 
@@ -45,6 +47,7 @@ extern void hakios_spmi_unlock(void);
 #define TOUCH_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
 #define TOUCH_GPIO_IO(n)  (TOUCH_GPIO_CFG(n) + 4u)
 #define TOUCH_MAX        10u
+#define TOUCH_ATTEMPTS   6u         /* bring-ups tried before giving up (boot-arg touch_retries=N; 1: as it was) */
 /* ST FTM5, I2C protocol of fts_touch_s5/fts_lib/ftsHardware.h */
 #define FTM5_ADDR        0x49u
 #define FTM5_READ_EVENT  0x86u      /* FIFO_CMD_READALL: one 8-byte event per read */
@@ -98,6 +101,29 @@ extern void hakios_spmi_unlock(void);
  * MSB-to-LSB, length 8, STOP only on vector 3. FIFO bytes remain LSB first. */
 #define SE_PACK0        0x0007f8feu
 #define SE_PACK1        0x000ffefeu
+
+/* every line to the loader's log as well as the console: the kernel's own log drops the early boot from its middle, and this driver says
+ * how its bring-up went at about three seconds */
+static int say(const char *format, ...) __printflike(1, 2);
+
+static int
+say(const char *format, ...)
+{
+	char line[240];
+	va_list list;
+	int length;
+
+	va_start(list, format);
+	length = vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	for (const char *c = line; *c != 0; c++) {
+		loader_log_putc(*c);
+	}
+	if (ml_get_interrupts_enabled()) {
+		printf("%s", line);
+	}
+	return length;
+}
 
 static struct {
 	vm_offset_t se, gcc, gpio;
@@ -168,13 +194,13 @@ touch_clocks(void)
 	touch_wr(st.gcc, TOUCH_GCC_VOTE, touch_rd(st.gcc, TOUCH_GCC_VOTE) | mask);
 	uint32_t dfs = touch_rd(st.gcc, TOUCH_RCG + 0x14u);
 	uint32_t cfg = touch_rd(st.gcc, TOUCH_RCG + 4u);
-	printf("ftm5: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
+	say("ftm5: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
 	    touch_rd(st.gcc, TOUCH_GCC_VOTE), touch_rd(st.gcc, TOUCH_RCG), cfg, dfs);
 	if (dfs & 1u) {
 		/* SE CLK_SEL=0 selects DFS performance level 0. Do not alter tables. */
 		cfg = touch_rd(st.gcc, TOUCH_RCG + 0x1cu);
 		if ((cfg & 0x371fu) != 1u) {
-			printf("ftm5: DFS level0=%#x is not XO/1; need clock integration\n", cfg);
+			say("ftm5: DFS level0=%#x is not XO/1; need clock integration\n", cfg);
 			return false;
 		}
 	} else {
@@ -183,14 +209,14 @@ touch_clocks(void)
 		touch_wr(st.gcc, TOUCH_RCG + 4u, cfg);
 		touch_wr(st.gcc, TOUCH_RCG, touch_rd(st.gcc, TOUCH_RCG) | 1u);
 		if (!touch_wait_clear(st.gcc, TOUCH_RCG, 1u)) {
-			printf("ftm5: RCG update timeout\n");
+			say("ftm5: RCG update timeout\n");
 			return false;
 		}
 	}
 	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, 0x18144};
 	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
 		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
-			printf("ftm5: GCC branch %#x halted (%#x)\n", branches[i],
+			say("ftm5: GCC branch %#x halted (%#x)\n", branches[i],
 			    touch_rd(st.gcc, branches[i]));
 			return false;
 		}
@@ -213,7 +239,7 @@ touch_abort(void)
 	}
 	if (!done || !touch_wait_clear(st.se, SE_STATUS, 1u)) {
 		st.dead = true;
-		printf("ftm5: abort failed status=%#x irq=%#x; stopping\n",
+		say("ftm5: abort failed status=%#x irq=%#x; stopping\n",
 		    touch_rd(st.se, SE_STATUS), touch_rd(st.se, SE_IRQ));
 	}
 	/* Bound drain even if the hardware reports an impossible FIFO count. */
@@ -223,7 +249,7 @@ touch_abort(void)
 	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
 	if (touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) {
 		st.dead = true;
-		printf("ftm5: TX FIFO not empty after abort; stopping\n");
+		say("ftm5: TX FIFO not empty after abort; stopping\n");
 	}
 }
 
@@ -323,7 +349,7 @@ touch_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
 	st.sent = st.got = 0;
 	int err = touch_msg_run(addr, tx, nt, rx, nr, stretch);
 	if (st.probing) {
-		printf("ftm5: probe xfer addr=%#x %s len=%u stretch=%u err=%d irq=%#x seen=%#x tx=%u rx=%u status=%#x\n",
+		say("ftm5: probe xfer addr=%#x %s len=%u stretch=%u err=%d irq=%#x seen=%#x tx=%u rx=%u status=%#x\n",
 		    addr, nr ? "read" : "write", nr ? nr : nt, stretch ? 1u : 0u,
 		    err, st.irq_last, st.irq_status, st.sent, st.got,
 		    touch_rd(st.se, SE_STATUS));
@@ -357,13 +383,13 @@ sp_init(void)
 	sp_cfg = ml_io_map(SP_CFG_PA, 0x1000);
 	sp_obs = ml_io_map(SP_OBS_PA, 0x10000);
 	if (!sp_core || !sp_cfg || !sp_obs) {
-		printf("ftm5: could not map the PMIC arbiter\n");
+		say("ftm5: could not map the PMIC arbiter\n");
 		return false;
 	}
 	uint32_t version = touch_rd(sp_core, 0);
 	sp_count = touch_rd(sp_core, 4) & 0x7ffu;
 	if (version < 0x50000000u || version >= 0x70000000u || !sp_count || sp_count > 512) {
-		printf("ftm5: PMIC arbiter version %#x, %u channels: not one this driver knows\n", version, sp_count);
+		say("ftm5: PMIC arbiter version %#x, %u channels: not one this driver knows\n", version, sp_count);
 		return false;
 	}
 	for (unsigned i = 0; i < sp_count; ++i) {
@@ -376,7 +402,7 @@ sp_init(void)
 		}
 	}
 	if (sp_apid == SP_NO_APID) {
-		printf("ftm5: the arbiter has no channel for PM6150 GPIO4\n");
+		say("ftm5: the arbiter has no channel for PM6150 GPIO4\n");
 		return false;
 	}
 	return true;
@@ -409,7 +435,7 @@ sp_read(unsigned reg, uint8_t *out)
 	}
 	sp_poisoned = true;
 	hakios_spmi_unlock();
-	printf("ftm5: PMIC read of %#x timed out; the channel is not used again\n", reg);
+	say("ftm5: PMIC read of %#x timed out; the channel is not used again\n", reg);
 	return -1;
 }
 
@@ -418,7 +444,7 @@ static int
 sp_write(unsigned reg, uint8_t value)
 {
 	if (sp_poisoned || reg < 0x40u || reg > 0x46u || (touch_rd(sp_cfg, 0x700u + 4u * sp_apid) & 7u) != 0) {
-		printf("ftm5: write of PM6150 GPIO4 %#x refused\n", reg);
+		say("ftm5: write of PM6150 GPIO4 %#x refused\n", reg);
 		return -1;
 	}
 	if (!sp_chnl) {
@@ -427,22 +453,45 @@ sp_write(unsigned reg, uint8_t value)
 			return -1;
 		}
 	}
-	hakios_spmi_lock();
-	__asm__ volatile("dmb oshst" ::: "memory");
-	*(volatile uint32_t *)(sp_chnl + 0x10u) = value;    /* WDATA0 */
-	*(volatile uint32_t *)(sp_chnl + 0x00u) = reg << 4; /* EXT_WRITEL, one byte */
-	__asm__ volatile("dsb osh" ::: "memory");
-	for (unsigned i = 0; i < 1000; ++i) {
-		uint32_t status = touch_rd(sp_chnl, 0x08u);
-		if (status & 1u) {
-			hakios_spmi_unlock();
-			return (status & 0x0eu) ? -1 : 0;
+	/*
+	 * The arbiter now and then answers a write with a failure, denied or dropped flag (seen on the phone: one boot in four lost the
+	 * touch screen at this write, once at 0x41 and once at 0x42, with the same writes right on the other boots). A flag is tried
+	 * again, up to six times, a few hundred microseconds apart; only a transaction that never completes poisons the channel.
+	 */
+	uint32_t status = 0;
+
+	for (unsigned attempt = 0; attempt < 6; ++attempt) {
+		bool completed = false;
+
+		hakios_spmi_lock();
+		__asm__ volatile("dmb oshst" ::: "memory");
+		*(volatile uint32_t *)(sp_chnl + 0x10u) = value;    /* WDATA0 */
+		*(volatile uint32_t *)(sp_chnl + 0x00u) = reg << 4; /* EXT_WRITEL, one byte */
+		__asm__ volatile("dsb osh" ::: "memory");
+		for (unsigned i = 0; i < 1000; ++i) {
+			status = touch_rd(sp_chnl, 0x08u);
+			if (status & 1u) {
+				completed = true;
+				break;
+			}
+			delay(1);
 		}
-		delay(1);
+		hakios_spmi_unlock();
+		if (!completed) {
+			sp_poisoned = true;
+			say("ftm5: PMIC write of %#x timed out; the channel is not used again\n", reg);
+			return -1;
+		}
+		if (!(status & 0x0eu)) {
+			if (attempt > 0) {
+				say("ftm5: PMIC write of %#x went through at attempt %u\n", reg, attempt + 1);
+			}
+			return 0;
+		}
+		say("ftm5: PMIC write of %#x: arbiter status %#x (%s%s%s), attempt %u\n", reg, status,
+		    (status & 2u) ? "failure " : "", (status & 4u) ? "denied " : "", (status & 8u) ? "dropped" : "", attempt + 1);
+		delay(300);
 	}
-	sp_poisoned = true;
-	hakios_spmi_unlock();
-	printf("ftm5: PMIC write of %#x timed out; the channel is not used again\n", reg);
 	return -1;
 }
 
@@ -497,20 +546,20 @@ touch_ftm5_power(void)
 	};
 	uint8_t mode = 0xff, src = 0xff, en = 0xff;
 	if (!sp_init()) {
-		printf("ftm5: no SPMI; cannot check the FTM5 load switch\n");
+		say("ftm5: no SPMI; cannot check the FTM5 load switch\n");
 		return false;
 	}
 	if (sp_read(0x40u, &mode) || sp_read(0x44u, &src) || sp_read(0x46u, &en)) {
-		printf("ftm5: cannot read the load switch; not writing to it\n");
+		say("ftm5: cannot read the load switch; not writing to it\n");
 		return false;
 	}
-	printf("ftm5: PM6150 GPIO4 mode=%#x src=%#x en=%#x\n", mode, src, en);
+	say("ftm5: PM6150 GPIO4 mode=%#x src=%#x en=%#x\n", mode, src, en);
 	if ((mode & 3u) == 1u && (src & 0x80u) && (en & 0x80u)) {
 		return true; /* ABL already switched the touch rails on */
 	}
 	for (unsigned i = 0; i < sizeof(seq) / sizeof(seq[0]); ++i) {
 		if (sp_write(seq[i].reg, seq[i].val) != 0) {
-			printf("ftm5: PM6150 GPIO4 write %#x failed\n", seq[i].reg);
+			say("ftm5: PM6150 GPIO4 write %#x failed\n", seq[i].reg);
 			return false;
 		}
 	}
@@ -522,7 +571,7 @@ static bool
 touch_ftm5_start(void)
 {
 	uint8_t ev[FTM5_EV_SIZE];
-	printf("ftm5: sunfish FTM5: TLMM reset=%#x irq=%#x switch=%#x\n",
+	say("ftm5: sunfish FTM5: TLMM reset=%#x irq=%#x switch=%#x\n",
 	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
 	    touch_rd(st.gpio, TOUCH_GPIO_IO(72)));
 	touch_gpio(9, 0, 0, 0, false, false);  /* IRQ input, no pull (polled) */
@@ -550,7 +599,7 @@ touch_ftm5_start(void)
 		st.probing = i < 2; /* log the first transfers only */
 	}
 	st.probing = false;
-	printf("ftm5: FTM5 0x49 err=%d ready=%d event=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+	say("ftm5: FTM5 0x49 err=%d ready=%d event=%02x %02x %02x %02x %02x %02x %02x %02x\n",
 	    err, ready, ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
 	if (err || st.dead) {
 		return false;
@@ -558,7 +607,7 @@ touch_ftm5_start(void)
 	/* Even without a READY event (missed, or reset already done) the IC answers. */
 	const uint8_t scan[3] = {FTM5_SCAN_MODE, 0x00, 0xff};
 	err = touch_msg(FTM5_ADDR, scan, sizeof(scan), NULL, 0, false);
-	printf("ftm5: FTM5 scan mode active err=%d\n", err);
+	say("ftm5: FTM5 scan mode active err=%d\n", err);
 	return err == 0;
 }
 
@@ -590,7 +639,7 @@ touch_ftm5(void)
 		touch_events++;
 		if (touch_log && touch_logged < 60) {
 			touch_logged++;
-			printf("ftm5: event %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			say("ftm5: event %02x %02x %02x %02x %02x %02x %02x %02x\n",
 			    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
 		}
 		/* Bits 2-3 of byte 0 carry touch-major bits (mainline STMFTS5_MASK_EVENT_ID). */
@@ -609,7 +658,7 @@ touch_ftm5(void)
 				mask &= ~(1u << id);
 			}
 		} else if (kind == FTM5_EV_ERROR) {
-			printf("ftm5: FTM5 error event %02x %02x %02x %02x %02x %02x %02x\n",
+			say("ftm5: FTM5 error event %02x %02x %02x %02x %02x %02x %02x\n",
 			    ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
 		}
 		/* status, user report, debug events: ignored */
@@ -626,17 +675,17 @@ touch_se_init(void)
 {
 	uint32_t fw = touch_rd(st.se, SE_FW);
 	uint32_t tx = touch_rd(st.se, SE_HW_TX), rx = touch_rd(st.se, SE_HW_RX);
-	printf("ftm5: se7 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
+	say("ftm5: se7 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
 	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
 	    touch_rd(st.se, 0x908));
 	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
 	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
 	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
-		printf("ftm5: need ABL-loaded I2C firmware and 32-bit FIFOs; probes skipped\n");
+		say("ftm5: need ABL-loaded I2C firmware and 32-bit FIFOs; probes skipped\n");
 		return false;
 	}
 	if (touch_rd(st.se, SE_STATUS) & 0x1001u) {
-		printf("ftm5: SE7 already busy; probes skipped\n");
+		say("ftm5: SE7 already busy; probes skipped\n");
 		return false;
 	}
 	touch_wr(st.se, 0xe18, 0); /* no GSI events */
@@ -662,69 +711,101 @@ touch_se_init(void)
 	touch_wr(st.se, 0x810, 0);
 	touch_wr(st.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
 	touch_wr(st.se, SE_IRQ_EN, SE_EVENTS);
-	printf("ftm5: packing tx=%#x/%#x rx=%#x/%#x gran=%#x\n",
+	say("ftm5: packing tx=%#x/%#x rx=%#x/%#x gran=%#x\n",
 	    touch_rd(st.se, 0x260), touch_rd(st.se, 0x264),
 	    touch_rd(st.se, 0x284), touch_rd(st.se, 0x288), touch_rd(st.se, 0x254));
 	if (touch_rd(st.se, 0x260) != SE_PACK0 || touch_rd(st.se, 0x264) != SE_PACK1 ||
 	    touch_rd(st.se, 0x284) != SE_PACK0 || touch_rd(st.se, 0x288) != SE_PACK1 ||
 	    touch_rd(st.se, 0x254) != 0) {
-		printf("ftm5: packing readback mismatch; probes skipped\n");
+		say("ftm5: packing readback mismatch; probes skipped\n");
 		return false;
 	}
 	if ((touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) ||
 	    (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
-		printf("ftm5: inherited FIFO data; probes skipped\n");
+		say("ftm5: inherited FIFO data; probes skipped\n");
 		return false;
 	}
 	return true;
 }
 
 
+/* after a failed bring-up: whatever transfer is left running aborted, the FIFOs and the interrupt flags cleared, the engine alive again */
+static void
+touch_se_recover(void)
+{
+	st.dead = false;
+	if (touch_rd(st.se, SE_STATUS) & 0x1001u) {
+		touch_abort();
+	}
+	for (unsigned i = 0; i < 128 && (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
+		(void)touch_rd(st.se, SE_RX);
+	}
+	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+	st.dead = false;
+}
+
 static void
 touch_thread(void *arg, wait_result_t result)
 {
-	unsigned delay_s = 45, errors = 0;
+	unsigned delay_s = 45, errors = 0, retries = TOUCH_ATTEMPTS;
 
 	(void)arg;
 	(void)result;
 	PE_parse_boot_argn("touch_delay", &delay_s, sizeof(delay_s));
-	printf("ftm5: starting in %u s\n", delay_s);
+	say("ftm5: starting in %u s\n", delay_s);
 	touch_wait(delay_s * 1000u);
 	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
 	st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
 	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
 	if (!st.gcc || !st.gpio || !st.se) {
-		printf("ftm5: could not map GCC, TLMM or the serial engine\n");
+		say("ftm5: could not map GCC, TLMM or the serial engine\n");
 		goto out;
 	}
-	if (!touch_clocks() || !touch_se_init()) {
-		goto out;
+	PE_parse_boot_argn("touch_retries", &retries, sizeof(retries));
+	if (retries < 1 || retries > 20) {
+		retries = TOUCH_ATTEMPTS;
 	}
-	if (!touch_ftm5_start() || st.dead) {
-		printf("ftm5: bring-up failed; stopping\n");
-		goto out;
-	}
-	printf("ftm5: running, 1080x2340, every 10 ms\n");
-	PE_parse_boot_argn("touch_log", &touch_log, sizeof(touch_log));
-	for (unsigned polls = 1; !st.dead; ++polls) {
-		int err = touch_ftm5();
-		if (touch_log && polls % 1000u == 0) {
-			printf("ftm5: %u polls, %u events, %u errors, IRQ pin %#x\n", polls, touch_events, errors,
-			    touch_rd(st.gpio, TOUCH_GPIO_IO(9)));
+	for (unsigned attempt = 1; attempt <= retries; ++attempt) {
+		if (attempt > 1) {
+			touch_wait(4000);
+			touch_se_recover();
 		}
-		if (err) {
-			if ((errors++ % 100u) == 0) {
-				printf("ftm5: report err=%d irq=%#x\n", err, st.irq_status);
-			}
-			if (errors == 10) {
-				touch_report(0, st.x, st.y); /* release after persistent bad reads */
-			}
-		} else {
-			errors = 0;
+		st.dead = false;
+		st.probing = false;
+		errors = 0;
+		if (!touch_clocks() || !touch_se_init()) {
+			say("ftm5: attempt %u of %u: the engine is not ready\n", attempt, retries);
+			continue;
 		}
-		touch_wait(10);
+		if (!touch_ftm5_start() || st.dead) {
+			say("ftm5: attempt %u of %u: bring-up failed\n", attempt, retries);
+			continue;
+		}
+		say("ftm5: running, 1080x2340, every 10 ms (attempt %u of %u)\n", attempt, retries);
+		PE_parse_boot_argn("touch_log", &touch_log, sizeof(touch_log));
+		for (unsigned polls = 1; !st.dead; ++polls) {
+			int err = touch_ftm5();
+
+			if (touch_log && polls % 1000u == 0) {
+				say("ftm5: %u polls, %u events, %u errors, IRQ pin %#x\n", polls, touch_events, errors,
+				    touch_rd(st.gpio, TOUCH_GPIO_IO(9)));
+			}
+			if (err) {
+				if ((errors++ % 100u) == 0) {
+					say("ftm5: report err=%d irq=%#x\n", err, st.irq_status);
+				}
+				if (errors == 10) {
+					touch_report(0, st.x, st.y); /* release after persistent bad reads */
+				}
+			} else {
+				errors = 0;
+			}
+			touch_wait(10);
+		}
+		touch_report(0, st.x, st.y);
+		say("ftm5: the bus stopped answering after %u events: starting over\n", touch_events);
 	}
-	touch_report(0, st.x, st.y);
+	say("ftm5: no touch screen: %u attempts, none lasted\n", retries);
 out:
 	(void)thread_terminate(current_thread());
 	thread_block(THREAD_CONTINUE_NULL);
