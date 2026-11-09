@@ -107,8 +107,8 @@ wait_ms(uint32_t ms)
 
 /* ---- pins ------------------------------------------------------------------------------------------ */
 
-#define TLMM_PHYS               0x03500000UL    /* the TLMM at 0x3400000, its east tile (pinctrl-sm6150: EAST 0x100000) */
-#define TLMM_SIZE               0x100000UL
+#define TLMM_PHYS               0x03900000UL    /* SM7150 TLMM North tile (sm7150.dtsi): holds GPIO 11, 46, 47 */
+#define TLMM_SIZE               0x300000UL
 #define GPIO_CFG(n)             (tlmm + 0x1000UL * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
 #define GPIO_IO(n)              (tlmm + 0x1000UL * (n) + 4)     /* bit 0 in, bit 1 out */
 #define CFG_PULL_UP             3
