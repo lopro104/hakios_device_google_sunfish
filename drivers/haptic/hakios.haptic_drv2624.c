@@ -327,6 +327,9 @@ regs_write(uint8_t reg, const uint8_t *values, unsigned count)
 #define HAPTIC_MAX_MS   1000
 #define RTP_MAX         0x7f
 
+static uint32_t haptic_gain = 45;       /* percentage (1..100, default 45% for subtle crisp tactile clicks) */
+static uint32_t haptic_tap_ms = 16;     /* tap pulse duration in ms (default 16 ms) */
+
 static void
 give_up(const char *why)
 {
@@ -493,11 +496,15 @@ motor_off(void)
 static bool
 play_pulse(unsigned ms)
 {
+	uint8_t amp = (uint8_t)((RTP_MAX * haptic_gain) / 100);
+	if (amp == 0) {
+		amp = 1;
+	}
 	if (ms < 5 || ms > HAPTIC_MAX_MS) {
 		ms = 40;
 	}
-	say("haptic: a pulse of %u ms at amplitude %#04x\n", ms, RTP_MAX);
-	if (!motor_on(RTP_MAX)) {
+	say("haptic: a pulse of %u ms at amplitude %#04x\n", ms, amp);
+	if (!motor_on(amp)) {
 		return false;
 	}
 	wait_ms(ms);
@@ -613,16 +620,24 @@ static const struct cdevsw haptic_cdevsw = {
 };
 
 /* Start a waveform without waiting for it: once, or (`forever') until stopped. */
-/* How strong to play what Darwin plays: from a third of full scale up the strongest, below that down to five eighths of it. */
+/* How strong to play what Darwin plays: scaled by haptic_gain */
 static uint8_t
 amplitude_for(uint32_t peak)
 {
-	uint32_t top = RTP_MAX, low = top * 5 / 8, third = 32767 / 3;
+	uint32_t top = (RTP_MAX * haptic_gain) / 100;
+	if (top == 0) {
+		top = 1;
+	}
+	uint32_t low = top * 3 / 8;
+	if (low == 0) {
+		low = 1;
+	}
+	uint32_t third = 32767 / 3;
 
 	return (uint8_t)(peak >= third ? top : low + (top - low) * peak / third);
 }
 
-#define TAP_PLAY_US     25000           /* a tap: the motor runs this long */
+#define TAP_PLAY_US     ((uint64_t)haptic_tap_ms * 1000)        /* a tap: the motor runs this long */
 
 static void
 serve(void)
@@ -792,6 +807,18 @@ hakios_haptic_init(void)
 	started = true;
 	if (level > 5) {
 		level = 5;
+	}
+	(void)PE_parse_boot_argn("haptic_gain", &haptic_gain, sizeof(haptic_gain));
+	if (haptic_gain == 0) {
+		haptic_gain = 1;
+	} else if (haptic_gain > 100) {
+		haptic_gain = 100;
+	}
+	(void)PE_parse_boot_argn("haptic_tap_ms", &haptic_tap_ms, sizeof(haptic_tap_ms));
+	if (haptic_tap_ms < 5) {
+		haptic_tap_ms = 5;
+	} else if (haptic_tap_ms > 50) {
+		haptic_tap_ms = 50;
 	}
 	if (kernel_thread_start(haptic_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
