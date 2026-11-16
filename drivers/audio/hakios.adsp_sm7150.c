@@ -27,7 +27,10 @@
  *   4  watches SMP2P (its item 443 and what it says) and GLINK (versions both ways, every channel it opens answered
  *              and named) for adsp_watch seconds (default 30)
  *   5  talks   APR on the channel apr_audio_svc, opened from here as well: is the core service's state "up", and what
- *              the audio framework says of its versions (steps 1 to 4 seen on the phone 2026-11-16; 5 not yet)
+ *              the audio framework says of its versions
+ *   6  runs    the secondary I2S port for adsp_hold seconds (default 3): LPASS's core voted, the bit clock, the port's
+ *              format, the port started, LPASS's pins 8 to 11 given to it, the clock pins looked at; then all of it back.
+ *              The amplifiers stay in reset. (steps 1 to 5 seen on the phone 2026-11-16; 6 not yet)
  * adsp_delay=S: seconds after the kernel's start before step 1 (default 45: the root with the firmware is mounted and
  * the modem, which shares the rails' and the always-on processor's mailboxes, has long started).
  * The important lines also go into the loader's log (the kernel's log loses its middle on a long run).
@@ -50,6 +53,7 @@
 
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern int hakios_rpmh_crypto_vote(uint32_t vote);
 extern int hakios_rpmh_arc_votes(const char *const *res, const uint32_t *level, unsigned n);
 extern int hakios_rpmh_ddr_vote(uint32_t vote, bool send);
@@ -595,7 +599,7 @@ tx(const void *data, size_t len)
 	uint32_t head = descs[1], tail = descs[0];
 	uint32_t room = tail <= head ? FIFO_SIZE - head + tail : tail - head;
 	size_t aligned = (len + 7) & ~(size_t)7;
-	uint8_t padded[64];
+	uint8_t padded[256];
 
 	if (aligned > sizeof(padded) || room < aligned + 16) {
 		return false;
@@ -623,6 +627,7 @@ static struct {
 	uint16_t id;
 	uint32_t intent_id, intent_size;         /* one of the DSP's intents, 0: none yet */
 	uint32_t received;
+	uint32_t last_token, last_opcode, last_words[8], last_payload;      /* the newest packet received */
 } apr;
 
 #define APR_HDR_SIZE        20
@@ -675,6 +680,10 @@ apr_received(const uint8_t *p, uint32_t len)
 	memcpy(&opcode, p + 16, 4);
 	memcpy(words, p + header, MIN(len - header, (uint32_t)sizeof(words)));
 	apr.received++;
+	apr.last_token = token;
+	apr.last_opcode = opcode;
+	apr.last_payload = len - header;
+	memcpy(apr.last_words, words, sizeof(apr.last_words));
 	/* (the header's length is the packet's own to say: this DSP answers with 8 words of header, not the 5 we send) */
 	say("adsp: APR: RECEIVED opcode %#x token %u, header %u bytes (first word %#x), %u bytes of payload: %#x %#x %#x %#x %#x %#x %#x %#x\n",
 	    opcode, token, header, (uint32_t)(p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24), len - header, words[0], words[1],
@@ -790,6 +799,10 @@ glink_poll(void)
 			if (msg.cmd == 8) {
 				say("adsp: GLINK: our request for an intent is %s\n", msg.param2 ? "granted" : "REFUSED");
 			}
+			if (msg.cmd == 6 && msg.param1 == apr.id) {     /* done WITHOUT reuse: that intent is gone, the next offer is taken */
+				apr.intent_size = 0;
+				apr.intent_asked = false;
+			}
 			rx_advance(sizeof(msg));
 		} else {
 			say("adsp: GLINK: command %u (%u, %#x) with %u bytes waiting: unknown, queue dropped\n", msg.cmd, msg.param1,
@@ -847,11 +860,199 @@ apr_step(uint32_t steps)
 	}
 }
 
+/* ---- step 6: the port the amplifiers listen on, running; nothing played, the amplifiers left in reset ---- */
+
+#define APR_SVC_AFE             0x04
+#define APR_BASIC_RESULT        0x000110E8u     /* payload: the opcode answered, its status (0 = done) */
+#define AFE_SVC_SET_PARAM       0x000100F3u
+#define AFE_PORT_SET_PARAM_V2   0x000100EFu
+#define AFE_PORT_START          0x000100E5u
+#define AFE_PORT_STOP           0x000100E6u
+#define AFE_HW_VOTE             0x000100F4u     /* answered by 0x000100F5: a handle */
+#define AFE_HW_DEVOTE           0x000100F6u
+#define AFE_PORT_SEC_MI2S_RX    0x1002
+#define AFE_CLK_SEC_MI2S_IBIT   0x102
+#define LPI_PA                  0x62b40000ul    /* LPASS's own pin controller: gpio n at + 0x1000 * n */
+
+/* One APR command and its answer (3 s at most); the answer is in apr.last_*. */
+static bool
+apr_call(uint8_t service, uint16_t port, uint32_t opcode, const void *payload, uint16_t len)
+{
+	static uint32_t token = 0x100;
+	struct {
+		struct glink_msg msg;
+		uint32_t chunk, left;
+		uint8_t apr[APR_HDR_SIZE + 96];
+	} __attribute__((packed)) packet;
+	uint16_t size = (uint16_t)(APR_HDR_SIZE + len);
+
+	if (len > 96) {
+		return false;
+	}
+	for (int waited = 0; apr.intent_size == 0 && waited < 400; waited++) {    /* an intent of the DSP's to send into */
+		if (!apr.intent_asked && waited == 20) {
+			struct glink_msg ask = { .cmd = 7, .param1 = apr.id, .param2 = 256 };
+
+			apr.intent_asked = tx(&ask, sizeof(ask));
+		}
+		sleep_ms(5);
+		glink_poll();
+	}
+	if (apr.intent_size == 0 || size > apr.intent_size) {
+		say("adsp: APR: no intent of the DSP's for %u bytes (it offers %u)\n", size, apr.intent_size);
+		return false;
+	}
+	token++;
+	memset(&packet, 0, sizeof(packet));
+	packet.msg.cmd = 9;
+	packet.msg.param1 = apr.id;
+	packet.msg.param2 = apr.intent_id;
+	packet.chunk = size;
+	packet.apr[0] = 0x50;
+	packet.apr[1] = 0x02;
+	memcpy(&packet.apr[2], &size, 2);
+	packet.apr[4] = service;
+	packet.apr[5] = APR_DOMAIN_APPS;
+	packet.apr[8] = service;
+	packet.apr[9] = APR_DOMAIN_ADSP;
+	memcpy(&packet.apr[10], &port, 2);
+	memcpy(&packet.apr[12], &token, 4);
+	memcpy(&packet.apr[16], &opcode, 4);
+	if (len != 0) {
+		memcpy(&packet.apr[APR_HDR_SIZE], payload, len);
+	}
+	apr.last_token = 0;
+	if (!tx(&packet, 16 + (size_t)size)) {
+		say("adsp: APR: opcode %#x could not be put into the FIFO\n", opcode);
+		return false;
+	}
+	for (int waited = 0; waited < 600; waited++) {
+		sleep_ms(5);
+		glink_poll();
+		if (apr.last_token == token) {
+			return true;
+		}
+	}
+	say("adsp: APR: NO ANSWER to opcode %#x (service %u, port %#x) in 3 s\n", opcode, service, port);
+	return false;
+}
+
+/* ... and one that is answered by the basic result: true when its status is 0. */
+static bool
+afe_do(const char *what, uint16_t port, uint32_t opcode, const void *payload, uint16_t len)
+{
+	bool answered = apr_call(APR_SVC_AFE, port, opcode, payload, len);
+	bool ok = answered && apr.last_opcode == APR_BASIC_RESULT && apr.last_words[0] == opcode && apr.last_words[1] == 0;
+
+	say("adsp: AFE: %s: %s (answer %#x: %#x, status %#x)\n", what, ok ? "done" : answered ? "REFUSED" : "no answer",
+	    apr.last_opcode, apr.last_words[0], apr.last_words[1]);
+	return ok;
+}
+
+static bool
+afe_clock(bool enable)
+{
+	/* in band: the payload's size, then no address and no memory handle; module, parameter, size; the clock */
+	uint32_t body[12] = { 32, 0, 0, 0, 0x0001028F, 0x00010290, 20, 1 /* version */, AFE_CLK_SEC_MI2S_IBIT,
+		              48000 * 16 * 2, 1 /* attribute 1 (couple no), root 0 */, enable };
+
+	return afe_do(enable ? "the bit clock of the secondary I2S, 1.536 MHz, on" : "the bit clock off", 0, AFE_SVC_SET_PARAM, body,
+	    sizeof(body));
+}
+
+static void
+step_port(uint32_t hold_seconds)
+{
+	/* the port's parameter: port and size (16 bits each), no address, no handle; module, parameter, size; the I2S format */
+	struct {
+		uint16_t port, size;
+		uint32_t zero[3];
+		uint32_t module, param;
+		uint16_t param_size, reserved;
+		uint32_t version;
+		uint16_t bits, lane, mono_stereo, ws_source;
+		uint32_t rate;
+		uint16_t format, reserved2;
+	} __attribute__((packed)) i2s = { AFE_PORT_SEC_MI2S_RX, 32, { 0, 0, 0 }, 0x0001020C, 0x0001020D, 20, 0, 1, 16,
+		                          2 /* the data line SD1: on this phone the amplifiers' input (lanes swapped) */, 1 /* stereo */,
+		                          1 /* word select from the DSP */, 48000, 0, 0 };
+	static const uint32_t pins_want[4] = { 0xcc, 0xcc, 0xd0, 0xc8 };       /* gpio 8 clock, 9 word select, 10 SD0, 11 SD1; 8 mA, no pull */
+	struct { uint32_t block; char name[8]; } vote = { 2, "hakios" };
+	uint16_t start[2] = { AFE_PORT_SEC_MI2S_RX, 0 };
+	uint32_t pins_before[4] = { 0 }, handle = 0;
+	bool voted = false, clocked, started = false, pins_set = false;
+	vm_offset_t lpi = 0;
+
+	say("adsp: step 6: the secondary I2S port (AFE %#x) run for %u s; the amplifiers stay in reset, nothing is played\n",
+	    AFE_PORT_SEC_MI2S_RX, hold_seconds);
+	if (apr_call(APR_SVC_AFE, 0, AFE_HW_VOTE, &vote, sizeof(vote)) && apr.last_opcode == 0x000100F5u) {
+		voted = true;
+		handle = apr.last_words[0];
+	}
+	say("adsp: AFE: the vote for LPASS's core (block 2): %s (answer %#x: %#x %#x)\n", voted ? "a handle" : "none; going on without",
+	    apr.last_opcode, apr.last_words[0], apr.last_words[1]);
+	clocked = afe_clock(true);
+	if (clocked && afe_do("the port's format: I2S, 48 kHz, 16 bits, stereo, data on SD1", AFE_PORT_SEC_MI2S_RX, AFE_PORT_SET_PARAM_V2,
+	    &i2s, sizeof(i2s))) {
+		started = afe_do("the port started", AFE_PORT_SEC_MI2S_RX, AFE_PORT_START, start, sizeof(start));
+	}
+	if (started) {
+		/* LPASS's pin controller answers only while its core's clocks run: now, with the port started (a read before hangs the bus) */
+		lpi = ml_io_map(LPI_PA + 0x8000, 0x4000);
+		if (lpi != 0) {
+			uint32_t toggles[2] = { 0, 0 }, last[2] = { 0, 0 };
+
+			pins_set = true;
+			for (unsigned i = 0; i < 4; i++) {
+				volatile uint32_t *cfg = (volatile uint32_t *)(lpi + 0x1000ul * i);
+
+				pins_before[i] = *cfg;
+				*cfg = pins_want[i];
+				__asm__ volatile ("dsb sy" ::: "memory");
+				say("adsp: LPI gpio%u: configuration %#x -> %#x, reads back %#x\n", 8 + i, pins_before[i], pins_want[i], *cfg);
+			}
+			/* do the clock and the word select move? 20000 looks at each pin's input bit, a few microseconds apart */
+			for (unsigned n = 0; n < 20000; n++) {
+				for (unsigned i = 0; i < 2; i++) {
+					uint32_t now = *(volatile uint32_t *)(lpi + 0x1000ul * i + 4) & 1;
+
+					toggles[i] += n != 0 && now != last[i];
+					last[i] = now;
+				}
+			}
+			say("adsp: LPI: in 20000 looks the bit clock (gpio8) changed %u times, the word select (gpio9) %u times: %s\n",
+			    toggles[0], toggles[1], toggles[0] > 100 && toggles[1] > 2 ? "THE PORT'S CLOCKS RUN AT THE PINS" :
+			    "no clocks seen at the pins");
+		}
+		sleep_ms(hold_seconds * 1000);
+		glink_poll();
+	}
+	/* back, in the opposite order; each as far as it was done */
+	if (pins_set) {
+		for (unsigned i = 0; i < 4; i++) {
+			*(volatile uint32_t *)(lpi + 0x1000ul * i) = pins_before[i];
+		}
+		__asm__ volatile ("dsb sy" ::: "memory");
+		say("adsp: LPI gpio 8 to 11 put back as they were\n");
+	}
+	if (started) {
+		(void)afe_do("the port stopped", AFE_PORT_SEC_MI2S_RX, AFE_PORT_STOP, start, sizeof(start));
+	}
+	if (clocked) {
+		(void)afe_clock(false);
+	}
+	if (voted) {
+		uint32_t devote[2] = { 2, handle };
+
+		(void)afe_do("the vote for LPASS's core given back", 0, AFE_HW_DEVOTE, devote, sizeof(devote));
+	}
+}
+
 static void
 step_watch(uint32_t seconds, uint32_t steps)
 {
 	struct glink_msg version = { .cmd = 0, .param1 = 1, .param2 = 1 };
-	bool up = false, linked = false;
+	bool up = false, linked = false, port_done = false;
 	uint32_t valid_before = ~0u, values[16] = { 0 };
 
 	for (uint32_t tick = 0; tick < seconds * 20; tick++) {
@@ -889,6 +1090,13 @@ step_watch(uint32_t seconds, uint32_t steps)
 		} else {
 			glink_poll();
 			apr_step(steps);
+			if (steps >= 6 && !port_done && apr.received >= 2 && apr.intent_size != 0) {
+				uint32_t hold = 3;
+
+				PE_parse_boot_argn("adsp_hold", &hold, sizeof(hold));
+				port_done = true;
+				step_port(MIN(hold, 30u));
+			}
 		}
 	}
 	say("adsp: watched %u s: SMP2P %s, GLINK %s, %u channels opened by the DSP, %u APR packets received\n", seconds,
