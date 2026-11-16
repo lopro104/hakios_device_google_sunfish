@@ -2617,6 +2617,99 @@ wlfw_smmu_identity(uint32_t sid)
 	return (g_smmu[(0x800 + 4 * smr_i) / 4] == ((1u << 31) | sid)) && ((g_smmu[(0xc00 + 4 * smr_i) / 4] >> 16) & 3u) == 0;
 }
 
+/*
+ * For the audio DSP's driver (hakios.adsp_sm7150.c): a translating bank of its own for one stream, `pages' 4 KiB pages
+ * of host memory at `pa' shown at `iova' (below 4 GiB, inside one 2 MiB stretch). The DSP is given 32-bit addresses and
+ * this kernel's memory lies above 4 GiB, so the WLAN's identity bank is no use to it. The same recipe as that bank:
+ * stage 1, tables of 4 KiB (four of them in one 16 KiB page: +0 L0, +0x1000 L1, +0x2000 L2, +0x3000 L3).
+ */
+bool hakios_sm7150_smmu_pages(uint32_t sid, uint64_t iova, uint64_t pa, uint32_t pages);
+bool
+hakios_sm7150_smmu_pages(uint32_t sid, uint64_t iova, uint64_t pa, uint32_t pages)
+{
+	uint32_t idr0, idr1, idr2, nsmr, ncb, page, cb_base, pasize, smr_i = ~0u, free_smr = ~0u;
+	uint8_t used[128] = { 0 };
+	vm_offset_t pt = 0;
+	volatile uint64_t *t;
+	uint64_t pt_pa;
+	int cb = -1;
+	unsigned tries = 0;
+
+	if (pages == 0 || pages > 512 - ((iova >> 12) & 511) || ((iova | pa) & 0xfff) != 0 || iova >= (1ull << 32)) {
+		return false;
+	}
+	if (g_smmu == NULL) {
+		g_smmu = (volatile uint32_t *)ml_io_map_unmappable(APPS_SMMU, 0x100000, WIMG_IO);
+		if (g_smmu == NULL) {
+			return false;
+		}
+	}
+	idr0 = g_smmu[0x20 / 4];
+	idr1 = g_smmu[0x24 / 4];
+	idr2 = g_smmu[0x28 / 4];
+	nsmr = MIN(idr0 & 0xffu, 128u);
+	ncb = MIN(idr1 & 0xffu, 128u);
+	page = (idr1 >> 31) ? 0x10000 : 0x1000;
+	cb_base = (1u << (((idr1 >> 28) & 7u) + 1u)) * page;
+	pasize = MIN((idr2 >> 4) & 0xfu, 2u);
+	for (uint32_t i = 0; i < nsmr; i++) {
+		uint32_t smr = g_smmu[(0x800 + 4 * i) / 4], s2cr = g_smmu[(0xc00 + 4 * i) / 4];
+
+		if (!(smr & (1u << 31))) {
+			if (free_smr == ~0u) {
+				free_smr = i;
+			}
+			continue;
+		}
+		if (((s2cr >> 16) & 3u) == 0 && (s2cr & 0xffu) < 128) {
+			used[s2cr & 0xffu] = 1;
+		}
+		if ((smr & 0x80007fffu) == ((1u << 31) | sid)) {
+			smr_i = i;              /* an exact entry for this stream already */
+		}
+	}
+	if (smr_i == ~0u) {
+		smr_i = free_smr;
+	}
+	if (smr_i == ~0u || kmem_alloc_contig(kernel_map, &pt, 0x4000, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		ev("SMMU: no stream match register or no memory for %#x", sid);
+		return false;
+	}
+	t = (volatile uint64_t *)pt;
+	pt_pa = kvtophys(pt);
+	t[(iova >> 39) & 511] = (pt_pa + 0x1000) | 3;                           /* L0 -> L1 */
+	t[0x1000 / 8 + ((iova >> 30) & 511)] = (pt_pa + 0x2000) | 3;            /* L1 -> L2 */
+	t[0x2000 / 8 + ((iova >> 21) & 511)] = (pt_pa + 0x3000) | 3;            /* L2 -> L3 */
+	for (uint32_t i = 0; i < pages; i++) {                                  /* pages: PA | AF | SH outer | AP RW | attr 0 | page */
+		t[0x3000 / 8 + ((iova >> 12) & 511) + i] = (pa + ((uint64_t)i << 12)) | (1u << 10) | (2u << 8) | (1u << 6) | 3u;
+	}
+	for (int o = 0; o < 0x4000; o += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" ((uint8_t *)pt + o) : "memory");
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (int n = (int)ncb - 1; n >= 0 && tries < 3; n--) {
+		uint32_t cbo = cb_base + (uint32_t)n * page;
+
+		if (used[n] || n == g_smmu_bank || cbo + page > 0x100000 || (g_smmu[(cbo + CB_SCTLR) / 4] & 1u)) {
+			continue;
+		}
+		tries++;
+		if (wlfw_smmu_bank_setup(page, cbo, (uint32_t)n, pasize, pt_pa)) {
+			cb = n;
+			break;
+		}
+	}
+	if (cb < 0) {
+		ev("SMMU: no context bank taken for %#x", sid);
+		return false;
+	}
+	smmu_wr(0xc00 + 4 * smr_i, (uint32_t)cb);                               /* S2CR: translate, bank */
+	smmu_wr(0x800 + 4 * smr_i, (1u << 31) | sid);                           /* SMR: valid, exact */
+	ev("SMMU: sid %#x -> smr%u %#x s2cr %#x (bank %d), %u pages at iova %#llx -> pa %#llx", sid, smr_i, g_smmu[(0x800 + 4 * smr_i) / 4],
+	    g_smmu[(0xc00 + 4 * smr_i) / 4], cb, pages, iova, pa);
+	return (g_smmu[(0x800 + 4 * smr_i) / 4] == ((1u << 31) | sid)) && ((g_smmu[(0xc00 + 4 * smr_i) / 4] >> 16) & 3u) == 0;
+}
+
 #define CE_RX_BUF       2048
 
 /*

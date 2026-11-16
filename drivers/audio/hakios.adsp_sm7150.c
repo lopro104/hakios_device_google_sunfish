@@ -32,7 +32,12 @@
  *              format, the port started, LPASS's pins 8 to 11 given to it, the clock pins looked at; then all of it back.
  *              The amplifiers stay in reset. (steps 1 to 6 seen on the phone 2026-11-16)
  *   7  ... and with the port running, the bottom speaker's amplifier (0x41) configured at -102 dB and powered up with
- *              no samples played: its PLL lock and power-up are reported, then it goes back into reset. Silent. (not yet run)
+ *              no samples played: its PLL lock and power-up are reported, then it goes back into reset. Silent.
+ *              (seen on the phone 2026-11-16: PLL_LOCK and PUP_DONE after 3 ms)
+ *   8  A TONE  (instead of 7): a buffer shown to the DSP through the SMMU (stream 0x1b21), a device path (ADM) to the
+ *              port, a stream (ASM) routed to it, 1 kHz at -20 dBFS written for adsp_tone seconds (default 2, at most 3);
+ *              the amplifier at 0x41, adsp_below decibels down (default 30, 20 at least), on once the DSP takes the
+ *              samples and never for more than 3 s; then everything back. AUDIBLE. (not yet run)
  * adsp_delay=S: seconds after the kernel's start before step 1 (default 45: the root with the firmware is mounted and
  * the modem, which shares the rails' and the always-on processor's mailboxes, has long started).
  * The important lines also go into the loader's log (the kernel's log loses its middle on a long run).
@@ -63,6 +68,7 @@ extern uint64_t kvtophys(vm_offset_t va);
 extern void loader_log_putc(char c);
 extern kern_return_t thread_terminate(thread_t);
 extern bool hakios_sm7150_aop_send(const char *msg);
+extern bool hakios_sm7150_smmu_pages(uint32_t sid, uint64_t iova, uint64_t pa, uint32_t pages);     /* hakios.mpss_sm7150.c */
 extern bool hakios_amp_prepare(uint8_t address, int vol_db);      /* hakios.cs35l41_sunfish.c */
 extern bool hakios_amp_start(void);
 extern void hakios_amp_stop(void);            /* hakios.mpss_sm7150.c: the one mailbox, the one sender */
@@ -633,6 +639,9 @@ static struct {
 	uint32_t intent_id, intent_size;         /* one of the DSP's intents, 0: none yet */
 	uint32_t received;
 	uint32_t last_token, last_opcode, last_words[8], last_payload;      /* the newest packet received */
+	bool intent_busy;                        /* sent into, and the DSP has not said it is done with it */
+	uint32_t written_done, write_errors, underflows;     /* the stream's events (step 8) */
+	uint32_t done_periods;                   /* bit p: period p's buffer is ours again */
 } apr;
 
 #define APR_HDR_SIZE        20
@@ -685,6 +694,22 @@ apr_received(const uint8_t *p, uint32_t len)
 	memcpy(&opcode, p + 16, 4);
 	memcpy(words, p + header, MIN(len - header, (uint32_t)sizeof(words)));
 	apr.received++;
+	if (opcode == 0x00010D99u && (token & 0x80000000u)) {      /* a period was played: buffer address (2 words), handle, status */
+		apr.written_done++;
+		apr.write_errors += words[3] != 0;
+		apr.done_periods |= 1u << (token & 7u);
+		return;
+	}
+	if (opcode == 0x00010C17u) {                              /* the stream ran dry */
+		apr.underflows++;
+		return;
+	}
+	if (opcode == 0x000110E8u && (token & 0x80000000u)) {      /* a write refused outright */
+		apr.write_errors++;
+		apr.done_periods |= 1u << (token & 7u);
+		say("adsp: APR: the write of period %u was refused (status %#x)\n", token & 7u, words[1]);
+		return;
+	}
 	apr.last_token = token;
 	apr.last_opcode = opcode;
 	apr.last_payload = len - header;
@@ -804,6 +829,9 @@ glink_poll(void)
 			if (msg.cmd == 8) {
 				say("adsp: GLINK: our request for an intent is %s\n", msg.param2 ? "granted" : "REFUSED");
 			}
+			if ((msg.cmd == 6 || msg.cmd == 14) && msg.param1 == apr.id) {
+				apr.intent_busy = false;
+			}
 			if (msg.cmd == 6 && msg.param1 == apr.id) {     /* done WITHOUT reuse: that intent is gone, the next offer is taken */
 				apr.intent_size = 0;
 				apr.intent_asked = false;
@@ -879,11 +907,10 @@ apr_step(uint32_t steps)
 #define AFE_CLK_SEC_MI2S_IBIT   0x102
 #define LPI_PA                  0x62b40000ul    /* LPASS's own pin controller: gpio n at + 0x1000 * n */
 
-/* One APR command and its answer (3 s at most); the answer is in apr.last_*. */
+/* One APR packet sent with `token' (the DSP's one intent is waited for: one packet in it at a time). */
 static bool
-apr_call(uint8_t service, uint16_t port, uint32_t opcode, const void *payload, uint16_t len)
+apr_post(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode, const void *payload, uint16_t len)
 {
-	static uint32_t token = 0x100;
 	struct {
 		struct glink_msg msg;
 		uint32_t chunk, left;
@@ -894,20 +921,20 @@ apr_call(uint8_t service, uint16_t port, uint32_t opcode, const void *payload, u
 	if (len > 96) {
 		return false;
 	}
-	for (int waited = 0; apr.intent_size == 0 && waited < 400; waited++) {    /* an intent of the DSP's to send into */
-		if (!apr.intent_asked && waited == 20) {
+	for (int waited = 0; (apr.intent_size == 0 || apr.intent_busy) && waited < 400; waited++) {
+		if (apr.intent_size == 0 && !apr.intent_asked && waited == 20) {
 			struct glink_msg ask = { .cmd = 7, .param1 = apr.id, .param2 = 256 };
 
 			apr.intent_asked = tx(&ask, sizeof(ask));
 		}
-		sleep_ms(5);
+		sleep_ms(1);
 		glink_poll();
 	}
-	if (apr.intent_size == 0 || size > apr.intent_size) {
-		say("adsp: APR: no intent of the DSP's for %u bytes (it offers %u)\n", size, apr.intent_size);
+	if (apr.intent_size == 0 || apr.intent_busy || size > apr.intent_size) {
+		say("adsp: APR: no intent of the DSP's free for %u bytes (it offers %u, %s)\n", size, apr.intent_size,
+		    apr.intent_busy ? "still in use" : "not in use");
 		return false;
 	}
-	token++;
 	memset(&packet, 0, sizeof(packet));
 	packet.msg.cmd = 9;
 	packet.msg.param1 = apr.id;
@@ -918,6 +945,9 @@ apr_call(uint8_t service, uint16_t port, uint32_t opcode, const void *payload, u
 	memcpy(&packet.apr[2], &size, 2);
 	packet.apr[4] = service;
 	packet.apr[5] = APR_DOMAIN_APPS;
+	if (service == 0x07) {                  /* a stream's packets come from its own port, as they go to it */
+		memcpy(&packet.apr[6], &port, 2);
+	}
 	packet.apr[8] = service;
 	packet.apr[9] = APR_DOMAIN_ADSP;
 	memcpy(&packet.apr[10], &port, 2);
@@ -926,13 +956,28 @@ apr_call(uint8_t service, uint16_t port, uint32_t opcode, const void *payload, u
 	if (len != 0) {
 		memcpy(&packet.apr[APR_HDR_SIZE], payload, len);
 	}
-	apr.last_token = 0;
+	apr.intent_busy = true;
 	if (!tx(&packet, 16 + (size_t)size)) {
+		apr.intent_busy = false;
 		say("adsp: APR: opcode %#x could not be put into the FIFO\n", opcode);
 		return false;
 	}
-	for (int waited = 0; waited < 600; waited++) {
-		sleep_ms(5);
+	return true;
+}
+
+/* One APR command and its answer (3 s at most); the answer is in apr.last_*. */
+static bool
+apr_call(uint8_t service, uint16_t port, uint32_t opcode, const void *payload, uint16_t len)
+{
+	static uint32_t token = 0x100;
+
+	token++;
+	apr.last_token = 0;
+	if (!apr_post(service, port, token, opcode, payload, len)) {
+		return false;
+	}
+	for (int waited = 0; waited < 3000; waited++) {
+		sleep_ms(1);
 		glink_poll();
 		if (apr.last_token == token) {
 			return true;
@@ -965,8 +1010,183 @@ afe_clock(bool enable)
 	    sizeof(body));
 }
 
+/* ---- step 8: a tone. The first thing here that can be heard. ---- */
+
+#define APR_SVC_ASM             0x07
+#define APR_SVC_ADM             0x08
+#define ASM_MAP                 0x00010D92u     /* answered by 0x00010D93: the handle */
+#define ASM_UNMAP               0x00010D94u
+#define ASM_OPEN_WRITE          0x00010DB3u
+#define ASM_FORMAT              0x00010D98u
+#define ASM_RUN                 0x00010DAAu
+#define ASM_PAUSE               0x00010BD3u
+#define ASM_WRITE               0x00010DABu     /* its event when played: 0x00010D99 */
+#define ASM_CLOSE               0x00010BCDu
+#define ADM_OPEN                0x00010326u     /* answered by 0x00010329: status, the device path's id */
+#define ADM_CLOSE               0x00010327u
+#define ADM_ROUTE               0x00010325u
+#define STREAM_PORT             0x0101          /* session 1, stream 1 */
+#define PERIODS                 8
+#define PERIOD_FRAMES           480             /* 10 ms at 48 kHz */
+#define PERIOD_BYTES            (PERIOD_FRAMES * 4)
+#define PERIOD_STRIDE           0x1000
+#define TONE_SID                0x1b21          /* the audio stream of the application processors' SMMU (qcom,msm-audio-ion) */
+#define TONE_IOVA               0xa0000000ull
+#define TONE_DSP_ADDRESS        (TONE_IOVA | 1ull << 32)        /* the stream's low four bits in bits 32 to 35 */
+
+static bool
+basic_ok(const char *what, uint8_t service, uint16_t port, uint32_t opcode, const void *payload, uint16_t len)
+{
+	bool answered = apr_call(service, port, opcode, payload, len);
+	bool ok = answered && apr.last_opcode == APR_BASIC_RESULT && apr.last_words[0] == opcode && apr.last_words[1] == 0;
+
+	say("adsp: stream: %s: %s (answer %#x: %#x, status %#x)\n", what, ok ? "done" : answered ? "REFUSED" : "no answer",
+	    apr.last_opcode, apr.last_words[0], apr.last_words[1]);
+	return ok;
+}
+
+static int16_t *tone_buffer;
+static uint32_t tone_at, tone_handle, tone_sent;
+
+/* A period of 1 kHz at -20 dBFS in both channels (or of silence), where the DSP reads it, and the write that says so. */
+static bool
+tone_write(uint32_t period, bool sound)
+{
+	static const int16_t quarter[13] = { 0, 428, 848, 1254, 1638, 1995, 2317, 2600, 2838, 3027, 3165, 3249, 3277 };
+	int16_t *p = (int16_t *)((uint8_t *)tone_buffer + PERIOD_STRIDE * period);
+	uint64_t address = TONE_DSP_ADDRESS + PERIOD_STRIDE * period;
+	uint32_t write[8] = { (uint32_t)address, (uint32_t)(address >> 32), tone_handle, PERIOD_BYTES, period, 0, 0, 0 };
+
+	for (uint32_t f = 0; f < PERIOD_FRAMES; f++) {
+		uint32_t k = tone_at++ % 48, q = k % 24;
+		int16_t v = quarter[q <= 12 ? q : 24 - q];
+
+		p[2 * f] = p[2 * f + 1] = !sound ? 0 : k < 24 ? v : (int16_t)-v;
+	}
+	for (uint32_t o = 0; o < PERIOD_BYTES; o += 64) {       /* the DSP reads the memory, not this processor's cache */
+		__asm__ volatile ("dc cvac, %0" : : "r" ((uint8_t *)p + o) : "memory");
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	tone_sent++;
+	return apr_post(APR_SVC_ASM, STREAM_PORT, 0x80000000u | period, ASM_WRITE, write, sizeof(write));
+}
+
+/* With the port running: the buffer, the path, the stream, the tone; the amplifier on once the DSP takes the samples. */
 static void
-step_port(uint32_t hold_seconds, bool with_amp)
+step_tone(void)
+{
+	struct { uint16_t pool, regions; uint32_t property, low, high, size; } __attribute__((packed)) map =
+	    { 3 /* pages of 4 KiB */, 1, 0, (uint32_t)TONE_DSP_ADDRESS, (uint32_t)(TONE_DSP_ADDRESS >> 32), PERIODS * PERIOD_STRIDE };
+	struct { uint16_t flags, mode, endpoint1, endpoint2; uint32_t topology; uint16_t channels, bits; uint32_t rate; uint8_t channel_map[8]; }
+	__attribute__((packed)) path = { 0, 1 /* playback */, AFE_PORT_SEC_MI2S_RX, 0xffff, 0x00010312 /* no processing */, 2, 16, 48000, { 1, 2 } };
+	struct { uint32_t flags; uint16_t sink, bits; uint32_t topology, format; } __attribute__((packed)) open =
+	    { 0, 0, 16, 0x00010C68 /* no processing */, 0x00010DA5 /* linear PCM, channels mapped */ };
+	struct { uint32_t matrix, sessions; uint16_t session, paths, path[2]; } __attribute__((packed)) route = { 0, 1, 1, 1, { 0, 0 } };
+	struct { uint32_t size; uint16_t channels, bits; uint32_t rate; uint16_t is_signed, reserved; uint8_t channel_map[8]; }
+	__attribute__((packed)) format = { 20, 2, 16, 48000, 1, 0, { 1, 2 } };
+	uint32_t run[3] = { 0, 0, 0 }, seconds = 2, tone_periods, played = 0, path_id = 0;
+	int volume = -30;
+	uint32_t below = 30;
+	bool mapped = false, path_open = false, stream_open = false, running = false, amp_ready = false, amp_on = false;
+	vm_offset_t memory = 0;
+
+	PE_parse_boot_argn("adsp_tone", &seconds, sizeof(seconds));
+	PE_parse_boot_argn("adsp_below", &below, sizeof(below));        /* decibels under the amplifier's full digital volume: 20 at least */
+	seconds = MIN(MAX(seconds, 1u), 3u);
+	volume = -(int)MIN(MAX(below, 20u), 102u);
+	tone_periods = seconds * 100;
+	say("adsp: step 8: A TONE: 1 kHz at -20 dBFS for %u s from the bottom speaker, its amplifier at %d dB\n", seconds, volume);
+
+	if (kmem_alloc_contig(kernel_map, &memory, PERIODS * PERIOD_STRIDE, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) !=
+	    KERN_SUCCESS || !hakios_sm7150_smmu_pages(TONE_SID, TONE_IOVA, kvtophys(memory), PERIODS * PERIOD_STRIDE >> 12)) {
+		say("adsp: stream: no buffer the DSP can read (memory or the SMMU)\n");
+		return;
+	}
+	tone_buffer = (int16_t *)memory;
+	say("adsp: stream: %u bytes at pa %#llx shown to the DSP as %#llx (stream %#x)\n", PERIODS * PERIOD_STRIDE, kvtophys(memory),
+	    TONE_DSP_ADDRESS, TONE_SID);
+	/* the amplifier configured and read back before anything plays; GLOBAL_EN only once the DSP is taking samples */
+	amp_ready = hakios_amp_prepare(0x41, volume);
+	if (!amp_ready) {
+		say("adsp: the amplifier is not ready: the stream is run without it (nothing will be heard)\n");
+	}
+	if (apr_call(APR_SVC_ASM, 0, ASM_MAP, &map, sizeof(map)) && apr.last_opcode == 0x00010D93u && apr.last_words[0] != 0) {
+		mapped = true;
+		tone_handle = apr.last_words[0];
+	}
+	say("adsp: stream: the buffer made known to the DSP: %s (answer %#x: %#x %#x)\n", mapped ? "a handle" : "REFUSED", apr.last_opcode,
+	    apr.last_words[0], apr.last_words[1]);
+	if (mapped && apr_call(APR_SVC_ADM, AFE_PORT_SEC_MI2S_RX, ADM_OPEN, &path, sizeof(path)) && apr.last_opcode == 0x00010329u &&
+	    apr.last_words[0] == 0) {
+		path_open = true;
+		path_id = apr.last_words[1] & 0xffff;
+	}
+	if (mapped) {
+		say("adsp: stream: the device path to the port: %s (answer %#x: status %#x, id %u)\n", path_open ? "open" : "REFUSED",
+		    apr.last_opcode, apr.last_words[0], path_id);
+	}
+	if (path_open) {
+		route.path[0] = (uint16_t)path_id;
+		stream_open = basic_ok("the stream opened for writing", APR_SVC_ASM, STREAM_PORT, ASM_OPEN_WRITE, &open, sizeof(open));
+	}
+	if (stream_open && basic_ok("the stream routed to the path", APR_SVC_ADM, 0, ADM_ROUTE, &route, sizeof(route)) &&
+	    basic_ok("the stream's format: 48 kHz, 16 bits, stereo", APR_SVC_ASM, STREAM_PORT, ASM_FORMAT, &format, sizeof(format))) {
+		running = basic_ok("the stream run", APR_SVC_ASM, STREAM_PORT, ASM_RUN, run, sizeof(run));
+	}
+	if (running) {
+		uint32_t waited = 0, amp_ms = 0;
+		bool wrote = true;
+
+		apr.done_periods = 0;
+		apr.written_done = apr.write_errors = apr.underflows = 0;
+		tone_sent = 0;
+		for (uint32_t p = 0; p < PERIODS && wrote; p++) {
+			wrote = tone_write(p, true);
+		}
+		/* until the tone's periods are played (and at most 6 s): a period that comes back is filled and written again */
+		while (wrote && played < tone_periods && waited < 6000) {
+			sleep_ms(1);
+			waited++;
+			glink_poll();
+			for (uint32_t p = 0; p < PERIODS && wrote; p++) {
+				if (apr.done_periods & (1u << p)) {
+					apr.done_periods &= ~(1u << p);
+					played++;
+					if (tone_sent < tone_periods + PERIODS) {
+						wrote = tone_write(p, tone_sent < tone_periods);
+					}
+				}
+			}
+			if (amp_ready && !amp_on && apr.written_done >= 1) {     /* the DSP takes the samples: the bit clock carries them */
+				amp_on = hakios_amp_start();
+				say("adsp: THE AMPLIFIER IS %s with the tone playing\n", amp_on ? "ON" : "NOT on");
+				amp_ready = amp_on;
+			}
+			if (amp_on && ++amp_ms >= 3000) {
+				break;                                  /* never on for more than 3 s */
+			}
+		}
+		say("adsp: stream: %u periods written, %u played (%u with an error), %u underflows, in %u ms\n", tone_sent, apr.written_done,
+		    apr.write_errors, apr.underflows, waited);
+	}
+	/* back: the amplifier first, then the stream, the path, the buffer */
+	hakios_amp_stop();
+	if (running) {
+		(void)basic_ok("the stream paused", APR_SVC_ASM, STREAM_PORT, ASM_PAUSE, NULL, 0);
+	}
+	if (stream_open) {
+		(void)basic_ok("the stream closed", APR_SVC_ASM, STREAM_PORT, ASM_CLOSE, NULL, 0);
+	}
+	if (path_open) {
+		(void)basic_ok("the device path closed", APR_SVC_ADM, (uint16_t)path_id, ADM_CLOSE, NULL, 0);
+	}
+	if (mapped) {
+		(void)basic_ok("the buffer taken back from the DSP", APR_SVC_ASM, 0, ASM_UNMAP, &tone_handle, sizeof(tone_handle));
+	}
+}
+
+static void
+step_port(uint32_t hold_seconds, bool with_amp, bool with_tone)
 {
 	/* the port's parameter: port and size (16 bits each), no address, no handle; module, parameter, size; the I2S format */
 	struct {
@@ -1029,7 +1249,9 @@ step_port(uint32_t hold_seconds, bool with_amp)
 			    toggles[0], toggles[1], toggles[0] > 100 && toggles[1] > 2 ? "THE PORT'S CLOCKS RUN AT THE PINS" :
 			    "no clocks seen at the pins");
 		}
-		if (with_amp && pins_set) {
+		if (with_tone && pins_set) {
+			step_tone();
+		} else if (with_amp && pins_set) {
 			/*
 			 * Step 7: the bottom speaker's amplifier (0x41) brought up on this clock at its lowest volume (-102 dB) with
 			 * nothing played into the port: does it take its configuration, does its PLL lock to the bit clock, does it
@@ -1116,7 +1338,7 @@ step_watch(uint32_t seconds, uint32_t steps)
 
 				PE_parse_boot_argn("adsp_hold", &hold, sizeof(hold));
 				port_done = true;
-				step_port(MIN(hold, 30u), steps >= 7);
+				step_port(MIN(hold, 30u), steps == 7, steps >= 8);
 			}
 		}
 	}
