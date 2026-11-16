@@ -3,7 +3,7 @@
  * Milestone 0 of sound and of the sensors (which this phone has behind the same DSP): the DSP runs, says so over SMP2P,
  * and opens its GLINK channels, whose names are written down. Nothing of audio is played yet.
  *
- * Status: COMPILED ONLY (2026-11-16). Not run on the phone.
+ * Status: steps 1 to 4 RUN ON THE PHONE 2026-11-16 (logs/140814-run.log): started, SMP2P up, six channels opened by the DSP.
  *
  * The way is the modem's on this phone (hakios.mpss_sm7150.c, which runs: PAS load, SMEM, SMP2P, GLINK by polling), with
  * the DSP's own numbers, each from the phone's Android device tree (scratch/android-ref/dt, read off the phone):
@@ -26,6 +26,8 @@
  *              authenticate and start the DSP; tells the always-on processor
  *   4  watches SMP2P (its item 443 and what it says) and GLINK (versions both ways, every channel it opens answered
  *              and named) for adsp_watch seconds (default 30)
+ *   5  talks   APR on the channel apr_audio_svc, opened from here as well: is the core service's state "up", and what
+ *              the audio framework says of its versions (steps 1 to 4 seen on the phone 2026-11-16; 5 not yet)
  * adsp_delay=S: seconds after the kernel's start before step 1 (default 45: the root with the firmware is mounted and
  * the modem, which shares the rails' and the always-on processor's mailboxes, has long started).
  * The important lines also go into the loader's log (the kernel's log loses its middle on a long run).
@@ -611,9 +613,82 @@ tx(const void *data, size_t len)
 
 static uint32_t channels;
 
+/*
+ * Step 5: the one channel spoken on, "apr_audio_svc" (Linux's apr.c: APR packets as GLINK data). Our id for it is the
+ * DSP's own (so the two conventions for whose id a data message carries agree). Its receive buffers ("intents") are what
+ * we may send into; ours (one, 4096 bytes, reused) is what it sends into.
+ */
+static struct {
+	bool remote_open, open_sent, acked, intent_asked;
+	uint16_t id;
+	uint32_t intent_id, intent_size;         /* one of the DSP's intents, 0: none yet */
+	uint32_t received;
+} apr;
+
+#define APR_HDR_SIZE        20
+#define APR_SVC_CORE        0x03
+#define APR_DOMAIN_ADSP     0x04
+#define APR_DOMAIN_APPS     0x05
+#define AVCS_GET_STATE      0x0001290Cu      /* answered by 0x0001290D: one word, 1 = the audio services are up */
+#define AVCS_GET_FWK        0x0001292Cu      /* answered by 0x0001292D: the framework's versions and its services */
+
+static bool
+apr_send(uint32_t opcode, uint32_t token)
+{
+	struct {
+		struct glink_msg msg;           /* TX_DATA: param1 our channel id, param2 the intent used */
+		uint32_t chunk, left;
+		uint8_t apr[APR_HDR_SIZE];
+	} __attribute__((packed)) packet;
+
+	if (apr.intent_id == 0 && apr.intent_size == 0) {
+		return false;
+	}
+	memset(&packet, 0, sizeof(packet));
+	packet.msg.cmd = 9;
+	packet.msg.param1 = apr.id;
+	packet.msg.param2 = apr.intent_id;
+	packet.chunk = APR_HDR_SIZE;
+	packet.apr[0] = 0x50;                   /* version 0, header of 5 words */
+	packet.apr[1] = 0x02;                   /* a command that is answered */
+	packet.apr[2] = APR_HDR_SIZE;           /* the packet's size, 16 bits */
+	packet.apr[4] = APR_SVC_CORE;           /* from: service, domain, port (16 bits) */
+	packet.apr[5] = APR_DOMAIN_APPS;
+	packet.apr[8] = APR_SVC_CORE;           /* to */
+	packet.apr[9] = APR_DOMAIN_ADSP;
+	memcpy(&packet.apr[12], &token, 4);
+	memcpy(&packet.apr[16], &opcode, 4);
+	say("adsp: APR: sending opcode %#x (token %u) into the DSP's intent %u\n", opcode, token, apr.intent_id);
+	return tx(&packet, sizeof(packet));
+}
+
+static void
+apr_received(const uint8_t *p, uint32_t len)
+{
+	uint32_t opcode = 0, token = 0, words[8] = { 0 }, header = len >= 1 ? (uint32_t)(p[0] >> 4) * 4 : 0;
+
+	if (len < APR_HDR_SIZE || header < APR_HDR_SIZE || header > len) {
+		say("adsp: APR: %u bytes with a header of %u: not a packet\n", len, header);
+		return;
+	}
+	memcpy(&token, p + 12, 4);
+	memcpy(&opcode, p + 16, 4);
+	memcpy(words, p + header, MIN(len - header, (uint32_t)sizeof(words)));
+	apr.received++;
+	/* (the header's length is the packet's own to say: this DSP answers with 8 words of header, not the 5 we send) */
+	say("adsp: APR: RECEIVED opcode %#x token %u, header %u bytes (first word %#x), %u bytes of payload: %#x %#x %#x %#x %#x %#x %#x %#x\n",
+	    opcode, token, header, (uint32_t)(p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24), len - header, words[0], words[1],
+	    words[2], words[3], words[4], words[5], words[6], words[7]);
+	if (opcode == 0x0001290D) {
+		say("adsp: APR: THE AUDIO SERVICES ARE %s\n", words[0] == 1 ? "UP" : "not up yet");
+	}
+}
+
 static void
 glink_poll(void)
 {
+	static uint8_t data[512];
+
 	for (int iter = 0; iter < 32; iter++) {
 		uint32_t head = descs[3], tail = descs[2];
 		uint32_t have = head >= tail ? head - tail : FIFO_SIZE - tail + head;
@@ -643,20 +718,137 @@ glink_poll(void)
 			rx_peek((tail + (uint32_t)sizeof(msg)) % FIFO_SIZE, name, MIN(name_len, (uint32_t)sizeof(name) - 1));
 			rx_advance(packet);
 			channels++;
-			say("adsp: GLINK: THE DSP OPENS CHANNEL \"%s\" (its id %u); acknowledged, not opened from here yet\n", name,
-			    msg.param1);
+			say("adsp: GLINK: THE DSP OPENS CHANNEL \"%s\" (its id %u); acknowledged\n", name, msg.param1);
 			(void)tx(&ack, sizeof(ack));
+			if (strcmp(name, "apr_audio_svc") == 0) {
+				apr.remote_open = true;
+				apr.id = msg.param1;
+			}
+		} else if (msg.cmd == 4) {                      /* OPEN_ACK: param1 our id */
+			rx_advance(sizeof(msg));
+			if (apr.open_sent && msg.param1 == apr.id) {
+				apr.acked = true;
+				say("adsp: GLINK: the DSP acknowledges our opening of apr_audio_svc\n");
+			}
+		} else if (msg.cmd == 5) {                      /* INTENT: param1 its channel id, param2 how many; then (size, id) each */
+			uint32_t count = msg.param2, packet = ((uint32_t)sizeof(msg) + count * 8 + 7) & ~7u;
+
+			if (count > 32) {
+				say("adsp: GLINK: %u intents at once: the queue is out of step; dropped\n", count);
+				rx_advance(have);
+				return;
+			}
+			if (have < packet) {
+				return;
+			}
+			for (uint32_t i = 0; i < count; i++) {
+				uint32_t pair[2];
+
+				rx_peek((tail + (uint32_t)sizeof(msg) + i * 8) % FIFO_SIZE, pair, sizeof(pair));
+				if (msg.param1 == apr.id && apr.remote_open && pair[0] >= 64 && apr.intent_size == 0) {
+					apr.intent_size = pair[0];
+					apr.intent_id = pair[1];
+					say("adsp: GLINK: the DSP offers an intent of %u bytes (id %u) on apr_audio_svc\n", pair[0], pair[1]);
+				}
+			}
+			rx_advance(packet);
+		} else if (msg.cmd == 9 || msg.cmd == 12) {     /* TX_DATA: param1 its channel id, param2 our intent; chunk, left; data */
+			uint32_t sizes[2], packet;
+
+			if (have < sizeof(msg) + 8) {
+				return;
+			}
+			rx_peek((tail + (uint32_t)sizeof(msg)) % FIFO_SIZE, sizes, sizeof(sizes));
+			packet = ((uint32_t)sizeof(msg) + 8 + sizes[0] + 7) & ~7u;
+			if (sizes[0] > FIFO_SIZE / 2) {
+				say("adsp: GLINK: data of %u bytes: the queue is out of step; dropped\n", sizes[0]);
+				rx_advance(have);
+				return;
+			}
+			if (have < packet) {
+				return;
+			}
+			if (msg.param1 == apr.id && apr.remote_open) {
+				struct glink_msg done = { .cmd = 14, .param1 = apr.id, .param2 = msg.param2 };    /* RX_DONE, the intent kept */
+				uint32_t n = MIN(sizes[0], (uint32_t)sizeof(data));
+
+				rx_peek((tail + (uint32_t)sizeof(msg) + 8) % FIFO_SIZE, data, n);
+				rx_advance(packet);
+				apr_received(data, n);
+				(void)tx(&done, sizeof(done));
+			} else {
+				rx_advance(packet);
+				say("adsp: GLINK: %u bytes of data on its channel %u: not ours, let go\n", sizes[0], msg.param1);
+			}
+		} else if (msg.cmd == 7) {                      /* RX_INTENT_REQ: param1 its channel id, param2 the size it wants of us */
+			struct glink_msg ack = { .cmd = 8, .param1 = msg.param1, .param2 = msg.param1 == apr.id ? 1 : 0 };
+
+			rx_advance(sizeof(msg));
+			(void)tx(&ack, sizeof(ack));
+		} else if (msg.cmd == 6 || msg.cmd == 14 || msg.cmd == 8 || msg.cmd == 15 || msg.cmd == 13 || msg.cmd == 3 || msg.cmd == 11) {
+			/* done with what we sent (the intent is ours to use again), an intent request's answer, signals, notices, closes */
+			if (msg.cmd == 8) {
+				say("adsp: GLINK: our request for an intent is %s\n", msg.param2 ? "granted" : "REFUSED");
+			}
+			rx_advance(sizeof(msg));
 		} else {
-			/* anything else belongs to a channel we have not opened: said once, and the queue emptied */
-			say("adsp: GLINK: command %u (%u, %#x) with %u bytes waiting: not handled in this step, queue dropped\n", msg.cmd,
-			    msg.param1, msg.param2, have);
+			say("adsp: GLINK: command %u (%u, %#x) with %u bytes waiting: unknown, queue dropped\n", msg.cmd, msg.param1,
+			    msg.param2, have);
 			rx_advance(have);
 		}
 	}
 }
 
+/* Our half of apr_audio_svc, one thing a pass; then the two questions. */
 static void
-step_watch(uint32_t seconds)
+apr_step(uint32_t steps)
+{
+	static uint32_t asked, waited;
+
+	if (steps < 5 || !apr.remote_open) {
+		return;
+	}
+	if (!apr.open_sent) {
+		struct {
+			struct glink_msg msg;
+			char name[16];
+		} __attribute__((packed)) open;
+		struct {
+			struct glink_msg msg;           /* INTENT: param1 our channel id, param2 one of them */
+			uint32_t size, id;
+		} __attribute__((packed)) intent = { { 5, apr.id, 1 }, 4096, 1 };
+
+		memset(&open, 0, sizeof(open));
+		open.msg.cmd = 2;
+		open.msg.param1 = apr.id;
+		open.msg.param2 = sizeof("apr_audio_svc");
+		memcpy(open.name, "apr_audio_svc", sizeof("apr_audio_svc"));
+		apr.open_sent = tx(&open, sizeof(open)) && tx(&intent, sizeof(intent));
+		say("adsp: GLINK: apr_audio_svc opened from here as channel %u, one intent of 4096 bytes offered: %s\n", apr.id,
+		    apr.open_sent ? "sent" : "NOT sent");
+		return;
+	}
+	if (!apr.acked) {
+		return;
+	}
+	if (apr.intent_size == 0) {
+		if (!apr.intent_asked && ++waited > 10) {       /* half a second without an offer: ask for one */
+			struct glink_msg ask = { .cmd = 7, .param1 = apr.id, .param2 = 256 };
+
+			apr.intent_asked = tx(&ask, sizeof(ask));
+			say("adsp: GLINK: no intent offered on apr_audio_svc; one of 256 bytes asked for\n");
+		}
+		return;
+	}
+	if (asked == 0) {
+		asked = apr_send(AVCS_GET_STATE, 1) ? 1 : 0;
+	} else if (asked == 1 && apr.received >= 1) {
+		asked = apr_send(AVCS_GET_FWK, 2) ? 2 : 1;
+	}
+}
+
+static void
+step_watch(uint32_t seconds, uint32_t steps)
 {
 	struct glink_msg version = { .cmd = 0, .param1 = 1, .param2 = 1 };
 	bool up = false, linked = false;
@@ -696,10 +888,11 @@ step_watch(uint32_t seconds)
 			}
 		} else {
 			glink_poll();
+			apr_step(steps);
 		}
 	}
-	say("adsp: watched %u s: SMP2P %s, GLINK %s, %u channels opened by the DSP\n", seconds, up ? "up" : "NOT up",
-	    linked ? "linked" : "NOT linked", channels);
+	say("adsp: watched %u s: SMP2P %s, GLINK %s, %u channels opened by the DSP, %u APR packets received\n", seconds,
+	    up ? "up" : "NOT up", linked ? "linked" : "NOT linked", channels, apr.received);
 }
 
 static void
@@ -714,7 +907,7 @@ adsp_thread(__unused void *parameter, __unused wait_result_t result)
 	sleep_ms(delay * 1000);
 	say("adsp: the audio DSP of the SM7150, steps 1 to %u\n", steps);
 	if (step_look() && steps >= 2 && step_ours() && steps >= 3 && step_start() && steps >= 4) {
-		step_watch(watch);
+		step_watch(watch, steps);
 	}
 	if (!keep) {
 		adsp_shutdown("the steps are over");
