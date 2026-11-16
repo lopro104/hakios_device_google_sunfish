@@ -33,6 +33,12 @@
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
+#include <sys/errno.h>
+#include <sys/fcntl.h>
+#include <sys/uio.h>
+#include <sys/vnode.h>
+#include <sys/kauth.h>
+#include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
@@ -792,6 +798,338 @@ static void cs_power_down(struct cs_amp *a)
 }
 
 
+
+/* ==== the amplifier's own DSP ("Halo") with Cirrus's speaker protection ============================================
+ * What the stock system runs (android_device_google_sunfish audio/mixer_paths_bolero_snd.xml: "PCM Source" DSP, "DSP1
+ * Firmware" Protection, AMP PCM Gain 17, Digital PCM Volume 817 = 0 dB, DRE and VBSTMON on): the samples go through
+ * firmware in the amplifier that watches the speaker (its voltage, current, temperature) and holds back before it is
+ * harmed, which is what allows the stock gain. Without it this driver stays at its lowest analog gain.
+ *
+ * The files are the vendor image's (never in the repository): cs35l41-dsp1-spk-prot.wmfw, and the tuning
+ * R-cs35l41-dsp1-spk-prot.bin for the amplifier at 0x41 (the device tree gives it the prefix "R"; 0x40 has none).
+ * Format and sequence: Google's kernel for this phone (msm-4.14 sound/soc/codecs/wm_adsp.c: wm_adsp_load,
+ * wm_halo_setup_algs, wm_adsp_load_coeff, wm_halo_configure_mpu, wm_halo_start_core; cs35l41.c: cs35l41_dsp_init,
+ * cs35l41_main_amp_event, cs35l41_set_csplmboxcmd), read, not copied.
+ *
+ * Not done: the per-phone calibration (the speaker's measured resistance, which Android keeps in its persist partition
+ * and its audio HAL writes into the firmware's CAL_R): the firmware runs with the tuning file's own values.
+ * Status: COMPILED ONLY.
+ */
+#define FW_DIRECTORY            "/redwood/fw-adsp/"
+#define HALO_XM_PACKED          0x02000000u     /* file type 0x11: three bytes a word */
+#define HALO_XM_UNPACKED        0x02800000u     /* type 5: a word a register */
+#define HALO_YM_PACKED          0x02c00000u     /* 0x12 */
+#define HALO_YM_UNPACKED        0x03400000u     /* 6 */
+#define HALO_PM_PACKED          0x03800000u     /* 0x10: five bytes a word */
+#define HALO_BASE               0x02b80000u
+#define HALO_CORE_CONTROL       (HALO_BASE + 0x41000)
+#define HALO_MPU_LOCK           (HALO_BASE + 0x43140)
+#define ALG_PROTECTION          0xcdu
+
+static bool amp_protected;      /* the firmware is loaded and the samples are routed through it */
+static bool amp_loud;           /* ... and the stock gain is on (only while the firmware says it runs) */
+
+static int
+fw_file(const char *name, uint8_t **data, uint32_t *size)
+{
+	vfs_context_t context = vfs_context_kernel();
+	char path[96];
+	vnode_t vnode = NULLVP;
+	struct vnode_attr attributes;
+	vm_offset_t memory = 0;
+	int resid = 0, error;
+
+	snprintf(path, sizeof(path), FW_DIRECTORY "%s", name);
+	error = vnode_open(path, FREAD, 0, 0, &vnode, context);
+	if (error != 0) {
+		return error;
+	}
+	VATTR_INIT(&attributes);
+	VATTR_WANTED(&attributes, va_data_size);
+	error = vnode_getattr(vnode, &attributes, context);
+	if (error == 0 && (attributes.va_data_size < 40 || attributes.va_data_size > 256 * 1024)) {
+		error = EFBIG;
+	}
+	if (error == 0 && kmem_alloc(kernel_map, &memory, (vm_size_t)attributes.va_data_size, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		error = ENOMEM;
+	}
+	if (error == 0) {
+		error = vn_rdwr(UIO_READ, vnode, (caddr_t)memory, (int)attributes.va_data_size, 0, UIO_SYSSPACE, 0,
+		    vfs_context_ucred(context), &resid, vfs_context_proc(context));
+		if (error == 0 && resid != 0) {
+			error = EIO;
+		}
+	}
+	vnode_close(vnode, FREAD, context);
+	if (error == 0) {
+		*data = (uint8_t *)memory;
+		*size = (uint32_t)attributes.va_data_size;
+	}
+	return error;
+}
+
+static uint32_t
+le32(const uint8_t *p)
+{
+	return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+/* Bytes as they are in the file to the registers from `reg' on, `burst' bytes or a multiple at a time. */
+static int
+wr_bytes(struct cs_amp *a, uint32_t reg, const uint8_t *data, uint32_t len, uint32_t burst)
+{
+	static uint8_t tx[4 + 240];
+	uint32_t most = 240 / burst * burst;
+
+	while (len != 0) {
+		uint32_t n = MIN(len, most);
+
+		tx[0] = (uint8_t)(reg >> 24);
+		tx[1] = (uint8_t)(reg >> 16);
+		tx[2] = (uint8_t)(reg >> 8);
+		tx[3] = (uint8_t)reg;
+		memcpy(tx + 4, data, n);
+		if (!hakios_sunfish_i2c(a->addr, tx, 4 + n, NULL, 0)) {
+			cs_say("cs35l41 %#x: firmware: %u bytes at %08x: no answer\n", a->addr, n, reg);
+			return -1;
+		}
+		reg += n;
+		data += n;
+		len -= n;
+	}
+	return 0;
+}
+
+/* The firmware's memory blocks into the amplifier. 0: all written. */
+static int
+halo_load(struct cs_amp *a, const uint8_t *d, uint32_t size)
+{
+	uint32_t pos, blocks = 0, bytes = 0;
+
+	if (size < 40 || memcmp(d, "WMFW", 4) != 0 || d[10] != 4 /* the Halo core */ || d[11] != 3 || le32(d + 4) != 40) {
+		cs_say("cs35l41 %#x: firmware: not a version 3 file for the Halo core\n", a->addr);
+		return -1;
+	}
+	for (pos = 40; pos + 8 <= size;) {
+		uint32_t offset = le32(d + pos) & 0xffffff, type = d[pos + 3], len = le32(d + pos + 4), reg = 0, burst = 4;
+
+		if (len > size - pos - 8) {
+			cs_say("cs35l41 %#x: firmware: a block runs past the end of the file\n", a->addr);
+			return -1;
+		}
+		if (type == 0x11) {
+			reg = (HALO_XM_PACKED + offset * 3) & ~3u;
+			burst = 12;
+		} else if (type == 0x12) {
+			reg = (HALO_YM_PACKED + offset * 3) & ~3u;
+			burst = 12;
+		} else if (type == 0x10) {
+			reg = HALO_PM_PACKED + offset * 5;
+			burst = 20;
+		} else if (type == 5) {
+			reg = HALO_XM_UNPACKED + offset * 4;
+		} else if (type == 6) {
+			reg = HALO_YM_UNPACKED + offset * 4;
+		} else if (type != 0xff && type != 0xfe && type != 0xf2) {       /* text and the controls' descriptions are not for the chip */
+			cs_say("cs35l41 %#x: firmware: a block of unknown type %#x\n", a->addr, type);
+			return -1;
+		}
+		if (reg != 0) {
+			if (wr_bytes(a, reg, d + pos + 8, len, burst) != 0) {
+				return -1;
+			}
+			blocks++;
+			bytes += len;
+		}
+		pos += 8 + len;
+	}
+	cs_say("cs35l41 %#x: firmware: %u blocks, %u bytes written\n", a->addr, blocks, bytes);
+	return 0;
+}
+
+/* Where the firmware keeps an algorithm's data: read out of the list at the start of its X memory. */
+static int
+halo_algorithm(struct cs_amp *a, uint32_t id, uint32_t *xm_base, uint32_t *ym_base)
+{
+	uint32_t h[10], count;
+
+	for (unsigned i = 0; i < 10; i++) {
+		if (rd(a, HALO_XM_UNPACKED + 4 * i, &h[i]) != 0) {
+			return -1;
+		}
+	}
+	count = h[9];
+	cs_say("cs35l41 %#x: firmware: id %#x version %#x, block revision %#x, %u algorithms\n", a->addr, h[3], h[4], h[1] >> 16, count);
+	if ((h[1] >> 16) != 3 || count == 0 || count > 32) {
+		cs_say("cs35l41 %#x: firmware: its header did not read back as written: the load did not take\n", a->addr);
+		return -1;
+	}
+	for (uint32_t n = 0; n < count; n++) {
+		uint32_t g[6];
+
+		for (unsigned i = 0; i < 6; i++) {
+			if (rd(a, HALO_XM_UNPACKED + 4 * (10 + 6 * n + i), &g[i]) != 0) {
+				return -1;
+			}
+		}
+		cs_say("cs35l41 %#x: firmware: algorithm %#x version %#x, X memory at %#x, Y memory at %#x\n", a->addr, g[0], g[1], g[2], g[4]);
+		if (g[0] == id) {
+			*xm_base = g[2];
+			*ym_base = g[4];
+			return 0;
+		}
+	}
+	return -1;
+}
+
+/* The tuning: each block into its algorithm's memory. */
+static int
+halo_tune(struct cs_amp *a, const uint8_t *d, uint32_t size, uint32_t xm_base, uint32_t ym_base)
+{
+	uint32_t pos, blocks = 0;
+
+	if (size < 16 || memcmp(d, "WMDR", 4) != 0) {
+		cs_say("cs35l41 %#x: tuning: not a coefficient file\n", a->addr);
+		return -1;
+	}
+	for (pos = le32(d + 4); pos + 20 <= size;) {
+		uint32_t offset = d[pos] | (uint32_t)d[pos + 1] << 8, type = d[pos + 2] | (uint32_t)d[pos + 3] << 8;
+		uint32_t id = le32(d + pos + 4), len = le32(d + pos + 16), reg = 0, burst = 4;
+
+		if (len > size - pos - 20) {
+			return -1;
+		}
+		if (type == 0x12 || type == 0x11 || type == 6 || type == 5) {
+			if (id != ALG_PROTECTION) {
+				cs_say("cs35l41 %#x: tuning: a block for algorithm %#x, which is not the protection: left out\n", a->addr, id);
+			} else if (type == 0x12) {
+				reg = ((HALO_YM_PACKED + ym_base * 3) & ~3u) + offset;
+				burst = 12;
+			} else if (type == 0x11) {
+				reg = ((HALO_XM_PACKED + xm_base * 3) & ~3u) + offset;
+				burst = 12;
+			} else if (type == 6) {
+				reg = HALO_YM_UNPACKED + ym_base * 4 + offset;
+			} else {
+				reg = HALO_XM_UNPACKED + xm_base * 4 + offset;
+			}
+		}
+		if (reg != 0) {
+			if (wr_bytes(a, reg, d + pos + 20, len, burst) != 0) {
+				return -1;
+			}
+			blocks++;
+		}
+		pos += (20 + len + 3) & ~3u;
+	}
+	cs_say("cs35l41 %#x: tuning: %u blocks written\n", a->addr, blocks);
+	return blocks != 0 ? 0 : -1;
+}
+
+/* The mailbox between this side and the firmware: 1 pause, 2 resume; its state after: 0 running, 1 paused. */
+static int
+halo_mailbox(struct cs_amp *a, uint32_t command, uint32_t state_wanted)
+{
+	uint32_t status = 0, state = ~0u;
+	bool acknowledged = false;
+
+	(void)wr(a, 0x00010814, 1u << 20);              /* the firmware's and our sticky bits cleared */
+	(void)wr(a, 0x00010014, 1u << 21);
+	(void)upd(a, 0x00010914, 1u << 20, 0);          /* the firmware's interrupt for our command let through */
+	(void)wr(a, 0x00013020, command);
+	for (int i = 0; i < 10 && !acknowledged; i++) {
+		cs_wait_us(1000);
+		acknowledged = rd(a, 0x00010014, &status) == 0 && (status & (1u << 21)) != 0;
+	}
+	if (acknowledged) {
+		(void)wr(a, 0x00010014, 1u << 21);
+	}
+	(void)upd(a, 0x00010914, 1u << 20, 1u << 20);
+	(void)rd(a, 0x00013004, &state);
+	cs_say("cs35l41 %#x: firmware: command %u %s, its state %u (wanted %u)\n", a->addr, command,
+	    acknowledged ? "acknowledged" : "NOT acknowledged", state, state_wanted);
+	return acknowledged && state == state_wanted ? 0 : -1;
+}
+
+/* After the plain configuration has read back: the firmware in, its core started, the samples through it. 0: done. */
+static int
+halo_bring_up(struct cs_amp *a)
+{
+	static const uint32_t mpu[] = { 0x43000, 0x43004, 0x43008, 0x4300c, 0x43014, 0x43018, 0x4301c, 0x43020, 0x43024, 0x4302c,
+		                        0x43030, 0x43034, 0x43038, 0x4303c, 0x43044, 0x43048, 0x4304c, 0x43050, 0x43054, 0x4305c };
+	uint8_t *firmware = NULL, *tuning = NULL;
+	uint32_t firmware_size = 0, tuning_size = 0, xm = 0, ym = 0;
+	int err = fw_file("cs35l41-dsp1-spk-prot.wmfw", &firmware, &firmware_size);
+
+	if (err == 0) {
+		err = fw_file(a->addr == 0x41 ? "R-cs35l41-dsp1-spk-prot.bin" : "cs35l41-dsp1-spk-prot.bin", &tuning, &tuning_size);
+	}
+	if (err != 0) {
+		cs_say("cs35l41 %#x: no protection firmware in " FW_DIRECTORY " (error %d): the unprotected, quiet path\n", a->addr, err);
+		return -1;
+	}
+	err = upd(a, HALO_CORE_CONTROL, 1, 0);          /* the core held while its memory is written */
+	err |= halo_load(a, firmware, firmware_size);
+	err = err ? err : halo_algorithm(a, ALG_PROTECTION, &xm, &ym);
+	err = err ? err : halo_tune(a, tuning, tuning_size, xm, ym);
+	if (err != 0) {
+		return -1;
+	}
+	/* what the core is fed besides the samples (RX1/RX2, and the speaker's voltage and current on RX3/RX4, are the chip's
+	 * defaults): the battery's voltage, the class H tracker, the temperature */
+	err |= set(a, 0x00004c50, 0x28);
+	err |= set(a, 0x00004c54, 0x21);
+	err |= set(a, 0x00004c58, 0x3a);
+	err |= set(a, 0x00004c5c, 0x3b);
+	/* the monitors themselves: speaker voltage and current, battery, boost and temperature; class H; dynamic range enhancement */
+	err |= upd(a, PWR_CTRL2, 0x3700, 0x3700);
+	err |= upd(a, PWR_CTRL3, (1u << 4) | (1u << 20), (1u << 4) | (1u << 20));
+	/* memory protection as Google's driver leaves it (its lock_regions is 0), the sample rates, then the core */
+	err |= wr(a, HALO_MPU_LOCK, 0x5555);
+	err |= wr(a, HALO_MPU_LOCK, 0xaaaa);
+	for (unsigned i = 0; i < sizeof(mpu) / sizeof(mpu[0]); i++) {
+		err |= wr(a, HALO_BASE + mpu[i], i % 5 < 2 ? 0xffffffffu : 0);
+	}
+	err |= wr(a, HALO_MPU_LOCK, 0);
+	for (unsigned i = 0; i < 8; i++) {
+		err |= upd(a, HALO_BASE + 0x80 + 8 * i, 0x1f, 1);
+		err |= upd(a, HALO_BASE + 0x280 + 8 * i, 0x1f, 1);
+	}
+	cs_wait_us(1000);
+	err |= upd(a, HALO_CORE_CONTROL, 1, 1);
+	err |= upd(a, DAC_PCM1_SRC, 0x7f, 0x32);        /* the amplifier plays what the core puts out */
+	cs_say("cs35l41 %#x: firmware: the core started, the samples routed through it: %s\n", a->addr, err ? "FAILED" : "done");
+	return err ? -1 : 0;
+}
+
+/* With the amplifier powered up: the firmware told to run; only if it says it does, the stock gain. */
+static void
+halo_after_power_up(struct cs_amp *a)
+{
+	if (!amp_protected) {
+		return;
+	}
+	if (halo_mailbox(a, 2, 0) == 0 && upd(a, AMP_GAIN_CTRL, 0x3e0, 17u << 5) == 0) {
+		amp_loud = true;
+		cs_say("cs35l41 %#x: THE PROTECTION FIRMWARE RUNS: analog gain 17 (17.5 dB), as the stock system\n", a->addr);
+	} else {
+		cs_say("cs35l41 %#x: the firmware does not say it runs: the gain stays at its lowest\n", a->addr);
+	}
+}
+
+static void
+halo_before_power_down(struct cs_amp *a)
+{
+	if (amp_loud) {
+		(void)upd(a, AMP_GAIN_CTRL, 0x3e0, 0);
+		amp_loud = false;
+	}
+	if (amp_protected && a->up) {
+		(void)halo_mailbox(a, 1, 1);
+	}
+}
+
 /* ---- for the DSP's driver (hakios.adsp_sm7150.c): one amplifier, brought up while the port's clock runs ---- */
 
 static struct pmic_gpio amp_gpios[2] = { { .name = "PM6150L GPIO 8", .peripheral = 0xc7 }, { .name = "PM6150L GPIO 11", .peripheral = 0xca } };
@@ -823,7 +1161,9 @@ hakios_amp_stop(void)
 		return;
 	}
 	(void)cs_check(&the_amp);
+	halo_before_power_down(&the_amp);
 	cs_power_down(&the_amp);
+	amp_protected = false;
 	for (int r = 5; r >= 0; r--) {
 		(void)sp_write(the_gpio, gpio_regs[r], the_gpio->before[r]);
 	}
@@ -835,6 +1175,7 @@ bool
 hakios_amp_prepare(uint8_t address, int vol_db)
 {
 	struct pmic_gpio *g = &amp_gpios[address == 0x41 ? 1 : 0];
+	uint32_t want_firmware = 1;             /* boot-arg amp_fw=0: the plain path, no firmware */
 
 	if (!AMP_OK(address) || the_gpio != NULL || !arbiter_map() || !gpio_look(g) || !g->ours) {
 		say("amp: %#x cannot be prepared (its reset line is not ours, or an amplifier is in use)\n", address);
@@ -850,10 +1191,26 @@ hakios_amp_prepare(uint8_t address, int vol_db)
 	the_amp.addr = address;
 	the_amp.out_mute = 1;
 	the_amp.clk = 1;
-	if (cs_probe(&the_amp) != 0 || cs_config(&the_amp, vol_db, 0) != 0 || cs_verify(&the_amp) != 0) {
+	PE_parse_boot_argn("amp_fw", &want_firmware, sizeof(want_firmware));
+	/* without the protection firmware: never above 6 dB under full digital volume, the boost bypassed, the lowest analog gain */
+	if (cs_probe(&the_amp) != 0 || cs_config(&the_amp, want_firmware ? vol_db : MIN(vol_db, -6), want_firmware != 0) != 0 ||
+	    cs_verify(&the_amp) != 0) {
 		say("amp: %#x did not take its configuration: powered down, back into reset\n", address);
 		hakios_amp_stop();
 		return false;
+	}
+	if (want_firmware) {
+		amp_protected = halo_bring_up(&the_amp) == 0;
+		if (!amp_protected) {
+			/* back to the plain path, as quiet as without it: the samples straight to the amplifier, the boost bypassed */
+			if (upd(&the_amp, HALO_CORE_CONTROL, 1, 0) != 0 || upd(&the_amp, DAC_PCM1_SRC, 0x7f, 0x08) != 0 ||
+			    upd(&the_amp, PWR_CTRL2, 0x30, 1u << 4) != 0 || upd(&the_amp, AMP_DIG_VOL, 0x7ffu << 3, ((0x800u - 48u) & 0x7ffu) << 3) != 0) {
+				say("amp: %#x could not be put back on the plain path: powered down, back into reset\n", address);
+				hakios_amp_stop();
+				return false;
+			}
+			say("amp: %#x: WITHOUT the protection firmware: 6 dB down, lowest gain, boost bypassed\n", address);
+		}
 	}
 	return true;
 }
@@ -863,7 +1220,11 @@ bool hakios_amp_pause(void);
 bool
 hakios_amp_pause(void)
 {
-	return the_gpio != NULL && cs_standby(&the_amp) == 0;
+	if (the_gpio == NULL) {
+		return false;
+	}
+	halo_before_power_down(&the_amp);
+	return cs_standby(&the_amp) == 0;
 }
 
 /* Still without an error bit? (false: the caller stops it) */
@@ -887,6 +1248,9 @@ hakios_amp_start(void)
 		return false;
 	}
 	up = cs_power_up(&the_amp) == 0;
+	if (up) {
+		halo_after_power_up(&the_amp);
+	}
 	if (!up || !amp_started_once) {
 		cs_diag(&the_amp, up ? "up" : "not up");        /* the long look only the first time, and when it fails */
 	}

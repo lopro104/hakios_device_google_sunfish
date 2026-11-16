@@ -1179,7 +1179,8 @@ step_tone(bool darwin)
 	volume = -(int)MIN(MAX(below, 20u), 102u);
 	tone_periods = seconds * 100;
 	if (darwin) {
-		below = 6;              /* Darwin's sound: 6 dB under the amplifier's full digital volume by default, 0 the loudest */
+		below = 0;              /* Darwin's sound at the amplifier's full digital volume, as the stock system: the amplifier's driver
+		                         * holds it 6 dB lower by itself when the protection firmware is not running in it */
 		PE_parse_boot_argn("adsp_below", &below, sizeof(below));
 		volume = -(int)MIN(below, 102u);
 		say("adsp: step 9: DARWIN'S SOUND to the bottom speaker until the run ends, its amplifier at %d dB\n", volume);
