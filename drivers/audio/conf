@@ -2,7 +2,7 @@
 
 driver ADSP_SM7150
 	file    bsd/dev/hakios.adsp_sm7150.c
-	requires MPSS_SM7150
+	requires MPSS_SM7150 CS35L41_SUNFISH
 	help    the audio DSP of the SM7150 started through TrustZone and linked (adsp=N): the first step of sound and sensors
 
 driver CS35L41_SUNFISH

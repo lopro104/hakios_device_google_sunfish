@@ -30,7 +30,9 @@
  *              the audio framework says of its versions
  *   6  runs    the secondary I2S port for adsp_hold seconds (default 3): LPASS's core voted, the bit clock, the port's
  *              format, the port started, LPASS's pins 8 to 11 given to it, the clock pins looked at; then all of it back.
- *              The amplifiers stay in reset. (steps 1 to 5 seen on the phone 2026-11-16; 6 not yet)
+ *              The amplifiers stay in reset. (steps 1 to 6 seen on the phone 2026-11-16)
+ *   7  ... and with the port running, the bottom speaker's amplifier (0x41) configured at -102 dB and powered up with
+ *              no samples played: its PLL lock and power-up are reported, then it goes back into reset. Silent. (not yet run)
  * adsp_delay=S: seconds after the kernel's start before step 1 (default 45: the root with the firmware is mounted and
  * the modem, which shares the rails' and the always-on processor's mailboxes, has long started).
  * The important lines also go into the loader's log (the kernel's log loses its middle on a long run).
@@ -60,7 +62,10 @@ extern int hakios_rpmh_ddr_vote(uint32_t vote, bool send);
 extern uint64_t kvtophys(vm_offset_t va);
 extern void loader_log_putc(char c);
 extern kern_return_t thread_terminate(thread_t);
-extern bool hakios_sm7150_aop_send(const char *msg);            /* hakios.mpss_sm7150.c: the one mailbox, the one sender */
+extern bool hakios_sm7150_aop_send(const char *msg);
+extern bool hakios_amp_prepare(uint8_t address, int vol_db);      /* hakios.cs35l41_sunfish.c */
+extern bool hakios_amp_start(void);
+extern void hakios_amp_stop(void);            /* hakios.mpss_sm7150.c: the one mailbox, the one sender */
 
 #define WIMG_WCOMB              0x6u    /* VM_WIMG_WCOMB: not cacheable | coherent (osfmk/arm/memory_types.h) */
 #define WIMG_IO                 0x7u    /* VM_WIMG_IO: guarded, coherent, not cacheable */
@@ -961,7 +966,7 @@ afe_clock(bool enable)
 }
 
 static void
-step_port(uint32_t hold_seconds)
+step_port(uint32_t hold_seconds, bool with_amp)
 {
 	/* the port's parameter: port and size (16 bits each), no address, no handle; module, parameter, size; the I2S format */
 	struct {
@@ -1023,6 +1028,22 @@ step_port(uint32_t hold_seconds)
 			say("adsp: LPI: in 20000 looks the bit clock (gpio8) changed %u times, the word select (gpio9) %u times: %s\n",
 			    toggles[0], toggles[1], toggles[0] > 100 && toggles[1] > 2 ? "THE PORT'S CLOCKS RUN AT THE PINS" :
 			    "no clocks seen at the pins");
+		}
+		if (with_amp && pins_set) {
+			/*
+			 * Step 7: the bottom speaker's amplifier (0x41) brought up on this clock at its lowest volume (-102 dB) with
+			 * nothing played into the port: does it take its configuration, does its PLL lock to the bit clock, does it
+			 * say its power-up is done. Silent. Then it is powered down and put back into reset.
+			 */
+			say("adsp: step 7: the amplifier at 0x41 on the port's clock, at -102 dB, no samples: silent\n");
+			if (hakios_amp_prepare(0x41, -102)) {
+				bool up = hakios_amp_start();
+
+				say("adsp: THE AMPLIFIER %s\n", up ? "POWERED UP ON THE PORT'S CLOCK (see its PLL_LOCK line above)" :
+				    "did NOT power up");
+				sleep_ms(1000);
+				hakios_amp_stop();
+			}
 		}
 		sleep_ms(hold_seconds * 1000);
 		glink_poll();
@@ -1095,7 +1116,7 @@ step_watch(uint32_t seconds, uint32_t steps)
 
 				PE_parse_boot_argn("adsp_hold", &hold, sizeof(hold));
 				port_done = true;
-				step_port(MIN(hold, 30u));
+				step_port(MIN(hold, 30u), steps >= 7);
 			}
 		}
 	}
