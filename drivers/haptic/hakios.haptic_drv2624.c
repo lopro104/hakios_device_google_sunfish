@@ -28,6 +28,7 @@
  * Status: WRITTEN FROM THE SOURCES, NOT YET RUN ON THE PHONE.
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -225,6 +226,10 @@ i2c_read(bool more)
 	return byte;
 }
 
+/* The bus is shared with the speaker amplifiers (hakios.cs35l41_sunfish.c, through hakios_sunfish_i2c()): one transfer at a time. */
+static LCK_GRP_DECLARE(bus_lock_group, "hakios-sunfish-i2c");
+static LCK_MTX_DECLARE(bus_lock, &bus_lock_group);
+
 static uint32_t taken_cfg[2], taken_io[2];
 
 static bool
@@ -266,7 +271,9 @@ regs_read(uint8_t reg, uint8_t *values, unsigned count)
 {
 	bool answered;
 
+	lck_mtx_lock(&bus_lock);
 	if (!bus_take()) {
+		lck_mtx_unlock(&bus_lock);
 		return false;
 	}
 	i2c_start();
@@ -280,6 +287,7 @@ regs_read(uint8_t reg, uint8_t *values, unsigned count)
 	}
 	i2c_stop();
 	bus_give_back();
+	lck_mtx_unlock(&bus_lock);
 	return answered;
 }
 
@@ -288,7 +296,9 @@ regs_write(uint8_t reg, const uint8_t *values, unsigned count)
 {
 	bool answered;
 
+	lck_mtx_lock(&bus_lock);
 	if (!bus_take()) {
+		lck_mtx_unlock(&bus_lock);
 		return false;
 	}
 	i2c_start();
@@ -298,6 +308,43 @@ regs_write(uint8_t reg, const uint8_t *values, unsigned count)
 	}
 	i2c_stop();
 	bus_give_back();
+	lck_mtx_unlock(&bus_lock);
+	return answered;
+}
+
+/*
+ * For the other chips on these two lines (the speaker amplifiers at 0x40 and 0x41): `nt' bytes written to `address', then,
+ * if nr != 0, a repeated start and `nr' bytes read. False when the bus is not at rest or a byte is not acknowledged.
+ */
+bool hakios_sunfish_i2c(uint8_t address, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr);
+bool
+hakios_sunfish_i2c(uint8_t address, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr)
+{
+	bool answered;
+
+	lck_mtx_lock(&bus_lock);
+	if (tlmm == 0) {
+		tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
+	}
+	if (tlmm == 0 || !bus_take()) {
+		lck_mtx_unlock(&bus_lock);
+		return false;
+	}
+	i2c_start();
+	answered = i2c_write((uint8_t)(address << 1));
+	for (unsigned i = 0; answered && i < nt; i++) {
+		answered = i2c_write(tx[i]);
+	}
+	if (answered && nr != 0) {
+		i2c_start();
+		answered = i2c_write((uint8_t)(address << 1 | 1));
+		for (unsigned i = 0; answered && i < nr; i++) {
+			rx[i] = i2c_read(i + 1 < nr);
+		}
+	}
+	i2c_stop();
+	bus_give_back();
+	lck_mtx_unlock(&bus_lock);
 	return answered;
 }
 
