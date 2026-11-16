@@ -37,7 +37,11 @@
  *   8  A TONE  (instead of 7): a buffer shown to the DSP through the SMMU (stream 0x1b21), a device path (ADM) to the
  *              port, a stream (ASM) routed to it, 1 kHz at -20 dBFS written for adsp_tone seconds (default 2, at most 3);
  *              the amplifier at 0x41, adsp_below decibels down (default 30, 20 at least), on once the DSP takes the
- *              samples and never for more than 3 s; then everything back. AUDIBLE. (not yet run)
+ *              samples and never for more than 3 s; then everything back. AUDIBLE. (HEARD by the user 2026-11-16)
+ *   9  SOUND   Darwin's own (/dev/hakios-audio) in place of the tone, until the run ends: the stream kept running, each
+ *              period filled from what the audio server writes; the amplifier (adsp_below, default 20 dB down, the
+ *              loudest allowed) on while there is sound, paused after 3 s of silence, powered down for good on an
+ *              error bit; a constant level in the samples is replaced by silence. (not yet run)
  * adsp_delay=S: seconds after the kernel's start before step 1 (default 45: the root with the firmware is mounted and
  * the modem, which shares the rails' and the always-on processor's mailboxes, has long started).
  * The important lines also go into the loader's log (the kernel's log loses its middle on a long run).
@@ -57,6 +61,7 @@
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <vm/vm_kern.h>
+#include <sys/hakios.audio.h>
 
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
@@ -71,7 +76,9 @@ extern bool hakios_sm7150_aop_send(const char *msg);
 extern bool hakios_sm7150_smmu_pages(uint32_t sid, uint64_t iova, uint64_t pa, uint32_t pages);     /* hakios.mpss_sm7150.c */
 extern bool hakios_amp_prepare(uint8_t address, int vol_db);      /* hakios.cs35l41_sunfish.c */
 extern bool hakios_amp_start(void);
-extern void hakios_amp_stop(void);            /* hakios.mpss_sm7150.c: the one mailbox, the one sender */
+extern void hakios_amp_stop(void);
+extern bool hakios_amp_pause(void);
+extern bool hakios_amp_healthy(void);            /* hakios.mpss_sm7150.c: the one mailbox, the one sender */
 
 #define WIMG_WCOMB              0x6u    /* VM_WIMG_WCOMB: not cacheable | coherent (osfmk/arm/memory_types.h) */
 #define WIMG_IO                 0x7u    /* VM_WIMG_IO: guarded, coherent, not cacheable */
@@ -1048,6 +1055,79 @@ basic_ok(const char *what, uint8_t service, uint16_t port, uint32_t opcode, cons
 static int16_t *tone_buffer;
 static uint32_t tone_at, tone_handle, tone_sent;
 
+/*
+ * Step 9: what Darwin plays (/dev/hakios-audio, hakios.audio.c) in place of the tone. The audio server's thread
+ * offers frames to the sink below, which must not wait: they go into a ring of a fifth of a second, and each period
+ * the DSP hands back is filled from it (with silence when it is empty).
+ */
+#define RING_FRAMES     9600u
+static int16_t ring[RING_FRAMES * 2];
+static volatile uint32_t ring_in, ring_out;     /* frames ever put in and taken out */
+static uint32_t ring_lost;
+
+static uint32_t
+darwin_sink(const int16_t *frames, uint32_t count)
+{
+	uint32_t in = ring_in, room = RING_FRAMES - (in - ring_out), n = MIN(count, room);
+
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t at = (in + i) % RING_FRAMES;
+
+		ring[2 * at] = frames[2 * i];
+		ring[2 * at + 1] = frames[2 * i + 1];
+	}
+	__asm__ volatile ("dmb ish" ::: "memory");
+	ring_in = in + n;
+	ring_lost += count - n;
+	return n;
+}
+
+/* A period from the ring: true when it holds sound. A period whose mean is far from zero is not sound but a fault
+ * upstream (a constant level is a current through the speaker's coil): ten of them in a row and silence goes out
+ * instead until it is over -- the amplifier has no protection of its own here (no DSP firmware in it). */
+static bool
+darwin_fill(int16_t *p)
+{
+	static uint32_t dc_periods;
+	uint32_t out = ring_out, have = ring_in - out, n = MIN(have, (uint32_t)PERIOD_FRAMES);
+	int32_t sum = 0;
+	bool sound = false;
+
+	for (uint32_t f = 0; f < PERIOD_FRAMES; f++) {
+		int16_t l = 0, r = 0;
+
+		if (f < n) {
+			uint32_t at = (out + f) % RING_FRAMES;
+
+			l = ring[2 * at];
+			r = ring[2 * at + 1];
+		}
+		p[2 * f] = l;
+		p[2 * f + 1] = r;
+		sum += l;
+		sound = sound || l > 8 || l < -8 || r > 8 || r < -8;
+	}
+	ring_out = out + n;
+	if (sum / (int32_t)PERIOD_FRAMES > 2000 || sum / (int32_t)PERIOD_FRAMES < -2000) {
+		if (++dc_periods == 10) {
+			say("adsp: sound: a constant level (mean %d) for 100 ms: silence goes out until it is over\n",
+			    sum / (int32_t)PERIOD_FRAMES);
+		}
+	} else {
+		if (dc_periods >= 10) {
+			say("adsp: sound: the constant level is over\n");
+		}
+		dc_periods = 0;
+	}
+	if (dc_periods >= 10) {
+		memset(p, 0, PERIOD_BYTES);
+		return false;
+	}
+	return sound;
+}
+
+static bool darwin_mode, period_had_sound;
+
 /* A period of 1 kHz at -20 dBFS in both channels (or of silence), where the DSP reads it, and the write that says so. */
 static bool
 tone_write(uint32_t period, bool sound)
@@ -1057,7 +1137,10 @@ tone_write(uint32_t period, bool sound)
 	uint64_t address = TONE_DSP_ADDRESS + PERIOD_STRIDE * period;
 	uint32_t write[8] = { (uint32_t)address, (uint32_t)(address >> 32), tone_handle, PERIOD_BYTES, period, 0, 0, 0 };
 
-	for (uint32_t f = 0; f < PERIOD_FRAMES; f++) {
+	if (darwin_mode) {
+		period_had_sound = darwin_fill(p);
+	}
+	for (uint32_t f = 0; f < PERIOD_FRAMES && !darwin_mode; f++) {
 		uint32_t k = tone_at++ % 48, q = k % 24;
 		int16_t v = quarter[q <= 12 ? q : 24 - q];
 
@@ -1073,7 +1156,7 @@ tone_write(uint32_t period, bool sound)
 
 /* With the port running: the buffer, the path, the stream, the tone; the amplifier on once the DSP takes the samples. */
 static void
-step_tone(void)
+step_tone(bool darwin)
 {
 	struct { uint16_t pool, regions; uint32_t property, low, high, size; } __attribute__((packed)) map =
 	    { 3 /* pages of 4 KiB */, 1, 0, (uint32_t)TONE_DSP_ADDRESS, (uint32_t)(TONE_DSP_ADDRESS >> 32), PERIODS * PERIOD_STRIDE };
@@ -1095,7 +1178,14 @@ step_tone(void)
 	seconds = MIN(MAX(seconds, 1u), 3u);
 	volume = -(int)MIN(MAX(below, 20u), 102u);
 	tone_periods = seconds * 100;
-	say("adsp: step 8: A TONE: 1 kHz at -20 dBFS for %u s from the bottom speaker, its amplifier at %d dB\n", seconds, volume);
+	if (darwin) {
+		below = 20;
+		PE_parse_boot_argn("adsp_below", &below, sizeof(below));
+		volume = -(int)MIN(MAX(below, 20u), 102u);
+		say("adsp: step 9: DARWIN'S SOUND to the bottom speaker until the run ends, its amplifier at %d dB\n", volume);
+	} else {
+		say("adsp: step 8: A TONE: 1 kHz at -20 dBFS for %u s from the bottom speaker, its amplifier at %d dB\n", seconds, volume);
+	}
 
 	if (kmem_alloc_contig(kernel_map, &memory, PERIODS * PERIOD_STRIDE, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) !=
 	    KERN_SUCCESS || !hakios_sm7150_smmu_pages(TONE_SID, TONE_IOVA, kvtophys(memory), PERIODS * PERIOD_STRIDE >> 12)) {
@@ -1133,7 +1223,73 @@ step_tone(void)
 	    basic_ok("the stream's format: 48 kHz, 16 bits, stereo", APR_SVC_ASM, STREAM_PORT, ASM_FORMAT, &format, sizeof(format))) {
 		running = basic_ok("the stream run", APR_SVC_ASM, STREAM_PORT, ASM_RUN, run, sizeof(run));
 	}
-	if (running) {
+	if (running && darwin) {
+		/*
+		 * Until the run ends: every period the DSP hands back goes out again, filled from the ring. The amplifier is on
+		 * while there is sound and for three seconds after, then paused (configured, GLOBAL_EN off); an error bit, looked
+		 * for every half second while it is on, powers it down for the rest of the run.
+		 */
+		uint32_t silent_ms = 0, look_ms = 0, report_ms = 0, starts = 0;
+		bool wrote = true, dead = !amp_ready;
+
+		darwin_mode = true;
+		apr.done_periods = 0;
+		apr.written_done = apr.write_errors = apr.underflows = 0;
+		tone_sent = 0;
+		for (uint32_t p = 0; p < PERIODS && wrote; p++) {
+			wrote = tone_write(p, false);
+		}
+		hakios_audio_set_sink("the Pixel 4a's bottom speaker, through the audio DSP", darwin_sink);
+		say("adsp: sound: DARWIN'S SOUND GOES TO THE SPEAKER from here on (amplifier %d dB down%s)\n", -volume,
+		    dead ? "; THE AMPLIFIER IS NOT READY: nothing will be heard" : "");
+		while (wrote) {
+			bool sound_now = false;
+
+			sleep_ms(1);
+			glink_poll();
+			for (uint32_t p = 0; p < PERIODS && wrote; p++) {
+				if (apr.done_periods & (1u << p)) {
+					apr.done_periods &= ~(1u << p);
+					wrote = tone_write(p, false);
+					sound_now = sound_now || period_had_sound;
+				}
+			}
+			silent_ms = sound_now ? 0 : silent_ms + 1;
+			if (!dead && sound_now && !amp_on) {
+				amp_on = hakios_amp_start();
+				starts++;
+				if (!amp_on) {
+					dead = true;
+					hakios_amp_stop();
+					say("adsp: sound: the amplifier did not come on: off for the rest of the run\n");
+				}
+			} else if (amp_on && silent_ms >= 3000) {
+				amp_on = false;
+				if (!hakios_amp_pause()) {
+					dead = true;
+					hakios_amp_stop();
+					say("adsp: sound: the amplifier did not pause: powered down for the rest of the run\n");
+				}
+			}
+			if (amp_on && ++look_ms >= 500) {
+				look_ms = 0;
+				if (!hakios_amp_healthy()) {
+					amp_on = false;
+					dead = true;
+					hakios_amp_stop();
+					say("adsp: sound: THE AMPLIFIER REPORTS AN ERROR: powered down for the rest of the run\n");
+				}
+			}
+			if (++report_ms >= 30000) {
+				report_ms = 0;
+				say("adsp: sound: %u periods played (%u errors, %u underflows), %u frames lost at the ring, amplifier %s, on %u times\n",
+				    apr.written_done, apr.write_errors, apr.underflows, ring_lost, dead ? "dead" : amp_on ? "on" : "paused", starts);
+			}
+		}
+		hakios_audio_set_sink("nothing", NULL);
+		darwin_mode = false;
+		say("adsp: sound: the stream stopped taking periods: over\n");
+	} else if (running) {
 		uint32_t waited = 0, amp_ms = 0;
 		bool wrote = true;
 
@@ -1186,7 +1342,7 @@ step_tone(void)
 }
 
 static void
-step_port(uint32_t hold_seconds, bool with_amp, bool with_tone)
+step_port(uint32_t hold_seconds, bool with_amp, bool with_tone, bool darwin)
 {
 	/* the port's parameter: port and size (16 bits each), no address, no handle; module, parameter, size; the I2S format */
 	struct {
@@ -1250,7 +1406,7 @@ step_port(uint32_t hold_seconds, bool with_amp, bool with_tone)
 			    "no clocks seen at the pins");
 		}
 		if (with_tone && pins_set) {
-			step_tone();
+			step_tone(darwin);
 		} else if (with_amp && pins_set) {
 			/*
 			 * Step 7: the bottom speaker's amplifier (0x41) brought up on this clock at its lowest volume (-102 dB) with
@@ -1338,7 +1494,7 @@ step_watch(uint32_t seconds, uint32_t steps)
 
 				PE_parse_boot_argn("adsp_hold", &hold, sizeof(hold));
 				port_done = true;
-				step_port(MIN(hold, 30u), steps == 7, steps >= 8);
+				step_port(MIN(hold, 30u), steps == 7, steps >= 8, steps >= 9);
 			}
 		}
 	}

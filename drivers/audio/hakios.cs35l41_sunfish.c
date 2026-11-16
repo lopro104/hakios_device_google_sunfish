@@ -795,6 +795,7 @@ static void cs_power_down(struct cs_amp *a)
 static struct pmic_gpio amp_gpios[2] = { { .name = "PM6150L GPIO 8", .peripheral = 0xc7 }, { .name = "PM6150L GPIO 11", .peripheral = 0xca } };
 static struct cs_amp the_amp;
 static struct pmic_gpio *the_gpio;
+static bool amp_started_once;
 
 static bool
 arbiter_map(void)
@@ -855,6 +856,22 @@ hakios_amp_prepare(uint8_t address, int vol_db)
 	return true;
 }
 
+/* Between sounds: GLOBAL_EN off, the configuration kept (a few milliseconds each way, where a full set-up is a second or two). */
+bool hakios_amp_pause(void);
+bool
+hakios_amp_pause(void)
+{
+	return the_gpio != NULL && cs_standby(&the_amp) == 0;
+}
+
+/* Still without an error bit? (false: the caller stops it) */
+bool hakios_amp_healthy(void);
+bool
+hakios_amp_healthy(void)
+{
+	return the_gpio != NULL && cs_check(&the_amp) == 0;
+}
+
 /* GLOBAL_EN: true when the amplifier says its power-up is done (whether its PLL locked to the bit clock is said). */
 bool
 hakios_amp_start(void)
@@ -864,8 +881,14 @@ hakios_amp_start(void)
 	if (the_gpio == NULL) {
 		return false;
 	}
+	if (cs_resume_check(&the_amp) != 0) {
+		return false;
+	}
 	up = cs_power_up(&the_amp) == 0;
-	cs_diag(&the_amp, up ? "up" : "not up");
+	if (!up || !amp_started_once) {
+		cs_diag(&the_amp, up ? "up" : "not up");        /* the long look only the first time, and when it fails */
+	}
+	amp_started_once = true;
 	return up;
 }
 
