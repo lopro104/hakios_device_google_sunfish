@@ -39,8 +39,8 @@
  *              the amplifier at 0x41, adsp_below decibels down (default 30, 20 at least), on once the DSP takes the
  *              samples and never for more than 3 s; then everything back. AUDIBLE. (HEARD by the user 2026-11-16)
  *   9  SOUND   Darwin's own (/dev/hakios-audio) in place of the tone, until the run ends: the stream kept running, each
- *              period filled from what the audio server writes; the amplifier (adsp_below, default 20 dB down, the
- *              loudest allowed) on while there is sound, paused after 3 s of silence, powered down for good on an
+ *              period filled from what the audio server writes; the amplifier (adsp_below, default 6 dB down, 0 the
+ *              loudest; the analog gain stays at its lowest) on while there is sound, paused after 3 s of silence, powered down for good on an
  *              error bit; a constant level in the samples is replaced by silence. (not yet run)
  * adsp_delay=S: seconds after the kernel's start before step 1 (default 45: the root with the firmware is mounted and
  * the modem, which shares the rails' and the always-on processor's mailboxes, has long started).
@@ -1179,9 +1179,9 @@ step_tone(bool darwin)
 	volume = -(int)MIN(MAX(below, 20u), 102u);
 	tone_periods = seconds * 100;
 	if (darwin) {
-		below = 20;
+		below = 6;              /* Darwin's sound: 6 dB under the amplifier's full digital volume by default, 0 the loudest */
 		PE_parse_boot_argn("adsp_below", &below, sizeof(below));
-		volume = -(int)MIN(MAX(below, 20u), 102u);
+		volume = -(int)MIN(below, 102u);
 		say("adsp: step 9: DARWIN'S SOUND to the bottom speaker until the run ends, its amplifier at %d dB\n", volume);
 	} else {
 		say("adsp: step 8: A TONE: 1 kHz at -20 dBFS for %u s from the bottom speaker, its amplifier at %d dB\n", seconds, volume);

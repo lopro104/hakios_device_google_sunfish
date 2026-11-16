@@ -300,7 +300,9 @@ cs_wait_us(uint32_t us)
 #define BCLK_CODE	0x1b		/* 1.536 MHz (cs35l41.c:66 PLL table) */
 #define BCLK_CODE_32	0x21		/* pcm32: 3.072 MHz, Linux cs35l41-lib.c cs35l41_pll_sysclk { 3072000, 0x21 } */	/* verified: Linux cs35l41.c cs35l41_pll_sysclk { 3072000, 0x21 } (fs_mon: 1536000 -> 52/84, 3072000 -> 28/44) */
 #define BCLK_CODE_OF(a)	((a)->slot32 ? BCLK_CODE_32 : BCLK_CODE)
-#define VOL_CEIL_DB	(-20)		/* sp1: hard ceiling, whatever the caller passes */
+#define VOL_CEIL_DB	(0)		/* the caller's to hold lower (the tone: -20). At 0 dB with the analog gain at 0.5 dB and the boost
+					 * bypassed this is still some 19 dB under what the stock system drives the speaker with (its analog
+					 * gain is 19.5 dB, with the amplifier's own protection firmware, which is not loaded here) */
 #define VOL_FLOOR_DB	(-102)		/* tlv minimum 0x4cf */
 #define AMP_OK(x)	((x) == 0x40 || (x) == 0x41)	/* ep1: 0x40 = top (earpiece, DT reset_pin_top), 0x41 = bottom loudspeaker */
 
