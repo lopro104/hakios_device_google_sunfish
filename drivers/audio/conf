@@ -1,0 +1,6 @@
+# devices/sunfish/drivers/audio/conf: what only the Pixel 4a has.
+
+driver ADSP_SM7150
+	file    bsd/dev/hakios.adsp_sm7150.c
+	requires MPSS_SM7150
+	help    the audio DSP of the SM7150 started through TrustZone and linked (adsp=N): the first step of sound and sensors

@@ -2712,6 +2712,14 @@ aop_send(const char *msg)
 	return true;
 }
 
+/* For the audio DSP's driver (hakios.adsp_sm7150.c): the mailbox is one, and this file's sender is the only one. */
+bool hakios_sm7150_aop_send(const char *msg);
+bool
+hakios_sm7150_aop_send(const char *msg)
+{
+	return aop_send(msg);
+}
+
 /* map the 2 MiB around a faulting address to a host buffer, to see what the firmware writes there */
 static void
 wp_sink_map(uint64_t far)
