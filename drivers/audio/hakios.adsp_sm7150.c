@@ -62,6 +62,8 @@
 #include <pexpert/pexpert.h>
 #include <vm/vm_kern.h>
 #include <sys/hakios.audio.h>
+#include <sys/conf.h>
+#include <miscfs/devfs/devfs.h>
 
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
@@ -1175,6 +1177,395 @@ tone_write(uint32_t period, bool sound)
 }
 
 /* With the port running: the buffer, the path, the stream, the tone; the amplifier on once the DSP takes the samples. */
+/* ---- step 10: the microphones. The tertiary TDM port takes the RT5514's frames; a stream reads them; levels said ---- */
+
+extern bool hakios_rt5514_start(void);         /* hakios.rt5514_sunfish.c */
+extern void hakios_rt5514_stop(void);
+
+#define AFE_PORT_TERT_TDM_TX    0x9021
+#define AFE_GROUP_TERT_TDM_TX   0x9121
+#define AFE_CLK_TER_TDM_IBIT    0x204
+#define TLMM_WEST_PA            0x03500000ul    /* gpio 53..56 (pinctrl-sdmmagpie.c), function 1 = ter_mi2s */
+#define MIC_PORT                0x0201          /* session 2, stream 1 */
+#define MIC_PERIODS             8
+#define MIC_PERIOD_FRAMES       480             /* 10 ms */
+#define MIC_CHANNELS            2               /* slots 0 and 1: Stereo1's left and right (the two edges of DMIC1) */
+#define MIC_PERIOD_BYTES        (MIC_PERIOD_FRAMES * 2 * MIC_CHANNELS)
+#define MIC_IOVA                (TONE_IOVA + PERIODS * PERIOD_STRIDE)   /* right after the speaker's: one SMMU mapping holds both */
+#define MIC_DSP_ADDRESS         (MIC_IOVA | 1ull << 32)
+
+static int16_t *mic_buffer;
+static uint32_t mic_handle;
+
+static bool
+afe_svc_param(const char *what, uint32_t module, uint32_t param, const void *data, uint16_t size)
+{
+	uint8_t body[96];
+	uint32_t head[7] = { 12u + size, 0, 0, 0, module, param, size };
+
+	if (size > sizeof(body) - sizeof(head)) {
+		return false;
+	}
+	memcpy(body, head, sizeof(head));
+	memcpy(body + sizeof(head), data, size);
+	return afe_do(what, 0, AFE_SVC_SET_PARAM, body, (uint16_t)(sizeof(head) + size));
+}
+
+static bool
+afe_port_param(const char *what, uint16_t port, uint32_t module, uint32_t param, const void *data, uint16_t size)
+{
+	uint8_t body[96];
+	struct { uint16_t port, size; uint32_t zero[3]; uint32_t module, param; uint16_t param_size, reserved; } __attribute__((packed))
+	head = { port, (uint16_t)(12u + size), { 0, 0, 0 }, module, param, size, 0 };
+
+	if (size > sizeof(body) - sizeof(head)) {
+		return false;
+	}
+	memcpy(body, &head, sizeof(head));
+	memcpy(body + sizeof(head), data, size);
+	return afe_do(what, port, AFE_PORT_SET_PARAM_V2, body, (uint16_t)(sizeof(head) + size));
+}
+
+static bool
+mic_read(uint32_t period)
+{
+	uint64_t address = MIC_DSP_ADDRESS + PERIOD_STRIDE * period;
+	uint32_t read[5] = { (uint32_t)address, (uint32_t)(address >> 32), mic_handle, MIC_PERIOD_BYTES, period };
+	uint8_t *frames = (uint8_t *)mic_buffer + PERIOD_STRIDE * period;
+
+	for (uint32_t o = 0; o < MIC_PERIOD_BYTES; o += 64) {   /* nothing of ours left in the cache to be written over the DSP's */
+		__asm__ volatile ("dc civac, %0" : : "r" (frames + o) : "memory");
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	return apr_post(APR_SVC_ASM, MIC_PORT, 0x40000000u | period, 0x00010DACu, read, sizeof(read));
+}
+
+/*
+ * /dev/hakios-mic, as drivers/audio/hakios.mic.c (the redwood's) makes it for the audio plug-in's input "Codec"
+ * (userland/src/audio_plugin.c): 16-bit samples, one channel, 48 kHz; open while Darwin records, reads never wait and
+ * keep the reader about 40 ms behind; the path up while it is open (the sound loop below brings it up and down).
+ */
+#define MRING_FRAMES            16384
+#define MRING_KEEP              1920
+#define MRING_MOST              4800
+
+static int16_t mring[MRING_FRAMES];
+static volatile uint64_t mring_written;
+static uint64_t mring_read, mring_skipped, mring_dry;
+static bool mring_primed;
+static volatile uint32_t mic_wanted;           /* the device is open */
+
+static void
+mring_put(const int16_t *samples, uint32_t count, uint32_t stride)
+{
+	uint64_t at = mring_written;
+
+	for (uint32_t i = 0; i < count; i++) {
+		mring[(at + i) % MRING_FRAMES] = samples[i * stride];
+	}
+	__atomic_store_n(&mring_written, at + count, __ATOMIC_RELEASE);
+}
+
+static int
+mic_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	uint64_t written = __atomic_load_n(&mring_written, __ATOMIC_ACQUIRE), avail, want;
+	int error = 0;
+
+	if (uio_resid(uio) < 2) {
+		return 0;
+	}
+	want = (uint64_t)uio_resid(uio) / 2;
+	avail = written - mring_read;
+	if (avail > MRING_MOST) {
+		mring_skipped += avail - MRING_KEEP;
+		mring_read = written - MRING_KEEP;
+		avail = MRING_KEEP;
+	}
+	if (!mring_primed) {
+		if (avail < MRING_KEEP) {
+			return 0;
+		}
+		mring_primed = true;
+	}
+	if (avail < want) {
+		mring_dry++;
+		mring_primed = false;
+	}
+	while (want > 0 && avail > 0 && error == 0) {
+		uint64_t at = mring_read % MRING_FRAMES, n = MIN(want, avail);
+
+		n = MIN(n, MRING_FRAMES - at);
+		error = uiomove((caddr_t)&mring[at], (int)(n * 2), uio);
+		mring_read += n;
+		want -= n;
+		avail -= n;
+	}
+	return error;
+}
+
+static int
+mic_dev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	mring_read = __atomic_load_n(&mring_written, __ATOMIC_ACQUIRE);
+	mring_primed = false;
+	mic_wanted = 1;
+	return 0;
+}
+
+static int
+mic_dev_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	mic_wanted = 0;
+	return 0;
+}
+
+static const struct cdevsw mic_cdevsw = {
+	.d_open = mic_dev_open, .d_close = mic_dev_close, .d_read = mic_dev_read, .d_write = eno_rdwrt,
+	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
+	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+};
+
+static bool mic_node_made;
+
+static void
+mic_make_node(void)
+{
+	int major;
+
+	if (mic_node_made) {
+		return;
+	}
+	major = cdevsw_add(-1, &mic_cdevsw);
+	mic_node_made = major >= 0 && devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "hakios-mic") != NULL;
+	say("adsp: mic: /dev/hakios-mic %s\n", mic_node_made ? "made: the microphone is Darwin's while it records" : "CANNOT BE MADE");
+}
+
+/* the path: what step 10 found to work (logs/201100-run.log) */
+static struct {
+	bool voted, grouped, clocked, started, codec, mapped, path_open, stream_open, running, failed;
+	uint32_t vote_handle, path_id, periods, errors_said;
+	uint32_t pins_before[4];
+	vm_offset_t west[4], memory;
+	/* levels, for step 10 */
+	uint64_t sum[MIC_CHANNELS];
+	int32_t peak[MIC_CHANNELS];
+	uint32_t count;
+} mic;
+
+static void mic_down(void);
+
+static bool
+mic_up(void)
+{
+	struct { uint32_t version; uint16_t group, reserved, ports[8]; uint32_t channels, rate, bits; uint16_t slots, slot_width;
+		 uint32_t slot_mask; } __attribute__((packed)) group = { 1, AFE_GROUP_TERT_TDM_TX, 0, { AFE_PORT_TERT_TDM_TX },
+		 8, 48000, 32, 8, 32, 0xff };
+	uint16_t enable[2] = { AFE_GROUP_TERT_TDM_TX, 1 };
+	uint32_t clock_on[5] = { 1, AFE_CLK_TER_TDM_IBIT, 12288000, 1 /* attribute 1, root 0 */, 1 };
+	struct { uint32_t version, channels, rate, bits; uint16_t format, sync_mode, sync_src, slots, data_out, invert, delay, slot_width;
+		 uint32_t slot_mask; } __attribute__((packed)) tdm = { 1, MIC_CHANNELS, 48000, 16, 0, 0, 1, 8, 0, 0, 1, 32, 0x3 };
+	struct { uint32_t version; uint16_t channels, bits; uint32_t align; uint16_t offset[8]; } __attribute__((packed)) slots =
+	    { 1, MIC_CHANNELS, 16, 0, { 0, 4, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff } };
+	struct { uint16_t pool, regions; uint32_t property, low, high, size; } __attribute__((packed)) map =
+	    { 3, 1, 0, (uint32_t)MIC_DSP_ADDRESS, (uint32_t)(MIC_DSP_ADDRESS >> 32), MIC_PERIODS * PERIOD_STRIDE };
+	struct { uint16_t flags, mode, endpoint1, endpoint2; uint32_t topology; uint16_t channels, bits; uint32_t rate; uint8_t channel_map[8]; }
+	__attribute__((packed)) path = { 0, 2 /* capture */, AFE_PORT_TERT_TDM_TX, 0xffff, 0x00010312, MIC_CHANNELS, 16, 48000, { 1, 2 } };
+	struct { uint32_t flags, endpoint, topology, format; uint16_t bits, reserved; } __attribute__((packed)) open =
+	    { 0, 0 /* the device matrix */, 0x00010C68, 0x00010DA5, 16, 0 };
+	struct { uint32_t matrix, sessions; uint16_t session, paths, path[2]; } __attribute__((packed)) route = { 1, 1, 2, 1, { 0, 0 } };
+	struct { uint32_t param, size, frames_per_buffer, block_size; uint16_t channels, bits; uint32_t rate; uint16_t is_signed, reserved;
+		 uint8_t channel_map[8]; } __attribute__((packed)) encoder = { 0x00010DA3, 28, 0, 20, MIC_CHANNELS, 16, 48000, 1, 0, { 1, 2 } };
+	uint32_t run[3] = { 0, 0, 0 };
+	struct { uint32_t block; char name[8]; } vote = { 2, "hakmic" };
+	uint16_t start[2] = { AFE_PORT_TERT_TDM_TX, 0 };
+	bool posted = true;
+
+	memset(&mic, 0, sizeof(mic));
+	if (apr_call(APR_SVC_AFE, 0, AFE_HW_VOTE, &vote, sizeof(vote)) && apr.last_opcode == 0x000100F5u) {
+		mic.voted = true;
+		mic.vote_handle = apr.last_words[0];
+	}
+	/* the TDM pins to the port (function 1, 8 mA, no pull, as Android's ter_tdm_active) */
+	for (unsigned i = 0; i < 4; i++) {
+		mic.west[i] = ml_io_map(TLMM_WEST_PA + 0x1000ul * (53 + i), 0x1000);
+		if (mic.west[i] != 0) {
+			mic.pins_before[i] = *(volatile uint32_t *)mic.west[i];
+			*(volatile uint32_t *)mic.west[i] = 1u << 2 | 3u << 6;
+		}
+	}
+	mic.grouped = afe_svc_param("the TDM group: 8 slots of 32 bits at 48 kHz", 0x00010254, 0x0001029E, &group, sizeof(group)) &&
+	    afe_svc_param("the TDM group enabled", 0x00010254, 0x00010256, enable, sizeof(enable));
+	mic.clocked = mic.grouped && afe_svc_param("the TDM bit clock, 12.288 MHz, on", 0x0001028F, 0x00010290, clock_on, sizeof(clock_on));
+	if (mic.clocked && afe_port_param("the port's TDM format: 2 channels, 16 bits, slots 0 and 1", AFE_PORT_TERT_TDM_TX, 0x0001020C,
+	    0x0001029D, &tdm, sizeof(tdm)) && afe_port_param("the port's slot mapping", AFE_PORT_TERT_TDM_TX, 0x0001028A, 0x00010297,
+	    &slots, sizeof(slots))) {
+		mic.started = afe_do("the port started", AFE_PORT_TERT_TDM_TX, AFE_PORT_START, start, sizeof(start));
+	}
+	mic.codec = mic.started && hakios_rt5514_start();
+	if (mic.codec && mic_buffer == NULL) {
+		vm_offset_t memory = 0;
+
+		if (kmem_alloc_contig(kernel_map, &memory, MIC_PERIODS * PERIOD_STRIDE, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO,
+		    VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS && hakios_sm7150_smmu_pages(TONE_SID, MIC_IOVA, kvtophys(memory),
+		    MIC_PERIODS * PERIOD_STRIDE >> 12)) {
+			mic_buffer = (int16_t *)memory;         /* kept for the rest of the run, and the SMMU's mapping with it */
+		}
+	}
+	if (mic.codec && mic_buffer != NULL && apr_call(APR_SVC_ASM, 0, ASM_MAP, &map, sizeof(map)) && apr.last_opcode == 0x00010D93u &&
+	    apr.last_words[0] != 0) {
+		mic.mapped = true;
+		mic_handle = apr.last_words[0];
+	}
+	if (mic.mapped && apr_call(APR_SVC_ADM, AFE_PORT_TERT_TDM_TX, ADM_OPEN, &path, sizeof(path)) && apr.last_opcode == 0x00010329u &&
+	    apr.last_words[0] == 0) {
+		mic.path_open = true;
+		mic.path_id = apr.last_words[1] & 0xffff;
+	}
+	if (mic.path_open) {
+		route.path[0] = (uint16_t)mic.path_id;
+		mic.stream_open = basic_ok("the stream opened for reading", APR_SVC_ASM, MIC_PORT, 0x00010DB4u, &open, sizeof(open));
+	}
+	if (mic.stream_open && basic_ok("the stream routed from the path", APR_SVC_ADM, 0, ADM_ROUTE, &route, sizeof(route)) &&
+	    basic_ok("the encoder: 48 kHz, 16 bits, 2 channels", APR_SVC_ASM, MIC_PORT, 0x00010C10u, &encoder, sizeof(encoder))) {
+		mic.running = basic_ok("the stream run", APR_SVC_ASM, MIC_PORT, ASM_RUN, run, sizeof(run));
+	}
+	apr.read_done = apr.read_errors = 0;
+	for (uint32_t p = 0; p < MIC_PERIODS && mic.running && posted; p++) {
+		posted = mic_read(p);
+	}
+	if (!mic.running || !posted) {
+		say("adsp: mic: the path did not come up: given back\n");
+		mic_down();
+		mic.failed = true;
+		return false;
+	}
+	say("adsp: mic: THE MICROPHONE LISTENS (capture path %u)\n", mic.path_id);
+	return true;
+}
+
+/* the buffers the DSP filled: into the ring (slot 0) and the levels; each handed back. False when one cannot be. */
+static bool
+mic_poll(void)
+{
+	for (uint32_t p = 0; p < MIC_PERIODS; p++) {
+		int16_t *frames;
+		uint32_t n;
+
+		if (!(apr.read_done & (1u << p))) {
+			continue;
+		}
+		frames = (int16_t *)((uint8_t *)mic_buffer + PERIOD_STRIDE * p);
+		n = MIN(apr.read_bytes[p], (uint32_t)MIC_PERIOD_BYTES) / 2;
+		apr.read_done &= ~(1u << p);
+		for (uint32_t o = 0; o < MIC_PERIOD_BYTES; o += 64) {
+			__asm__ volatile ("dc ivac, %0" : : "r" ((uint8_t *)frames + o) : "memory");
+		}
+		__asm__ volatile ("dsb sy" ::: "memory");
+		mring_put(frames, n / MIC_CHANNELS, MIC_CHANNELS);
+		for (uint32_t f = 0; f < n; f++) {
+			int32_t v = frames[f];
+			unsigned c = f % MIC_CHANNELS;
+
+			mic.sum[c] += (uint64_t)((int64_t)v * v);
+			mic.peak[c] = MAX(mic.peak[c], v < 0 ? -v : v);
+		}
+		mic.count += n / MIC_CHANNELS;
+		mic.periods++;
+		if (!mic_read(p)) {
+			return false;
+		}
+	}
+	if (apr.read_errors != mic.errors_said && apr.read_errors % 100 == 1) {
+		mic.errors_said = apr.read_errors;
+		say("adsp: mic: %u capture buffers came back with an error\n", apr.read_errors);
+	}
+	return true;
+}
+
+/* back, in the opposite order, as far as it was done */
+static void
+mic_down(void)
+{
+	uint16_t disable[2] = { AFE_GROUP_TERT_TDM_TX, 0 }, start[2] = { AFE_PORT_TERT_TDM_TX, 0 };
+	uint32_t clock_off[5] = { 1, AFE_CLK_TER_TDM_IBIT, 12288000, 1, 0 };
+
+	if (mic.running) {
+		(void)basic_ok("the stream paused", APR_SVC_ASM, MIC_PORT, ASM_PAUSE, NULL, 0);
+	}
+	if (mic.stream_open) {
+		(void)basic_ok("the stream closed", APR_SVC_ASM, MIC_PORT, ASM_CLOSE, NULL, 0);
+	}
+	if (mic.path_open) {
+		(void)basic_ok("the capture path closed", APR_SVC_ADM, (uint16_t)mic.path_id, ADM_CLOSE, NULL, 0);
+	}
+	if (mic.mapped) {
+		(void)basic_ok("the buffer taken back", APR_SVC_ASM, 0, ASM_UNMAP, &mic_handle, sizeof(mic_handle));
+	}
+	if (mic.codec) {
+		hakios_rt5514_stop();
+	}
+	if (mic.started) {
+		(void)afe_do("the port stopped", AFE_PORT_TERT_TDM_TX, AFE_PORT_STOP, start, sizeof(start));
+	}
+	if (mic.clocked) {
+		(void)afe_svc_param("the TDM bit clock off", 0x0001028F, 0x00010290, clock_off, sizeof(clock_off));
+	}
+	if (mic.grouped) {
+		(void)afe_svc_param("the TDM group disabled", 0x00010254, 0x00010256, disable, sizeof(disable));
+	}
+	for (unsigned i = 0; i < 4; i++) {
+		if (mic.west[i] != 0) {
+			*(volatile uint32_t *)mic.west[i] = mic.pins_before[i];
+		}
+	}
+	if (mic.voted) {
+		uint32_t devote[2] = { 2, mic.vote_handle };
+
+		(void)afe_do("the vote for LPASS's core given back", 0, AFE_HW_DEVOTE, devote, sizeof(devote));
+	}
+	if (mic.running) {
+		say("adsp: mic: the microphone stopped after %u periods (%u with an error)\n", mic.periods, apr.read_errors);
+	}
+	mic.voted = mic.grouped = mic.clocked = mic.started = mic.codec = mic.mapped = mic.path_open = mic.stream_open = false;
+	mic.running = false;
+}
+
+/* step 10: the path for `seconds', its levels said every second (no Darwin) */
+static void
+step_mic(uint32_t seconds)
+{
+	uint32_t waited = 0;
+
+	say("adsp: step 10: THE MICROPHONES for %u s: the tertiary TDM port (AFE %#x), the RT5514, a capture stream\n",
+	    seconds, AFE_PORT_TERT_TDM_TX);
+	if (!mic_up()) {
+		return;
+	}
+	while (waited < seconds * 1000 && mic_poll()) {
+		sleep_ms(1);
+		waited++;
+		glink_poll();
+		if (waited % 1000 == 0) {
+			uint32_t rms[MIC_CHANNELS] = { 0 };
+
+			for (unsigned c = 0; c < MIC_CHANNELS; c++) {
+				uint64_t mean = mic.count != 0 ? mic.sum[c] / mic.count : 0;
+
+				while ((uint64_t)(rms[c] + 1) * (rms[c] + 1) <= mean) {
+					rms[c]++;
+				}
+				mic.sum[c] = 0;
+			}
+			say("adsp: mic: %u s: %u periods (%u errors): slot 0 rms %u peak %d, slot 1 rms %u peak %d\n", waited / 1000,
+			    mic.periods, apr.read_errors, rms[0], mic.peak[0], rms[1], mic.peak[1]);
+			mic.count = 0;
+			mic.peak[0] = mic.peak[1] = 0;
+		}
+	}
+	mic_down();
+}
+
 static void
 step_tone(bool darwin)
 {
@@ -1208,12 +1599,19 @@ step_tone(bool darwin)
 		say("adsp: step 8: A TONE: 1 kHz at -20 dBFS for %u s from the bottom speaker, its amplifier at %d dB\n", seconds, volume);
 	}
 
-	if (kmem_alloc_contig(kernel_map, &memory, PERIODS * PERIOD_STRIDE, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) !=
-	    KERN_SUCCESS || !hakios_sm7150_smmu_pages(TONE_SID, TONE_IOVA, kvtophys(memory), PERIODS * PERIOD_STRIDE >> 12)) {
+	/*
+	 * The speaker's buffers and the microphone's together, in one mapping: a second hakios_sm7150_smmu_pages() for the
+	 * same stream makes a new page table for it and the first mapping is gone (the DSP stopped answering when the
+	 * microphone's buffer was mapped while the speaker played, logs/202230-run.log).
+	 */
+	if (kmem_alloc_contig(kernel_map, &memory, (PERIODS + MIC_PERIODS) * PERIOD_STRIDE, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO,
+	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS || !hakios_sm7150_smmu_pages(TONE_SID, TONE_IOVA, kvtophys(memory),
+	    (PERIODS + MIC_PERIODS) * PERIOD_STRIDE >> 12)) {
 		say("adsp: stream: no buffer the DSP can read (memory or the SMMU)\n");
 		return;
 	}
 	tone_buffer = (int16_t *)memory;
+	mic_buffer = (int16_t *)(memory + PERIODS * PERIOD_STRIDE);
 	say("adsp: stream: %u bytes at pa %#llx shown to the DSP as %#llx (stream %#x)\n", PERIODS * PERIOD_STRIDE, kvtophys(memory),
 	    TONE_DSP_ADDRESS, TONE_SID);
 	/* the amplifier configured and read back before anything plays; GLOBAL_EN only once the DSP is taking samples */
@@ -1268,7 +1666,7 @@ step_tone(bool darwin)
 		 * while there is sound and for three seconds after, then paused (configured, GLOBAL_EN off); an error bit, looked
 		 * for every half second while it is on, powers it down for the rest of the run.
 		 */
-		uint32_t silent_ms = 0, look_ms = 0, report_ms = 0, starts = 0;
+		uint32_t silent_ms = 0, look_ms = 0, report_ms = 0, starts = 0, mic_idle_ms = 0;
 		bool wrote = true, dead = !amp_ready;
 
 		darwin_mode = true;
@@ -1279,6 +1677,7 @@ step_tone(bool darwin)
 			wrote = tone_write(p, false);
 		}
 		hakios_audio_set_sink("the Pixel 4a's bottom speaker, through the audio DSP", darwin_sink);
+		mic_make_node();
 		say("adsp: sound: DARWIN'S SOUND GOES TO THE SPEAKER from here on (amplifier %d dB down%s)\n", -volume,
 		    dead ? "; THE AMPLIFIER IS NOT READY: nothing will be heard" : "");
 		while (wrote) {
@@ -1292,6 +1691,18 @@ step_tone(bool darwin)
 					wrote = tone_write(p, false);
 					sound_now = sound_now || period_had_sound;
 				}
+			}
+			/* the microphone: up while Darwin has /dev/hakios-mic open, down 3 s after it closed it */
+			if (mic_wanted && !mic.running && !mic.failed) {
+				(void)mic_up();
+				mic_idle_ms = 0;
+			} else if (mic.running) {
+				mic_idle_ms = mic_wanted ? 0 : mic_idle_ms + 1;
+				if (!mic_poll() || mic_idle_ms >= 3000) {
+					mic_down();
+				}
+			} else if (!mic_wanted) {
+				mic.failed = false;             /* (a failed start is tried again when Darwin opens it anew) */
 			}
 			silent_ms = sound_now ? 0 : silent_ms + 1;
 			if (!dead && sound_now && !amp_on) {
@@ -1326,6 +1737,9 @@ step_tone(bool darwin)
 			}
 		}
 		hakios_audio_set_sink("nothing", NULL);
+		if (mic.running) {
+			mic_down();
+		}
 		darwin_mode = false;
 		say("adsp: sound: the stream stopped taking periods: over\n");
 	} else if (running) {
@@ -1478,253 +1892,6 @@ step_port(uint32_t hold_seconds, bool with_amp, bool with_tone, bool darwin)
 	}
 	if (clocked) {
 		(void)afe_clock(false);
-	}
-	if (voted) {
-		uint32_t devote[2] = { 2, handle };
-
-		(void)afe_do("the vote for LPASS's core given back", 0, AFE_HW_DEVOTE, devote, sizeof(devote));
-	}
-}
-
-/* ---- step 10: the microphones. The tertiary TDM port takes the RT5514's frames; a stream reads them; levels said ---- */
-
-extern bool hakios_rt5514_start(void);         /* hakios.rt5514_sunfish.c */
-extern void hakios_rt5514_stop(void);
-
-#define AFE_PORT_TERT_TDM_TX    0x9021
-#define AFE_GROUP_TERT_TDM_TX   0x9121
-#define AFE_CLK_TER_TDM_IBIT    0x204
-#define TLMM_WEST_PA            0x03500000ul    /* gpio 53..56 (pinctrl-sdmmagpie.c), function 1 = ter_mi2s */
-#define MIC_PORT                0x0201          /* session 2, stream 1 */
-#define MIC_PERIODS             8
-#define MIC_PERIOD_FRAMES       480             /* 10 ms */
-#define MIC_CHANNELS            2               /* slots 0 and 1: Stereo1's left and right (the two edges of DMIC1) */
-#define MIC_PERIOD_BYTES        (MIC_PERIOD_FRAMES * 2 * MIC_CHANNELS)
-#define MIC_IOVA                (TONE_IOVA + 0x100000ull)
-#define MIC_DSP_ADDRESS         (MIC_IOVA | 1ull << 32)
-
-static int16_t *mic_buffer;
-static uint32_t mic_handle;
-
-static bool
-afe_svc_param(const char *what, uint32_t module, uint32_t param, const void *data, uint16_t size)
-{
-	uint8_t body[96];
-	uint32_t head[7] = { 12u + size, 0, 0, 0, module, param, size };
-
-	if (size > sizeof(body) - sizeof(head)) {
-		return false;
-	}
-	memcpy(body, head, sizeof(head));
-	memcpy(body + sizeof(head), data, size);
-	return afe_do(what, 0, AFE_SVC_SET_PARAM, body, (uint16_t)(sizeof(head) + size));
-}
-
-static bool
-afe_port_param(const char *what, uint16_t port, uint32_t module, uint32_t param, const void *data, uint16_t size)
-{
-	uint8_t body[96];
-	struct { uint16_t port, size; uint32_t zero[3]; uint32_t module, param; uint16_t param_size, reserved; } __attribute__((packed))
-	head = { port, (uint16_t)(12u + size), { 0, 0, 0 }, module, param, size, 0 };
-
-	if (size > sizeof(body) - sizeof(head)) {
-		return false;
-	}
-	memcpy(body, &head, sizeof(head));
-	memcpy(body + sizeof(head), data, size);
-	return afe_do(what, port, AFE_PORT_SET_PARAM_V2, body, (uint16_t)(sizeof(head) + size));
-}
-
-static bool
-mic_read(uint32_t period)
-{
-	uint64_t address = MIC_DSP_ADDRESS + PERIOD_STRIDE * period;
-	uint32_t read[5] = { (uint32_t)address, (uint32_t)(address >> 32), mic_handle, MIC_PERIOD_BYTES, period };
-	uint8_t *frames = (uint8_t *)mic_buffer + PERIOD_STRIDE * period;
-
-	for (uint32_t o = 0; o < MIC_PERIOD_BYTES; o += 64) {   /* nothing of ours left in the cache to be written over the DSP's */
-		__asm__ volatile ("dc civac, %0" : : "r" (frames + o) : "memory");
-	}
-	__asm__ volatile ("dsb sy" ::: "memory");
-
-	return apr_post(APR_SVC_ASM, MIC_PORT, 0x40000000u | period, 0x00010DACu, read, sizeof(read));
-}
-
-static void
-step_mic(uint32_t seconds)
-{
-	struct { uint32_t version; uint16_t group, reserved, ports[8]; uint32_t channels, rate, bits; uint16_t slots, slot_width;
-		 uint32_t slot_mask; } __attribute__((packed)) group = { 1, AFE_GROUP_TERT_TDM_TX, 0, { AFE_PORT_TERT_TDM_TX },
-		 8, 48000, 32, 8, 32, 0xff };
-	uint16_t enable[2] = { AFE_GROUP_TERT_TDM_TX, 1 }, disable[2] = { AFE_GROUP_TERT_TDM_TX, 0 };
-	uint32_t clock[5] = { 1, AFE_CLK_TER_TDM_IBIT, 12288000, 1 /* attribute 1, root 0 */, 0 /* off */ },
-	    clock_on[5] = { 1, AFE_CLK_TER_TDM_IBIT, 12288000, 1, 1 };
-	struct { uint32_t version, channels, rate, bits; uint16_t format, sync_mode, sync_src, slots, data_out, invert, delay, slot_width;
-		 uint32_t slot_mask; } __attribute__((packed)) tdm = { 1, MIC_CHANNELS, 48000, 16, 0, 0, 1, 8, 0, 0, 1, 32, 0x3 };
-	struct { uint32_t version; uint16_t channels, bits; uint32_t align; uint16_t offset[8]; } __attribute__((packed)) slots =
-	    { 1, MIC_CHANNELS, 16, 0, { 0, 4, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff } };
-	struct { uint16_t pool, regions; uint32_t property, low, high, size; } __attribute__((packed)) map =
-	    { 3, 1, 0, (uint32_t)MIC_DSP_ADDRESS, (uint32_t)(MIC_DSP_ADDRESS >> 32), MIC_PERIODS * PERIOD_STRIDE };
-	struct { uint16_t flags, mode, endpoint1, endpoint2; uint32_t topology; uint16_t channels, bits; uint32_t rate; uint8_t channel_map[8]; }
-	__attribute__((packed)) path = { 0, 2 /* capture */, AFE_PORT_TERT_TDM_TX, 0xffff, 0x00010312, MIC_CHANNELS, 16, 48000, { 1, 2 } };
-	struct { uint32_t flags, endpoint, topology, format; uint16_t bits, reserved; } __attribute__((packed)) open =
-	    { 0, 0 /* the device matrix */, 0x00010C68, 0x00010DA5, 16, 0 };
-	struct { uint32_t matrix, sessions; uint16_t session, paths, path[2]; } __attribute__((packed)) route = { 1, 1, 2, 1, { 0, 0 } };
-	struct { uint32_t param, size, frames_per_buffer, block_size; uint16_t channels, bits; uint32_t rate; uint16_t is_signed, reserved;
-		 uint8_t channel_map[8]; } __attribute__((packed)) encoder = { 0x00010DA3, 28, 0, 20, MIC_CHANNELS, 16, 48000, 1, 0, { 1, 2 } };
-	uint32_t run[3] = { 0, 0, 0 }, pins_before[4] = { 0 }, handle = 0, path_id = 0, periods = 0, waited = 0;
-	struct { uint32_t block; char name[8]; } vote = { 2, "hakios" };
-	uint16_t start[2] = { AFE_PORT_TERT_TDM_TX, 0 };
-	bool voted = false, grouped = false, clocked = false, started = false, codec = false, mapped = false, path_open = false,
-	    stream_open = false, running = false;
-	vm_offset_t west[4] = { 0 }, memory = 0;
-	uint64_t sum = 0;
-	int32_t peak = 0;
-	uint32_t count = 0;
-	int64_t mic_mean = 0;
-	uint64_t csum[MIC_CHANNELS] = { 0 };
-	int32_t cpeak[MIC_CHANNELS] = { 0 };
-
-	say("adsp: step 10: THE MICROPHONES for %u s: the tertiary TDM port (AFE %#x), the RT5514, a capture stream\n",
-	    seconds, AFE_PORT_TERT_TDM_TX);
-	if (apr_call(APR_SVC_AFE, 0, AFE_HW_VOTE, &vote, sizeof(vote)) && apr.last_opcode == 0x000100F5u) {
-		voted = true;
-		handle = apr.last_words[0];
-	}
-	/* the TDM pins to the port (function 1, 8 mA, no pull, as Android's ter_tdm_active) */
-	for (unsigned i = 0; i < 4; i++) {
-		west[i] = ml_io_map(TLMM_WEST_PA + 0x1000ul * (53 + i), 0x1000);
-		if (west[i] != 0) {
-			pins_before[i] = *(volatile uint32_t *)west[i];
-			*(volatile uint32_t *)west[i] = 1u << 2 | 3u << 6;
-		}
-	}
-	say("adsp: mic: gpio 53..56 to ter_mi2s (were %#x %#x %#x %#x)\n", pins_before[0], pins_before[1], pins_before[2], pins_before[3]);
-	grouped = afe_svc_param("the TDM group: 8 slots of 32 bits at 48 kHz", 0x00010254, 0x0001029E, &group, sizeof(group)) &&
-	    afe_svc_param("the TDM group enabled", 0x00010254, 0x00010256, enable, sizeof(enable));
-	clocked = grouped && afe_svc_param("the TDM bit clock, 12.288 MHz, on", 0x0001028F, 0x00010290, clock_on, sizeof(clock_on));
-	if (clocked && afe_port_param("the port's TDM format: 2 channels, 16 bits, slots 0 and 1", AFE_PORT_TERT_TDM_TX, 0x0001020C, 0x0001029D,
-	    &tdm, sizeof(tdm)) && afe_port_param("the port's slot mapping", AFE_PORT_TERT_TDM_TX, 0x0001028A, 0x00010297, &slots,
-	    sizeof(slots))) {
-		started = afe_do("the port started", AFE_PORT_TERT_TDM_TX, AFE_PORT_START, start, sizeof(start));
-	}
-	codec = started && hakios_rt5514_start();
-	if (codec && kmem_alloc_contig(kernel_map, &memory, MIC_PERIODS * PERIOD_STRIDE, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO,
-	    VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS && hakios_sm7150_smmu_pages(TONE_SID, MIC_IOVA, kvtophys(memory),
-	    MIC_PERIODS * PERIOD_STRIDE >> 12)) {
-		mic_buffer = (int16_t *)memory;
-		if (apr_call(APR_SVC_ASM, 0, ASM_MAP, &map, sizeof(map)) && apr.last_opcode == 0x00010D93u && apr.last_words[0] != 0) {
-			mapped = true;
-			mic_handle = apr.last_words[0];
-		}
-	}
-	if (mapped && apr_call(APR_SVC_ADM, AFE_PORT_TERT_TDM_TX, ADM_OPEN, &path, sizeof(path)) && apr.last_opcode == 0x00010329u &&
-	    apr.last_words[0] == 0) {
-		path_open = true;
-		path_id = apr.last_words[1] & 0xffff;
-	}
-	say("adsp: mic: buffer %s, capture path %s (id %u)\n", mapped ? "mapped" : "NOT mapped", path_open ? "open" : "NOT open", path_id);
-	if (path_open) {
-		route.path[0] = (uint16_t)path_id;
-		stream_open = basic_ok("the stream opened for reading", APR_SVC_ASM, MIC_PORT, 0x00010DB4u, &open, sizeof(open));
-	}
-	if (stream_open && basic_ok("the stream routed from the path", APR_SVC_ADM, 0, ADM_ROUTE, &route, sizeof(route)) &&
-	    basic_ok("the encoder: 48 kHz, 16 bits, 2 channels", APR_SVC_ASM, MIC_PORT, 0x00010C10u, &encoder, sizeof(encoder))) {
-		running = basic_ok("the stream run", APR_SVC_ASM, MIC_PORT, ASM_RUN, run, sizeof(run));
-	}
-	if (running) {
-		bool posted = true;
-
-		apr.read_done = apr.read_errors = 0;
-		for (uint32_t p = 0; p < MIC_PERIODS && posted; p++) {
-			posted = mic_read(p);
-		}
-		while (posted && waited < seconds * 1000) {
-			sleep_ms(1);
-			waited++;
-			glink_poll();
-			for (uint32_t p = 0; p < MIC_PERIODS && posted; p++) {
-				if (apr.read_done & (1u << p)) {
-					int16_t *frames = (int16_t *)((uint8_t *)mic_buffer + PERIOD_STRIDE * p);
-					uint32_t n = MIN(apr.read_bytes[p], (uint32_t)MIC_PERIOD_BYTES) / 2;
-
-					apr.read_done &= ~(1u << p);
-					for (uint32_t o = 0; o < MIC_PERIOD_BYTES; o += 64) {
-						__asm__ volatile ("dc ivac, %0" : : "r" ((uint8_t *)frames + o) : "memory");
-					}
-					__asm__ volatile ("dsb sy" ::: "memory");
-					if (periods == 50 || periods == 500) {
-						say("adsp: mic: period %u, %u bytes: %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x\n",
-						    periods, apr.read_bytes[p], (uint16_t)frames[0], (uint16_t)frames[1], (uint16_t)frames[2],
-						    (uint16_t)frames[3], (uint16_t)frames[4], (uint16_t)frames[5], (uint16_t)frames[6],
-						    (uint16_t)frames[7], (uint16_t)frames[8], (uint16_t)frames[9], (uint16_t)frames[10],
-						    (uint16_t)frames[11], (uint16_t)frames[12], (uint16_t)frames[13], (uint16_t)frames[14],
-						    (uint16_t)frames[15]);
-					}
-					for (uint32_t f = 0; f < n; f++) {
-						int32_t v = frames[f];
-
-						unsigned c = f % MIC_CHANNELS;
-
-						mic_mean += v;
-						csum[c] += (uint64_t)((int64_t)v * v);
-						cpeak[c] = MAX(cpeak[c], v < 0 ? -v : v);
-					}
-					count += n / MIC_CHANNELS;
-					periods++;
-					posted = mic_read(p);
-				}
-			}
-			if (waited % 1000 == 0) {
-				uint32_t rms[MIC_CHANNELS] = { 0 };
-
-				for (unsigned c = 0; c < MIC_CHANNELS; c++) {
-					uint64_t mean = count != 0 ? csum[c] / count : 0;
-
-					while ((uint64_t)(rms[c] + 1) * (rms[c] + 1) <= mean) {
-						rms[c]++;
-					}
-				}
-				say("adsp: mic: %u s: %u periods (%u errors): slot 0 rms %u peak %d, slot 1 rms %u peak %d\n", waited / 1000,
-				    periods, apr.read_errors, rms[0], cpeak[0], rms[1], cpeak[1]);
-				mic_mean = 0;
-				count = 0;
-				for (unsigned c = 0; c < MIC_CHANNELS; c++) {
-					csum[c] = 0;
-					cpeak[c] = 0;
-				}
-			}
-		}
-	}
-	/* back, in the opposite order */
-	if (running) {
-		(void)basic_ok("the stream paused", APR_SVC_ASM, MIC_PORT, ASM_PAUSE, NULL, 0);
-	}
-	if (stream_open) {
-		(void)basic_ok("the stream closed", APR_SVC_ASM, MIC_PORT, ASM_CLOSE, NULL, 0);
-	}
-	if (path_open) {
-		(void)basic_ok("the capture path closed", APR_SVC_ADM, (uint16_t)path_id, ADM_CLOSE, NULL, 0);
-	}
-	if (mapped) {
-		(void)basic_ok("the buffer taken back", APR_SVC_ASM, 0, ASM_UNMAP, &mic_handle, sizeof(mic_handle));
-	}
-	if (codec) {
-		hakios_rt5514_stop();
-	}
-	if (started) {
-		(void)afe_do("the port stopped", AFE_PORT_TERT_TDM_TX, AFE_PORT_STOP, start, sizeof(start));
-	}
-	if (clocked) {
-		(void)afe_svc_param("the TDM bit clock off", 0x0001028F, 0x00010290, clock, sizeof(clock));
-	}
-	if (grouped) {
-		(void)afe_svc_param("the TDM group disabled", 0x00010254, 0x00010256, disable, sizeof(disable));
-	}
-	for (unsigned i = 0; i < 4; i++) {
-		if (west[i] != 0) {
-			*(volatile uint32_t *)west[i] = pins_before[i];
-		}
 	}
 	if (voted) {
 		uint32_t devote[2] = { 2, handle };
