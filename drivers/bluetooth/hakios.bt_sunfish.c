@@ -15,6 +15,11 @@
  *          (0xC0 at 2400 baud: boot mode; 0xFC at 115200: on; 100 ms), then HCI Reset, Read Local Version and the QCA
  *          version command (0xFC00, 0x19); every event received is said in hex. GENI samples 32 times a bit on this SoC
  *          (msm_geni_serial.c, no HALF_SAMPLING): 115200 is the 7.3728 MHz clock / 32 / 2 (bt_div=N overrides the 2).
+ *   bt=4   ... and the firmware: 3,000,000 baud (QCA command 0xfc48, index 14; the clock 96 MHz, M/N 8/25), the rampatch
+ *          crbtfw21.tlv and the NVM crnv21.bin downloaded (btqca: 0xfc00 0x1e in 243-byte segments; the NVM's tag 17 given
+ *          the speed in byte 2, as btqca does before the WCN3991, and its in-band sleep bit cleared: no IBS to serve),
+ *          HCI Reset, the version again, the address read (said only as present or not), then 10 s of an LE scan:
+ *          how many advertisers were heard (no address or name is logged).
  */
 #include <sys/param.h>
 #include <stdarg.h>
@@ -25,6 +30,10 @@
 #include <kern/clock.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include <sys/fcntl.h>
+#include <sys/vnode.h>
+#include <sys/kauth.h>
+#include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void loader_log_putc(char c);
@@ -391,9 +400,260 @@ hci_command(const char *what, uint16_t opcode, const uint8_t *params, unsigned p
 	if (!uart_tx(packet, plen + 4)) {
 		return 0;
 	}
-	n = hci_event(event, capacity, 1000);
+	/*
+	 * The answer that names this opcode: a Command Complete or Command Status for it, or (the QCA commands 0xfcXX) a vendor
+	 * event. Anything else in between -- the chip's NOP "ready" after the rampatch, a late answer -- is said and passed
+	 * over (one NOP left unread put every answer after it one behind, logs/015126-run.log).
+	 */
+	for (unsigned tries = 0; tries < 8; tries++) {
+		n = hci_event(event, capacity, 1000);
+		if (n == 0 ||
+		    (n >= 6 && event[1] == 0x0e && event[4] == (uint8_t)opcode && event[5] == (uint8_t)(opcode >> 8)) ||
+		    (n >= 7 && event[1] == 0x0f && event[5] == (uint8_t)opcode && event[6] == (uint8_t)(opcode >> 8)) ||
+		    ((opcode >> 8) == 0xfc && event[1] == 0xff)) {
+			break;
+		}
+		if (event[1] != 0x3e && event[1] != 0x2f && event[1] != 0x22 && event[1] != 0x02) {
+			say_event("(passed over)", event, n);     /* (advertising and inquiry reports carry others' addresses: never said) */
+		}
+	}
 	say_event(what, event, n);
 	return n;
+}
+
+/* ---- the firmware ---- */
+
+static int
+fw_load(const char *name, uint8_t **data, uint32_t *size)
+{
+	static const char *const dirs[] = { "/redwood/fw-adsp/", "/private/preboot/redwood/fw-adsp/" };
+	vfs_context_t context = vfs_context_kernel();
+	int error = ENOENT;
+
+	for (unsigned d = 0; d < 2 && error != 0; d++) {
+		char path[80];
+		vnode_t vnode = NULLVP;
+		struct vnode_attr attributes;
+		int resid = 0;
+		vm_offset_t memory = 0;
+
+		snprintf(path, sizeof(path), "%s%s", dirs[d], name);
+		if ((error = vnode_open(path, FREAD, 0, 0, &vnode, context)) != 0) {
+			continue;
+		}
+		VATTR_INIT(&attributes);
+		VATTR_WANTED(&attributes, va_data_size);
+		error = vnode_getattr(vnode, &attributes, context);
+		if (error == 0 && (attributes.va_data_size < 4 || attributes.va_data_size > 512 * 1024)) {
+			error = EFBIG;
+		}
+		if (error == 0 && kmem_alloc(kernel_map, &memory, round_page(attributes.va_data_size), KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
+		    KERN_SUCCESS) {
+			error = ENOMEM;
+		}
+		if (error == 0) {
+			error = vn_rdwr(UIO_READ, vnode, (caddr_t)memory, (int)attributes.va_data_size, 0, UIO_SYSSPACE, 0,
+			    vfs_context_ucred(context), &resid, vfs_context_proc(context));
+			if (error == 0 && resid != 0) {
+				error = EIO;
+			}
+		}
+		vnode_close(vnode, FREAD, context);
+		if (error == 0) {
+			*data = (uint8_t *)memory;
+			*size = (uint32_t)attributes.va_data_size;
+			say("bt: %s: %u bytes from %s\n", name, *size, dirs[d]);
+		}
+	}
+	return error;
+}
+
+static bool
+qca_tlv_ack(const uint8_t *e, unsigned n)
+{
+	/* a vendor event "EDL command response" for the TLV request (btqca: 0xff, length 3, 0x00 0x04 0x00) or a Command Complete */
+	return (n == 6 && e[0] == 4 && e[1] == 0xff && e[2] == 3 && e[3] == 0 && e[4] == 4 && e[5] == 0) ||
+	       (n >= 7 && e[0] == 4 && e[1] == 0x0e && e[4] == 0x00 && e[5] == 0xfc && e[6] == 0);
+}
+
+static bool
+qca_download(const char *what, const uint8_t *tlv, uint32_t size, bool skip_events)
+{
+	uint32_t offset = 0, segments = 0;
+
+	while (offset < size) {
+		uint32_t part = MIN(size - offset, 243u);
+		uint8_t packet[260] = { 1, 0x00, 0xfc, (uint8_t)(part + 2), 0x1e, (uint8_t)part }, event[32];
+		bool last = offset + part == size;
+
+		memcpy(packet + 6, tlv + offset, part);
+		if (!uart_tx(packet, part + 6)) {
+			return false;
+		}
+		offset += part;
+		segments++;
+		if (!skip_events || last) {
+			unsigned n = hci_event(event, sizeof(event), 1000);
+
+			/* a Command Complete for opcode 0 (NOP) is the chip saying it is ready (it came after the rampatch): not the answer */
+			while (n >= 6 && event[1] == 0x0e && event[4] == 0 && event[5] == 0) {
+				say("bt: the chip says it is ready (NOP) during %s\n", what);
+				n = hci_event(event, sizeof(event), 1000);
+			}
+
+			if (!qca_tlv_ack(event, n)) {
+				say_event("a segment NOT acknowledged", event, n);
+				say("bt: %s: segment %u of %u refused\n", what, segments, (size + 242) / 243);
+				return false;
+			}
+		}
+	}
+	say("bt: %s: %u bytes in %u segments, accepted\n", what, size, segments);
+	return true;
+}
+
+/* the NVM's records (tag, length, 8 reserved bytes, data): tag 17 (HCI transport) gets the speed in byte 2, its IBS bit off */
+static bool
+nvm_tags(uint8_t *nvm, uint32_t at, uint32_t end, uint8_t baud_index)
+{
+	bool found = false;
+
+	while (at + 12 <= end) {
+		uint32_t tag = nvm[at] | (uint32_t)nvm[at + 1] << 8, length = nvm[at + 2] | (uint32_t)nvm[at + 3] << 8;
+
+		if (at + 12 + length > end) {
+			break;
+		}
+		if (tag == 17 && length >= 3) {
+			say("bt: NVM tag 17 was %02x %02x %02x: IBS bit cleared, speed index %u in byte 2\n", nvm[at + 12], nvm[at + 13],
+			    nvm[at + 14], baud_index);
+			nvm[at + 12] &= (uint8_t)~0x80;
+			nvm[at + 14] = baud_index;
+			found = true;
+		}
+		at += 12 + length;
+	}
+	return found;
+}
+
+/*
+ * A plain NVM is one TLV of type 2. This phone's crnv21.bin is a TLV of type 4 that holds TLVs: a type 2 (the NVM, 3639
+ * bytes) and a type 3 (1071 bytes). It goes to the chip whole, as btqca sends a type it does not know; only the tags of
+ * the type 2 inside are changed.
+ */
+static bool
+nvm_prepare(uint8_t *nvm, uint32_t size, uint8_t baud_index)
+{
+	uint32_t length = (uint32_t)nvm[1] | (uint32_t)nvm[2] << 8 | (uint32_t)nvm[3] << 16;
+	bool found = false;
+
+	if (length != size - 4) {
+		say("bt: the NVM's length (%u) is not its size less 4 (%u)\n", length, size - 4);
+		return false;
+	}
+	if (nvm[0] == 2) {
+		return nvm_tags(nvm, 4, size, baud_index);
+	}
+	for (uint32_t at = 4; nvm[0] == 4 && at + 4 <= size;) {
+		uint32_t inner = (uint32_t)nvm[at + 1] | (uint32_t)nvm[at + 2] << 8 | (uint32_t)nvm[at + 3] << 16;
+
+		if (at + 4 + inner > size) {
+			break;
+		}
+		if (nvm[at] == 2) {
+			found = nvm_tags(nvm, at + 4, at + 4 + inner, baud_index) || found;
+		}
+		at += 4 + inner;
+	}
+	if (!found) {
+		say("bt: no tag 17 in the NVM (type %u)\n", nvm[0]);
+	}
+	return found;
+}
+
+static void
+clock_rate(uint32_t m, uint32_t n)
+{
+	vm_offset_t gcc = ml_io_map(GCC_PA + 0x17000, 0x1000), rcg = gcc + (RCG_S3 & 0xfff);
+
+	*(volatile uint32_t *)(rcg + 0x8) = m;
+	*(volatile uint32_t *)(rcg + 0xc) = ~(n - m) & 0xffff;
+	*(volatile uint32_t *)(rcg + 0x10) = ~n & 0xffff;
+	*(volatile uint32_t *)(rcg + 0x4) = 6u << 8 | 1u | 2u << 12;
+	*(volatile uint32_t *)rcg |= 1u;
+	for (unsigned i = 0; i < 1000 && (rd(rcg) & 1u); i++) {
+		delay(1);
+	}
+}
+
+static void
+firmware_and_scan(void)
+{
+	uint8_t *patch = NULL, *nvm = NULL, event[64];
+	uint32_t patch_size = 0, nvm_size = 0, heard = 0;
+	static const uint8_t to_3m[] = { 14 };          /* QCA_BAUDRATE_3000000 */
+	static const uint8_t scan_params[] = { 0, 0x10, 0, 0x10, 0, 0, 0 };     /* passive, 10 ms, public, all */
+	static const uint8_t scan_on[] = { 1, 0 }, scan_off[] = { 0, 0 };
+	uint8_t seen[64][6];
+	unsigned n;
+
+	if (fw_load("crbtfw21.tlv", &patch, &patch_size) != 0 || fw_load("crnv21.bin", &nvm, &nvm_size) != 0) {
+		say("bt: the firmware files are not in the image (FW_ADSP at build time)\n");
+		return;
+	}
+	if (!nvm_prepare(nvm, nvm_size, 14)) {
+		return;
+	}
+	/* 3,000,000 baud: the chip told, then the host (96 MHz / 32) */
+	uint8_t packet[5] = { 1, 0x48, 0xfc, 1, to_3m[0] };
+	if (!uart_tx(packet, sizeof(packet))) {
+		return;
+	}
+	delay(10000);
+	uart_quiesce();
+	clock_rate(8, 25);
+	uart_setup(1);
+	delay(50000);
+	n = hci_event(event, sizeof(event), 200);
+	say_event("after the speed change", event, n);
+	if (!hci_command("Read Local Version at 3 Mbaud", 0x1001, NULL, 0, event, sizeof(event))) {
+		return;
+	}
+	if (!qca_download("rampatch crbtfw21.tlv", patch, patch_size, patch_size > 14 && patch[14] == 3)) {
+		return;
+	}
+	n = hci_event(event, sizeof(event), 100);       /* the chip's NOP once the patch runs */
+	say_event("after the rampatch", event, n);
+	if (!qca_download("NVM crnv21.bin", nvm, nvm_size, false)) {
+		return;
+	}
+	delay(10000);
+	(void)hci_command("HCI Reset after the firmware", 0x0c03, NULL, 0, event, sizeof(event));
+	(void)hci_command("Read Local Version after the firmware", 0x1001, NULL, 0, event, sizeof(event));
+	n = hci_command("Read BD_ADDR", 0x1009, NULL, 0, event, 7);
+	(void)hci_command("LE Set Scan Parameters", 0x200b, scan_params, sizeof(scan_params), event, sizeof(event));
+	(void)hci_command("LE Set Scan Enable", 0x200c, scan_on, sizeof(scan_on), event, sizeof(event));
+	for (unsigned ms = 0; ms < 10000; ms += 10) {
+		uint8_t e[64];
+
+		while ((n = hci_event(e, sizeof(e), 0)) != 0) {
+			if (n >= 13 && e[1] == 0x3e && e[3] == 0x02) {      /* LE advertising report: the first one's address */
+				bool known = false;
+
+				for (unsigned i = 0; i < heard && !known; i++) {
+					known = memcmp(seen[i], e + 7, 6) == 0;
+				}
+				if (!known && heard < 64) {
+					memcpy(seen[heard++], e + 7, 6);
+				}
+			}
+		}
+		delay(10000);
+	}
+	(void)hci_command("LE Set Scan Enable (off)", 0x200c, scan_off, sizeof(scan_off), event, sizeof(event));
+	say("bt: THE RADIO HEARS: %u different Bluetooth LE advertisers in 10 s\n", heard);
+	/* back to 115200 for the power-off pulse that follows */
+	clock_rate(384, 15625);
 }
 
 static void
@@ -423,6 +683,9 @@ talk(void)
 	(void)hci_command("HCI Reset", 0x0c03, NULL, 0, event, sizeof(event));
 	(void)hci_command("Read Local Version", 0x1001, NULL, 0, event, sizeof(event));
 	(void)hci_command("QCA version (0xfc00 0x19)", 0xfc00, version_request, sizeof(version_request), event, sizeof(event));
+	if (level >= 4) {
+		firmware_and_scan();
+	}
 	/* off again: 0xC0 at 2400 */
 	uart_setup(divider * 48);
 	pulse = 0xc0;
