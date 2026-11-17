@@ -1417,10 +1417,16 @@ mic_up(void)
 		mic.mapped = true;
 		mic_handle = apr.last_words[0];
 	}
-	if (mic.mapped && apr_call(APR_SVC_ADM, AFE_PORT_TERT_TDM_TX, ADM_OPEN, &path, sizeof(path)) && apr.last_opcode == 0x00010329u &&
-	    apr.last_words[0] == 0) {
-		mic.path_open = true;
-		mic.path_id = apr.last_words[1] & 0xffff;
+	/* (the DSP leaves this one unanswered now and then, logs/204554-run.log, while it answers everything else: asked again) */
+	for (unsigned tries = 0; mic.mapped && !mic.path_open && tries < 3; tries++) {
+		if (apr_call(APR_SVC_ADM, AFE_PORT_TERT_TDM_TX, ADM_OPEN, &path, sizeof(path)) && apr.last_opcode == 0x00010329u &&
+		    apr.last_words[0] == 0) {
+			mic.path_open = true;
+			mic.path_id = apr.last_words[1] & 0xffff;
+		} else {
+			say("adsp: mic: the capture path not opened (try %u: answer %#x, status %#x)\n", tries + 1, apr.last_opcode,
+			    apr.last_words[0]);
+		}
 	}
 	if (mic.path_open) {
 		route.path[0] = (uint16_t)mic.path_id;
