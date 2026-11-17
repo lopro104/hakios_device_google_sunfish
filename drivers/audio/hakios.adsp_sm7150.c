@@ -1091,7 +1091,7 @@ darwin_fill(int16_t *p)
 	static uint32_t dc_periods;
 	uint32_t out = ring_out, have = ring_in - out, n = MIN(have, (uint32_t)PERIOD_FRAMES);
 	int32_t sum = 0;
-	bool sound = false;
+	bool sound = false, mono = true;        /* the earpiece's amplifier (0x40, the second speaker) is not driven yet */
 
 	for (uint32_t f = 0; f < PERIOD_FRAMES; f++) {
 		int16_t l = 0, r = 0;
@@ -1101,6 +1101,11 @@ darwin_fill(int16_t *p)
 
 			l = ring[2 * at];
 			r = ring[2 * at + 1];
+		}
+		if (mono) {             /* one speaker plays: both channels into it, nothing of the right one lost */
+			int16_t m = (int16_t)(((int32_t)l + (int32_t)r) / 2);
+
+			l = r = m;
 		}
 		p[2 * f] = l;
 		p[2 * f + 1] = r;

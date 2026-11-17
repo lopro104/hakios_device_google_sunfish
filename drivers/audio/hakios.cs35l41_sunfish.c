@@ -1293,7 +1293,7 @@ bool
 hakios_amp_prepare(uint8_t address, int vol_db)
 {
 	struct pmic_gpio *g = &amp_gpios[address == 0x41 ? 1 : 0];
-	uint32_t want_firmware = 0;             /* default to plain path (ASP direct) until CAL_R calibration is wired */
+	uint32_t want_firmware = 1;             /* the protection firmware (runs since 2026-11-17); boot-arg amp_fw=0: the plain path */
 	uint32_t gain = 10;                     /* Google unassisted analog gain: 10 (10.5 dB) */
 
 	if (!AMP_OK(address) || the_gpio != NULL || !arbiter_map() || !gpio_look(g) || !g->ours) {
