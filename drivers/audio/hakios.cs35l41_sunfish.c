@@ -946,12 +946,6 @@ halo_load(struct cs_amp *a, const uint8_t *d, uint32_t size)
 			}
 			blocks++;
 			bytes += len;
-			if (type == 0x10 || type == 0x12) {      /* the program, and the Y memory: their start, and a stretch well inside */
-				halo_compare(a, type == 0x10 ? "program" : "Y memory", reg, d + pos + 8, MIN(len, 40u));
-				if (len > 6040) {
-					halo_compare(a, type == 0x10 ? "program, further in" : "Y memory, further in", reg + 6000, d + pos + 8 + 6000, 40);
-				}
-			}
 		}
 		pos += 8 + len;
 	}
@@ -1141,10 +1135,31 @@ halo_bring_up(struct cs_amp *a)
 	cs_wait_us(1000);
 	/* the core: enabled with its reset held, then the reset let go (mainline Linux's cs_dsp_halo_start_core; Google's older
 	 * driver only sets the enable bit, and with that alone the firmware never answered its mailbox here) */
+	{
+		uint32_t control = 0, soft = 0;
+
+		(void)rd(a, HALO_CORE_CONTROL, &control);
+		(void)rd(a, HALO_BASE + 0x10, &soft);
+		cs_say("cs35l41 %#x: core before its start: control %#x, soft reset %#x\n", a->addr, control, soft);
+	}
 	err |= upd(a, HALO_CORE_CONTROL, 0x201, 0x201);
 	err |= upd(a, HALO_CORE_CONTROL, 0x200, 0);
 	halo_xm_base = 0;
 	(void)rd(a, HALO_XM_UNPACKED + 4 * 5, &halo_xm_base);
+	{
+		uint32_t w[3] = { 0 }, state = 0;
+		int ms;
+
+		for (ms = 0; ms < 15 && state != 2; ms++) {
+			cs_wait_us(1000);
+			(void)rd(a, HALO_XM_UNPACKED + 4 * halo_xm_base, &state);
+		}
+		for (unsigned i = 0; i < 3; i++) {
+			(void)rd(a, HALO_XM_UNPACKED + 4 * (halo_xm_base + i), &w[i]);
+		}
+		cs_say("cs35l41 %#x: core started (before GLOBAL_EN): firmware XM base %#x, its words %#x %#x %#x; HALO_STATE %u after %d ms "
+		    "(mainline expects 2 within 15 ms)\n", a->addr, halo_xm_base, w[0], w[1], w[2], state, ms);
+	}
 	err |= upd(a, DAC_PCM1_SRC, 0x7f, 0x32);        /* the amplifier plays what the core puts out */
 	cs_say("cs35l41 %#x: firmware: the core started, the samples routed through it: %s\n", a->addr, err ? "FAILED" : "done");
 	return err ? -1 : 0;
@@ -1192,12 +1207,25 @@ halo_after_power_up(struct cs_amp *a)
 	}
 	cs_wait_us(5000);                       /* the PLL has locked (3 ms): the core has its clock */
 	if (!halo_look(a, "after the power-up")) {
-		/* started while the amplifier's clocks stood still, the core may never have seen its reset: once more, now */
-		(void)upd(a, HALO_CORE_CONTROL, 0x201, 0x201);
-		cs_wait_us(1000);
-		(void)upd(a, HALO_CORE_CONTROL, 0x200, 0);
+		/* started while the amplifier's clocks stood still, the core may never have seen its reset: Google's driver's
+		 * "CCM reset" (cs35l41_ccm_reset_put): the DSP clock to 2, the core's reset set, the DSP clock back to 3, then the
+		 * reset let go with the core enabled. boot-arg amp_ccm=0: only the plain reset pulse */
+		uint32_t ccm = 1;
+
+		PE_parse_boot_argn("amp_ccm", &ccm, sizeof(ccm));
+		if (ccm) {
+			(void)upd(a, 0x00002c08, 0x3, 0x2);
+			(void)upd(a, HALO_CORE_CONTROL, 0x200, 0x200);
+			(void)upd(a, 0x00002c08, 0x3, 0x3);
+			cs_wait_us(1000);
+			(void)upd(a, HALO_CORE_CONTROL, 0x201, 0x001);
+		} else {
+			(void)upd(a, HALO_CORE_CONTROL, 0x201, 0x201);
+			cs_wait_us(1000);
+			(void)upd(a, HALO_CORE_CONTROL, 0x200, 0);
+		}
 		cs_wait_us(20000);
-		(void)halo_look(a, "after a second reset with the clocks running");
+		(void)halo_look(a, ccm ? "after Google's CCM reset (DSP clock cycled), clocks running" : "after a second reset pulse");
 	}
 	if (halo_mailbox(a, 2, 0) == 0 && upd(a, AMP_GAIN_CTRL, 0x3e0, 17u << 5) == 0) {
 		amp_loud = true;
