@@ -10,7 +10,12 @@
 # The log goes to logs/<time>-run.log (git-ignored; it holds whatever the radio saw, so mask before pasting anywhere).
 cd "$(dirname "$(readlink -f "$0")")/../.." || exit 1
 . devices/sunfish/boot-args.sh
-ARGS="$BOOT_ARGS_BASE $1"
+# an argument given here replaces the base's of the same name (adsp=10 instead of the base's adsp=9)
+BASE=""
+for a in $BOOT_ARGS_BASE; do
+	case " $1 " in *" ${a%%=*}="*) ;; *) BASE="$BASE $a" ;; esac
+done
+ARGS="${BASE# } $1"
 SECS=${2:-90}      # how long the kernel runs before the loader gets the phone back; the boot itself is about a minute with FLASH=1
 # FLASH=1: the root is the Darwin volume in the phone's darwin partition (userland/build.sh CRYPTEXES=flash FLASHBOOT=1): a 4 MB RAM image instead of 2.4 GB
 RAMDISK=userland/system.apfs

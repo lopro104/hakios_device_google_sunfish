@@ -657,6 +657,7 @@ static struct {
 	bool intent_busy;                        /* sent into, and the DSP has not said it is done with it */
 	uint32_t written_done, write_errors, underflows;     /* the stream's events (step 8) */
 	uint32_t done_periods;                   /* bit p: period p's buffer is ours again */
+	uint32_t read_done, read_errors, read_bytes[8];  /* the capture stream's events (adsp=10): bit p, buffer p is filled */
 } apr;
 
 #define APR_HDR_SIZE        20
@@ -713,6 +714,12 @@ apr_received(const uint8_t *p, uint32_t len)
 		apr.written_done++;
 		apr.write_errors += words[3] != 0;
 		apr.done_periods |= 1u << (token & 7u);
+		return;
+	}
+	if (opcode == 0x00010D9Au && (token & 0x40000000u)) {      /* a capture buffer filled: status, address (2), handle, size */
+		apr.read_errors += words[0] != 0;
+		apr.read_bytes[token & 7u] = words[4];
+		apr.read_done |= 1u << (token & 7u);
 		return;
 	}
 	if (opcode == 0x00010C17u) {                              /* the stream ran dry */
@@ -1479,6 +1486,244 @@ step_port(uint32_t hold_seconds, bool with_amp, bool with_tone, bool darwin)
 	}
 }
 
+/* ---- step 10: the microphones. The tertiary TDM port takes the RT5514's frames; a stream reads them; levels said ---- */
+
+extern bool hakios_rt5514_start(void);         /* hakios.rt5514_sunfish.c */
+extern void hakios_rt5514_stop(void);
+
+#define AFE_PORT_TERT_TDM_TX    0x9021
+#define AFE_GROUP_TERT_TDM_TX   0x9121
+#define AFE_CLK_TER_TDM_IBIT    0x204
+#define TLMM_WEST_PA            0x03500000ul    /* gpio 53..56 (pinctrl-sdmmagpie.c), function 1 = ter_mi2s */
+#define MIC_PORT                0x0201          /* session 2, stream 1 */
+#define MIC_PERIODS             8
+#define MIC_PERIOD_FRAMES       480             /* 10 ms, mono */
+#define MIC_PERIOD_BYTES        (MIC_PERIOD_FRAMES * 2)
+#define MIC_IOVA                (TONE_IOVA + 0x100000ull)
+#define MIC_DSP_ADDRESS         (MIC_IOVA | 1ull << 32)
+
+static int16_t *mic_buffer;
+static uint32_t mic_handle;
+
+static bool
+afe_svc_param(const char *what, uint32_t module, uint32_t param, const void *data, uint16_t size)
+{
+	uint8_t body[96];
+	uint32_t head[7] = { 12u + size, 0, 0, 0, module, param, size };
+
+	if (size > sizeof(body) - sizeof(head)) {
+		return false;
+	}
+	memcpy(body, head, sizeof(head));
+	memcpy(body + sizeof(head), data, size);
+	return afe_do(what, 0, AFE_SVC_SET_PARAM, body, (uint16_t)(sizeof(head) + size));
+}
+
+static bool
+afe_port_param(const char *what, uint16_t port, uint32_t module, uint32_t param, const void *data, uint16_t size)
+{
+	uint8_t body[96];
+	struct { uint16_t port, size; uint32_t zero[3]; uint32_t module, param; uint16_t param_size, reserved; } __attribute__((packed))
+	head = { port, (uint16_t)(12u + size), { 0, 0, 0 }, module, param, size, 0 };
+
+	if (size > sizeof(body) - sizeof(head)) {
+		return false;
+	}
+	memcpy(body, &head, sizeof(head));
+	memcpy(body + sizeof(head), data, size);
+	return afe_do(what, port, AFE_PORT_SET_PARAM_V2, body, (uint16_t)(sizeof(head) + size));
+}
+
+static bool
+mic_read(uint32_t period)
+{
+	uint64_t address = MIC_DSP_ADDRESS + PERIOD_STRIDE * period;
+	uint32_t read[5] = { (uint32_t)address, (uint32_t)(address >> 32), mic_handle, MIC_PERIOD_BYTES, period };
+	uint8_t *frames = (uint8_t *)mic_buffer + PERIOD_STRIDE * period;
+
+	for (uint32_t o = 0; o < MIC_PERIOD_BYTES; o += 64) {   /* nothing of ours left in the cache to be written over the DSP's */
+		__asm__ volatile ("dc civac, %0" : : "r" (frames + o) : "memory");
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	return apr_post(APR_SVC_ASM, MIC_PORT, 0x40000000u | period, 0x00010DACu, read, sizeof(read));
+}
+
+static void
+step_mic(uint32_t seconds)
+{
+	struct { uint32_t version; uint16_t group, reserved, ports[8]; uint32_t channels, rate, bits; uint16_t slots, slot_width;
+		 uint32_t slot_mask; } __attribute__((packed)) group = { 1, AFE_GROUP_TERT_TDM_TX, 0, { AFE_PORT_TERT_TDM_TX },
+		 8, 48000, 32, 8, 32, 0xff };
+	uint16_t enable[2] = { AFE_GROUP_TERT_TDM_TX, 1 }, disable[2] = { AFE_GROUP_TERT_TDM_TX, 0 };
+	uint32_t clock[5] = { 1, AFE_CLK_TER_TDM_IBIT, 12288000, 1 /* attribute 1, root 0 */, 0 /* off */ },
+	    clock_on[5] = { 1, AFE_CLK_TER_TDM_IBIT, 12288000, 1, 1 };
+	struct { uint32_t version, channels, rate, bits; uint16_t format, sync_mode, sync_src, slots, data_out, invert, delay, slot_width;
+		 uint32_t slot_mask; } __attribute__((packed)) tdm = { 1, 1, 48000, 16, 0, 0, 1, 8, 0, 0, 1, 32, 0x1 };
+	struct { uint32_t version; uint16_t channels, bits; uint32_t align; uint16_t offset[8]; } __attribute__((packed)) slots =
+	    { 1, 1, 16, 0, { 0, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff } };
+	struct { uint16_t pool, regions; uint32_t property, low, high, size; } __attribute__((packed)) map =
+	    { 3, 1, 0, (uint32_t)MIC_DSP_ADDRESS, (uint32_t)(MIC_DSP_ADDRESS >> 32), MIC_PERIODS * PERIOD_STRIDE };
+	struct { uint16_t flags, mode, endpoint1, endpoint2; uint32_t topology; uint16_t channels, bits; uint32_t rate; uint8_t channel_map[8]; }
+	__attribute__((packed)) path = { 0, 2 /* capture */, AFE_PORT_TERT_TDM_TX, 0xffff, 0x00010312, 1, 16, 48000, { 1 } };
+	struct { uint32_t flags, endpoint, topology, format; uint16_t bits, reserved; } __attribute__((packed)) open =
+	    { 0, 0 /* the device matrix */, 0x00010C68, 0x00010DA5, 16, 0 };
+	struct { uint32_t matrix, sessions; uint16_t session, paths, path[2]; } __attribute__((packed)) route = { 1, 1, 2, 1, { 0, 0 } };
+	struct { uint32_t param, size, frames_per_buffer, block_size; uint16_t channels, bits; uint32_t rate; uint16_t is_signed, reserved;
+		 uint8_t channel_map[8]; } __attribute__((packed)) encoder = { 0x00010DA3, 28, 0, 20, 1, 16, 48000, 1, 0, { 1 } };
+	uint32_t run[3] = { 0, 0, 0 }, pins_before[4] = { 0 }, handle = 0, path_id = 0, periods = 0, waited = 0;
+	struct { uint32_t block; char name[8]; } vote = { 2, "hakios" };
+	uint16_t start[2] = { AFE_PORT_TERT_TDM_TX, 0 };
+	bool voted = false, grouped = false, clocked = false, started = false, codec = false, mapped = false, path_open = false,
+	    stream_open = false, running = false;
+	vm_offset_t west[4] = { 0 }, memory = 0;
+	uint64_t sum = 0;
+	int32_t peak = 0;
+	uint32_t count = 0;
+	int64_t mic_mean = 0;
+
+	say("adsp: step 10: THE MICROPHONES for %u s: the tertiary TDM port (AFE %#x), the RT5514, a capture stream\n",
+	    seconds, AFE_PORT_TERT_TDM_TX);
+	if (apr_call(APR_SVC_AFE, 0, AFE_HW_VOTE, &vote, sizeof(vote)) && apr.last_opcode == 0x000100F5u) {
+		voted = true;
+		handle = apr.last_words[0];
+	}
+	/* the TDM pins to the port (function 1, 8 mA, no pull, as Android's ter_tdm_active) */
+	for (unsigned i = 0; i < 4; i++) {
+		west[i] = ml_io_map(TLMM_WEST_PA + 0x1000ul * (53 + i), 0x1000);
+		if (west[i] != 0) {
+			pins_before[i] = *(volatile uint32_t *)west[i];
+			*(volatile uint32_t *)west[i] = 1u << 2 | 3u << 6;
+		}
+	}
+	say("adsp: mic: gpio 53..56 to ter_mi2s (were %#x %#x %#x %#x)\n", pins_before[0], pins_before[1], pins_before[2], pins_before[3]);
+	grouped = afe_svc_param("the TDM group: 8 slots of 32 bits at 48 kHz", 0x00010254, 0x0001029E, &group, sizeof(group)) &&
+	    afe_svc_param("the TDM group enabled", 0x00010254, 0x00010256, enable, sizeof(enable));
+	clocked = grouped && afe_svc_param("the TDM bit clock, 12.288 MHz, on", 0x0001028F, 0x00010290, clock_on, sizeof(clock_on));
+	if (clocked && afe_port_param("the port's TDM format: 1 channel, 16 bits, slot 0", AFE_PORT_TERT_TDM_TX, 0x0001020C, 0x0001029D,
+	    &tdm, sizeof(tdm)) && afe_port_param("the port's slot mapping", AFE_PORT_TERT_TDM_TX, 0x0001028A, 0x00010297, &slots,
+	    sizeof(slots))) {
+		started = afe_do("the port started", AFE_PORT_TERT_TDM_TX, AFE_PORT_START, start, sizeof(start));
+	}
+	codec = started && hakios_rt5514_start();
+	if (codec && kmem_alloc_contig(kernel_map, &memory, MIC_PERIODS * PERIOD_STRIDE, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO,
+	    VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS && hakios_sm7150_smmu_pages(TONE_SID, MIC_IOVA, kvtophys(memory),
+	    MIC_PERIODS * PERIOD_STRIDE >> 12)) {
+		mic_buffer = (int16_t *)memory;
+		if (apr_call(APR_SVC_ASM, 0, ASM_MAP, &map, sizeof(map)) && apr.last_opcode == 0x00010D93u && apr.last_words[0] != 0) {
+			mapped = true;
+			mic_handle = apr.last_words[0];
+		}
+	}
+	if (mapped && apr_call(APR_SVC_ADM, AFE_PORT_TERT_TDM_TX, ADM_OPEN, &path, sizeof(path)) && apr.last_opcode == 0x00010329u &&
+	    apr.last_words[0] == 0) {
+		path_open = true;
+		path_id = apr.last_words[1] & 0xffff;
+	}
+	say("adsp: mic: buffer %s, capture path %s (id %u)\n", mapped ? "mapped" : "NOT mapped", path_open ? "open" : "NOT open", path_id);
+	if (path_open) {
+		route.path[0] = (uint16_t)path_id;
+		stream_open = basic_ok("the stream opened for reading", APR_SVC_ASM, MIC_PORT, 0x00010DB4u, &open, sizeof(open));
+	}
+	if (stream_open && basic_ok("the stream routed from the path", APR_SVC_ADM, 0, ADM_ROUTE, &route, sizeof(route)) &&
+	    basic_ok("the encoder: 48 kHz, 16 bits, mono", APR_SVC_ASM, MIC_PORT, 0x00010C10u, &encoder, sizeof(encoder))) {
+		running = basic_ok("the stream run", APR_SVC_ASM, MIC_PORT, ASM_RUN, run, sizeof(run));
+	}
+	if (running) {
+		bool posted = true;
+
+		apr.read_done = apr.read_errors = 0;
+		for (uint32_t p = 0; p < MIC_PERIODS && posted; p++) {
+			posted = mic_read(p);
+		}
+		while (posted && waited < seconds * 1000) {
+			sleep_ms(1);
+			waited++;
+			glink_poll();
+			for (uint32_t p = 0; p < MIC_PERIODS && posted; p++) {
+				if (apr.read_done & (1u << p)) {
+					int16_t *frames = (int16_t *)((uint8_t *)mic_buffer + PERIOD_STRIDE * p);
+					uint32_t n = MIN(apr.read_bytes[p], (uint32_t)MIC_PERIOD_BYTES) / 2;
+
+					apr.read_done &= ~(1u << p);
+					for (uint32_t o = 0; o < MIC_PERIOD_BYTES; o += 64) {
+						__asm__ volatile ("dc ivac, %0" : : "r" ((uint8_t *)frames + o) : "memory");
+					}
+					__asm__ volatile ("dsb sy" ::: "memory");
+					if (periods == 50 || periods == 500) {
+						say("adsp: mic: period %u, %u bytes: %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x\n",
+						    periods, apr.read_bytes[p], (uint16_t)frames[0], (uint16_t)frames[1], (uint16_t)frames[2],
+						    (uint16_t)frames[3], (uint16_t)frames[4], (uint16_t)frames[5], (uint16_t)frames[6],
+						    (uint16_t)frames[7], (uint16_t)frames[8], (uint16_t)frames[9], (uint16_t)frames[10],
+						    (uint16_t)frames[11], (uint16_t)frames[12], (uint16_t)frames[13], (uint16_t)frames[14],
+						    (uint16_t)frames[15]);
+					}
+					for (uint32_t f = 0; f < n; f++) {
+						int32_t v = frames[f];
+
+						mic_mean += v;
+
+						sum += (uint64_t)((int64_t)v * v);
+						peak = MAX(peak, v < 0 ? -v : v);
+					}
+					count += n;
+					periods++;
+					posted = mic_read(p);
+				}
+			}
+			if (waited % 1000 == 0) {
+				uint64_t mean = count != 0 ? sum / count : 0;
+				uint32_t rms = 0;
+
+				while ((uint64_t)(rms + 1) * (rms + 1) <= mean) {
+					rms++;
+				}
+				say("adsp: mic: %u s: %u periods (%u errors), level: rms %u, peak %d of 32767, mean %lld\n", waited / 1000, periods,
+				    apr.read_errors, rms, peak, count != 0 ? mic_mean / (int64_t)count : 0);
+				mic_mean = 0;
+				sum = 0;
+				count = 0;
+				peak = 0;
+			}
+		}
+	}
+	/* back, in the opposite order */
+	if (running) {
+		(void)basic_ok("the stream paused", APR_SVC_ASM, MIC_PORT, ASM_PAUSE, NULL, 0);
+	}
+	if (stream_open) {
+		(void)basic_ok("the stream closed", APR_SVC_ASM, MIC_PORT, ASM_CLOSE, NULL, 0);
+	}
+	if (path_open) {
+		(void)basic_ok("the capture path closed", APR_SVC_ADM, (uint16_t)path_id, ADM_CLOSE, NULL, 0);
+	}
+	if (mapped) {
+		(void)basic_ok("the buffer taken back", APR_SVC_ASM, 0, ASM_UNMAP, &mic_handle, sizeof(mic_handle));
+	}
+	if (codec) {
+		hakios_rt5514_stop();
+	}
+	if (started) {
+		(void)afe_do("the port stopped", AFE_PORT_TERT_TDM_TX, AFE_PORT_STOP, start, sizeof(start));
+	}
+	if (clocked) {
+		(void)afe_svc_param("the TDM bit clock off", 0x0001028F, 0x00010290, clock, sizeof(clock));
+	}
+	if (grouped) {
+		(void)afe_svc_param("the TDM group disabled", 0x00010254, 0x00010256, disable, sizeof(disable));
+	}
+	for (unsigned i = 0; i < 4; i++) {
+		if (west[i] != 0) {
+			*(volatile uint32_t *)west[i] = pins_before[i];
+		}
+	}
+	if (voted) {
+		uint32_t devote[2] = { 2, handle };
+
+		(void)afe_do("the vote for LPASS's core given back", 0, AFE_HW_DEVOTE, devote, sizeof(devote));
+	}
+}
+
 static void
 step_watch(uint32_t seconds, uint32_t steps)
 {
@@ -1526,7 +1771,14 @@ step_watch(uint32_t seconds, uint32_t steps)
 
 				PE_parse_boot_argn("adsp_hold", &hold, sizeof(hold));
 				port_done = true;
-				step_port(MIN(hold, 30u), steps == 7, steps >= 8, steps >= 9);
+				if (steps == 10) {
+					uint32_t secs = 10;
+
+					PE_parse_boot_argn("mic_secs", &secs, sizeof(secs));
+					step_mic(MIN(secs, 120u));
+				} else {
+					step_port(MIN(hold, 30u), steps == 7, steps >= 8, steps >= 9);
+				}
 			}
 		}
 	}
