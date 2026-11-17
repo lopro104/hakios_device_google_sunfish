@@ -813,7 +813,8 @@ static void cs_power_down(struct cs_amp *a)
  *
  * Not done: the per-phone calibration (the speaker's measured resistance, which Android keeps in its persist partition
  * and its audio HAL writes into the firmware's CAL_R): the firmware runs with the tuning file's own values.
- * Status: COMPILED ONLY.
+ * Status: RUNS ON THE PHONE 2026-11-17 (logs/144442-run.log, amp_fw=1): loaded, the core started only by Google's CCM reset
+ * after GLOBAL_EN (HALO_STATE 2, heartbeat counting, a temperature), resume and pause acknowledged, gain 17 while it runs.
  */
 #define FW_DIRECTORY            "/redwood/fw-adsp/"
 #define HALO_XM_PACKED          0x02000000u     /* file type 0x11: three bytes a word */
