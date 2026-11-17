@@ -1,0 +1,5 @@
+# devices/sunfish/drivers/bluetooth/conf: what only the Pixel 4a has.
+
+driver BT_SUNFISH
+	file    bsd/dev/hakios.bt_sunfish.c
+	help    Bluetooth: the WCN3990 on the GENI UART of QUP0 SE3 (bt=N)
