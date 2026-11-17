@@ -1497,8 +1497,9 @@ extern void hakios_rt5514_stop(void);
 #define TLMM_WEST_PA            0x03500000ul    /* gpio 53..56 (pinctrl-sdmmagpie.c), function 1 = ter_mi2s */
 #define MIC_PORT                0x0201          /* session 2, stream 1 */
 #define MIC_PERIODS             8
-#define MIC_PERIOD_FRAMES       480             /* 10 ms, mono */
-#define MIC_PERIOD_BYTES        (MIC_PERIOD_FRAMES * 2)
+#define MIC_PERIOD_FRAMES       480             /* 10 ms */
+#define MIC_CHANNELS            2               /* slots 0 and 1: Stereo1's left and right (the two edges of DMIC1) */
+#define MIC_PERIOD_BYTES        (MIC_PERIOD_FRAMES * 2 * MIC_CHANNELS)
 #define MIC_IOVA                (TONE_IOVA + 0x100000ull)
 #define MIC_DSP_ADDRESS         (MIC_IOVA | 1ull << 32)
 
@@ -1559,18 +1560,18 @@ step_mic(uint32_t seconds)
 	uint32_t clock[5] = { 1, AFE_CLK_TER_TDM_IBIT, 12288000, 1 /* attribute 1, root 0 */, 0 /* off */ },
 	    clock_on[5] = { 1, AFE_CLK_TER_TDM_IBIT, 12288000, 1, 1 };
 	struct { uint32_t version, channels, rate, bits; uint16_t format, sync_mode, sync_src, slots, data_out, invert, delay, slot_width;
-		 uint32_t slot_mask; } __attribute__((packed)) tdm = { 1, 1, 48000, 16, 0, 0, 1, 8, 0, 0, 1, 32, 0x1 };
+		 uint32_t slot_mask; } __attribute__((packed)) tdm = { 1, MIC_CHANNELS, 48000, 16, 0, 0, 1, 8, 0, 0, 1, 32, 0x3 };
 	struct { uint32_t version; uint16_t channels, bits; uint32_t align; uint16_t offset[8]; } __attribute__((packed)) slots =
-	    { 1, 1, 16, 0, { 0, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff } };
+	    { 1, MIC_CHANNELS, 16, 0, { 0, 4, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff } };
 	struct { uint16_t pool, regions; uint32_t property, low, high, size; } __attribute__((packed)) map =
 	    { 3, 1, 0, (uint32_t)MIC_DSP_ADDRESS, (uint32_t)(MIC_DSP_ADDRESS >> 32), MIC_PERIODS * PERIOD_STRIDE };
 	struct { uint16_t flags, mode, endpoint1, endpoint2; uint32_t topology; uint16_t channels, bits; uint32_t rate; uint8_t channel_map[8]; }
-	__attribute__((packed)) path = { 0, 2 /* capture */, AFE_PORT_TERT_TDM_TX, 0xffff, 0x00010312, 1, 16, 48000, { 1 } };
+	__attribute__((packed)) path = { 0, 2 /* capture */, AFE_PORT_TERT_TDM_TX, 0xffff, 0x00010312, MIC_CHANNELS, 16, 48000, { 1, 2 } };
 	struct { uint32_t flags, endpoint, topology, format; uint16_t bits, reserved; } __attribute__((packed)) open =
 	    { 0, 0 /* the device matrix */, 0x00010C68, 0x00010DA5, 16, 0 };
 	struct { uint32_t matrix, sessions; uint16_t session, paths, path[2]; } __attribute__((packed)) route = { 1, 1, 2, 1, { 0, 0 } };
 	struct { uint32_t param, size, frames_per_buffer, block_size; uint16_t channels, bits; uint32_t rate; uint16_t is_signed, reserved;
-		 uint8_t channel_map[8]; } __attribute__((packed)) encoder = { 0x00010DA3, 28, 0, 20, 1, 16, 48000, 1, 0, { 1 } };
+		 uint8_t channel_map[8]; } __attribute__((packed)) encoder = { 0x00010DA3, 28, 0, 20, MIC_CHANNELS, 16, 48000, 1, 0, { 1, 2 } };
 	uint32_t run[3] = { 0, 0, 0 }, pins_before[4] = { 0 }, handle = 0, path_id = 0, periods = 0, waited = 0;
 	struct { uint32_t block; char name[8]; } vote = { 2, "hakios" };
 	uint16_t start[2] = { AFE_PORT_TERT_TDM_TX, 0 };
@@ -1581,6 +1582,8 @@ step_mic(uint32_t seconds)
 	int32_t peak = 0;
 	uint32_t count = 0;
 	int64_t mic_mean = 0;
+	uint64_t csum[MIC_CHANNELS] = { 0 };
+	int32_t cpeak[MIC_CHANNELS] = { 0 };
 
 	say("adsp: step 10: THE MICROPHONES for %u s: the tertiary TDM port (AFE %#x), the RT5514, a capture stream\n",
 	    seconds, AFE_PORT_TERT_TDM_TX);
@@ -1600,7 +1603,7 @@ step_mic(uint32_t seconds)
 	grouped = afe_svc_param("the TDM group: 8 slots of 32 bits at 48 kHz", 0x00010254, 0x0001029E, &group, sizeof(group)) &&
 	    afe_svc_param("the TDM group enabled", 0x00010254, 0x00010256, enable, sizeof(enable));
 	clocked = grouped && afe_svc_param("the TDM bit clock, 12.288 MHz, on", 0x0001028F, 0x00010290, clock_on, sizeof(clock_on));
-	if (clocked && afe_port_param("the port's TDM format: 1 channel, 16 bits, slot 0", AFE_PORT_TERT_TDM_TX, 0x0001020C, 0x0001029D,
+	if (clocked && afe_port_param("the port's TDM format: 2 channels, 16 bits, slots 0 and 1", AFE_PORT_TERT_TDM_TX, 0x0001020C, 0x0001029D,
 	    &tdm, sizeof(tdm)) && afe_port_param("the port's slot mapping", AFE_PORT_TERT_TDM_TX, 0x0001028A, 0x00010297, &slots,
 	    sizeof(slots))) {
 		started = afe_do("the port started", AFE_PORT_TERT_TDM_TX, AFE_PORT_START, start, sizeof(start));
@@ -1626,7 +1629,7 @@ step_mic(uint32_t seconds)
 		stream_open = basic_ok("the stream opened for reading", APR_SVC_ASM, MIC_PORT, 0x00010DB4u, &open, sizeof(open));
 	}
 	if (stream_open && basic_ok("the stream routed from the path", APR_SVC_ADM, 0, ADM_ROUTE, &route, sizeof(route)) &&
-	    basic_ok("the encoder: 48 kHz, 16 bits, mono", APR_SVC_ASM, MIC_PORT, 0x00010C10u, &encoder, sizeof(encoder))) {
+	    basic_ok("the encoder: 48 kHz, 16 bits, 2 channels", APR_SVC_ASM, MIC_PORT, 0x00010C10u, &encoder, sizeof(encoder))) {
 		running = basic_ok("the stream run", APR_SVC_ASM, MIC_PORT, ASM_RUN, run, sizeof(run));
 	}
 	if (running) {
@@ -1661,29 +1664,35 @@ step_mic(uint32_t seconds)
 					for (uint32_t f = 0; f < n; f++) {
 						int32_t v = frames[f];
 
-						mic_mean += v;
+						unsigned c = f % MIC_CHANNELS;
 
-						sum += (uint64_t)((int64_t)v * v);
-						peak = MAX(peak, v < 0 ? -v : v);
+						mic_mean += v;
+						csum[c] += (uint64_t)((int64_t)v * v);
+						cpeak[c] = MAX(cpeak[c], v < 0 ? -v : v);
 					}
-					count += n;
+					count += n / MIC_CHANNELS;
 					periods++;
 					posted = mic_read(p);
 				}
 			}
 			if (waited % 1000 == 0) {
-				uint64_t mean = count != 0 ? sum / count : 0;
-				uint32_t rms = 0;
+				uint32_t rms[MIC_CHANNELS] = { 0 };
 
-				while ((uint64_t)(rms + 1) * (rms + 1) <= mean) {
-					rms++;
+				for (unsigned c = 0; c < MIC_CHANNELS; c++) {
+					uint64_t mean = count != 0 ? csum[c] / count : 0;
+
+					while ((uint64_t)(rms[c] + 1) * (rms[c] + 1) <= mean) {
+						rms[c]++;
+					}
 				}
-				say("adsp: mic: %u s: %u periods (%u errors), level: rms %u, peak %d of 32767, mean %lld\n", waited / 1000, periods,
-				    apr.read_errors, rms, peak, count != 0 ? mic_mean / (int64_t)count : 0);
+				say("adsp: mic: %u s: %u periods (%u errors): slot 0 rms %u peak %d, slot 1 rms %u peak %d\n", waited / 1000,
+				    periods, apr.read_errors, rms[0], cpeak[0], rms[1], cpeak[1]);
 				mic_mean = 0;
-				sum = 0;
 				count = 0;
-				peak = 0;
+				for (unsigned c = 0; c < MIC_CHANNELS; c++) {
+					csum[c] = 0;
+					cpeak[c] = 0;
+				}
 			}
 		}
 	}
