@@ -1354,7 +1354,24 @@ bool hakios_amp_healthy(void);
 bool
 hakios_amp_healthy(void)
 {
-	return the_gpio != NULL && cs_check(&the_amp) == 0;
+	uint32_t status = 0;
+
+	if (the_gpio == NULL) {
+		return false;
+	}
+	/* a read that goes unanswered once is the shared bus, not the amplifier: three tries before it counts (seen once in
+	 * five minutes, logs/152224-run.log, which powered the amplifier down for nothing) */
+	for (int tries = 0; tries < 3; tries++) {
+		if (amp_read(the_amp.addr, IRQ1_STATUS1, &status)) {
+			if (status & IRQ_ERRORS) {
+				return cs_check(&the_amp) == 0;         /* said, and its bits kept */
+			}
+			return true;
+		}
+		delay_for_interval(2, 1000 * 1000);
+	}
+	cs_say("cs35l41 %#x: its status could not be read three times\n", the_amp.addr);
+	return false;
 }
 
 /* GLOBAL_EN: true when the amplifier says its power-up is done (whether its PLL locked to the bit clock is said). */
