@@ -826,6 +826,9 @@ static void cs_power_down(struct cs_amp *a)
 #define HALO_MPU_LOCK           (HALO_BASE + 0x43140)
 #define ALG_PROTECTION          0xcdu
 
+static uint32_t halo_mpu_open = 1;     /* boot-arg amp_mpu: 1 every access word 0xffffffff (mainline Linux's lock_regions), 0 Google's older driver's */
+static uint32_t halo_cspl_xm;   /* where the protection algorithm's X memory begins */
+static uint32_t halo_xm_base;   /* where the firmware's own X memory begins: its first word is a heartbeat counter */
 static bool amp_protected;      /* the firmware is loaded and the samples are routed through it */
 static bool amp_loud;           /* ... and the stock gain is on (only while the firmware says it runs) */
 
@@ -901,6 +904,8 @@ wr_bytes(struct cs_amp *a, uint32_t reg, const uint8_t *data, uint32_t len, uint
 	return 0;
 }
 
+static void halo_compare(struct cs_amp *a, const char *what, uint32_t reg, const uint8_t *file, uint32_t len);
+
 /* The firmware's memory blocks into the amplifier. 0: all written. */
 static int
 halo_load(struct cs_amp *a, const uint8_t *d, uint32_t size)
@@ -941,11 +946,43 @@ halo_load(struct cs_amp *a, const uint8_t *d, uint32_t size)
 			}
 			blocks++;
 			bytes += len;
+			if (type == 0x10 || type == 0x12) {      /* the program, and the Y memory: their start, and a stretch well inside */
+				halo_compare(a, type == 0x10 ? "program" : "Y memory", reg, d + pos + 8, MIN(len, 40u));
+				if (len > 6040) {
+					halo_compare(a, type == 0x10 ? "program, further in" : "Y memory, further in", reg + 6000, d + pos + 8 + 6000, 40);
+				}
+			}
 		}
 		pos += 8 + len;
 	}
 	cs_say("cs35l41 %#x: firmware: %u blocks, %u bytes written\n", a->addr, blocks, bytes);
 	return 0;
+}
+
+/* Do `len' bytes (a multiple of 4) at `reg' read back as the file has them? Said either way. */
+static void
+halo_compare(struct cs_amp *a, const char *what, uint32_t reg, const uint8_t *file, uint32_t len)
+{
+	uint32_t same = 0, first_bad = ~0u, got_bad = 0;
+
+	for (uint32_t i = 0; i + 4 <= len; i += 4) {
+		uint32_t v = 0, want = (uint32_t)file[i] << 24 | (uint32_t)file[i + 1] << 16 | (uint32_t)file[i + 2] << 8 | file[i + 3];
+
+		if (rd(a, reg + i, &v) != 0) {
+			break;
+		}
+		if (v == want) {
+			same += 4;
+		} else if (first_bad == ~0u) {
+			first_bad = i;
+			got_bad = v;
+		}
+	}
+	cs_say("cs35l41 %#x: firmware: %s at %08x: %u of %u bytes read back the same%s", a->addr, what, reg, same, len,
+	    first_bad == ~0u ? "\n" : "");
+	if (first_bad != ~0u) {
+		cs_say(" (first difference at byte %u: read %08x)\n", first_bad, got_bad);
+	}
 }
 
 /* Where the firmware keeps an algorithm's data: read out of the list at the start of its X memory. */
@@ -1031,25 +1068,27 @@ halo_tune(struct cs_amp *a, const uint8_t *d, uint32_t size, uint32_t xm_base, u
 static int
 halo_mailbox(struct cs_amp *a, uint32_t command, uint32_t state_wanted)
 {
-	uint32_t status = 0, state = ~0u;
+	uint32_t status = 0, raw_status = 0, state = ~0u;
 	bool acknowledged = false;
 
 	(void)wr(a, 0x00010814, 1u << 20);              /* the firmware's and our sticky bits cleared */
 	(void)wr(a, 0x00010014, 1u << 21);
+	(void)upd(a, 0x00010114, 1u << 21, 0);          /* unmask AP interrupt for firmware ACK */
 	(void)upd(a, 0x00010914, 1u << 20, 0);          /* the firmware's interrupt for our command let through */
 	(void)wr(a, 0x00013020, command);
-	for (int i = 0; i < 10 && !acknowledged; i++) {
+	for (int i = 0; i < 100 && !acknowledged; i++) {
 		cs_wait_us(1000);
-		acknowledged = rd(a, 0x00010014, &status) == 0 && (status & (1u << 21)) != 0;
+		acknowledged = (rd(a, 0x00010014, &status) == 0 && (status & (1u << 21)) != 0) ||
+		               (rd(a, 0x00010094, &raw_status) == 0 && (raw_status & (1u << 21)) != 0);
 	}
 	if (acknowledged) {
 		(void)wr(a, 0x00010014, 1u << 21);
 	}
 	(void)upd(a, 0x00010914, 1u << 20, 1u << 20);
 	(void)rd(a, 0x00013004, &state);
-	cs_say("cs35l41 %#x: firmware: command %u %s, its state %u (wanted %u)\n", a->addr, command,
-	    acknowledged ? "acknowledged" : "NOT acknowledged", state, state_wanted);
-	return acknowledged && state == state_wanted ? 0 : -1;
+	cs_say("cs35l41 %#x: firmware: command %u %s (status %08x raw %08x), its state %u (wanted %u)\n",
+	    a->addr, command, acknowledged ? "acknowledged" : "NOT acknowledged", status, raw_status, state, state_wanted);
+	return acknowledged && state == state_wanted ? 0 : -1;  /* both: a state of 0 is also what a firmware that does not run reads as */
 }
 
 /* After the plain configuration has read back: the firmware in, its core started, the samples through it. 0: done. */
@@ -1062,6 +1101,8 @@ halo_bring_up(struct cs_amp *a)
 	uint32_t firmware_size = 0, tuning_size = 0, xm = 0, ym = 0;
 	int err = fw_file("cs35l41-dsp1-spk-prot.wmfw", &firmware, &firmware_size);
 
+	PE_parse_boot_argn("amp_mpu", &halo_mpu_open, sizeof(halo_mpu_open));
+
 	if (err == 0) {
 		err = fw_file(a->addr == 0x41 ? "R-cs35l41-dsp1-spk-prot.bin" : "cs35l41-dsp1-spk-prot.bin", &tuning, &tuning_size);
 	}
@@ -1073,6 +1114,7 @@ halo_bring_up(struct cs_amp *a)
 	err |= halo_load(a, firmware, firmware_size);
 	err = err ? err : halo_algorithm(a, ALG_PROTECTION, &xm, &ym);
 	err = err ? err : halo_tune(a, tuning, tuning_size, xm, ym);
+	halo_cspl_xm = xm;
 	if (err != 0) {
 		return -1;
 	}
@@ -1089,7 +1131,7 @@ halo_bring_up(struct cs_amp *a)
 	err |= wr(a, HALO_MPU_LOCK, 0x5555);
 	err |= wr(a, HALO_MPU_LOCK, 0xaaaa);
 	for (unsigned i = 0; i < sizeof(mpu) / sizeof(mpu[0]); i++) {
-		err |= wr(a, HALO_BASE + mpu[i], i % 5 < 2 ? 0xffffffffu : 0);
+		err |= wr(a, HALO_BASE + mpu[i], halo_mpu_open ? 0xffffffffu : i % 5 < 2 ? 0xffffffffu : 0);
 	}
 	err |= wr(a, HALO_MPU_LOCK, 0);
 	for (unsigned i = 0; i < 8; i++) {
@@ -1097,10 +1139,48 @@ halo_bring_up(struct cs_amp *a)
 		err |= upd(a, HALO_BASE + 0x280 + 8 * i, 0x1f, 1);
 	}
 	cs_wait_us(1000);
-	err |= upd(a, HALO_CORE_CONTROL, 1, 1);
+	/* the core: enabled with its reset held, then the reset let go (mainline Linux's cs_dsp_halo_start_core; Google's older
+	 * driver only sets the enable bit, and with that alone the firmware never answered its mailbox here) */
+	err |= upd(a, HALO_CORE_CONTROL, 0x201, 0x201);
+	err |= upd(a, HALO_CORE_CONTROL, 0x200, 0);
+	halo_xm_base = 0;
+	(void)rd(a, HALO_XM_UNPACKED + 4 * 5, &halo_xm_base);
 	err |= upd(a, DAC_PCM1_SRC, 0x7f, 0x32);        /* the amplifier plays what the core puts out */
 	cs_say("cs35l41 %#x: firmware: the core started, the samples routed through it: %s\n", a->addr, err ? "FAILED" : "done");
 	return err ? -1 : 0;
+}
+
+/* What the core is doing: its control word, its heartbeat counter twice, its scratch words, what its memory protection caught. */
+
+/*
+ * What the firmware says of itself, by the names its file gives its words (the file's "algorithm data" blocks):
+ * the firmware's own X memory: +0 HALO_STATE (2 when it runs, as mainline Linux waits for), +1 HALO_HEARTBEAT, +9
+ * FIRMWARE_STATE; the protection's: +0 CSPL_ENABLE, +2 CSPL_STATE, +3 CSPL_ERRORNO, +4 CSPL_TEMPERATURE, +9 CAL_STATUS.
+ * True when the heartbeat moves or the state is 2.
+ */
+static bool
+halo_look(struct cs_amp *a, const char *when)
+{
+	uint32_t control = 0, state = 0, beat1 = 0, beat2 = 0, fw_state = 0, cspl[5] = { 0 }, violation[3] = { 0 };
+	static const uint32_t cspl_words[5] = { 0, 2, 3, 4, 9 };
+
+	(void)rd(a, HALO_CORE_CONTROL, &control);
+	(void)rd(a, HALO_XM_UNPACKED + 4 * (halo_xm_base + 1), &beat1);
+	(void)rd(a, HALO_BASE + 0x43104, &violation[0]);
+	(void)rd(a, HALO_BASE + 0x4310c, &violation[1]);
+	(void)rd(a, HALO_BASE + 0x43114, &violation[2]);
+	cs_wait_us(10000);
+	(void)rd(a, HALO_XM_UNPACKED + 4 * (halo_xm_base + 1), &beat2);
+	(void)rd(a, HALO_XM_UNPACKED + 4 * halo_xm_base, &state);
+	(void)rd(a, HALO_XM_UNPACKED + 4 * (halo_xm_base + 9), &fw_state);
+	for (unsigned i = 0; i < 5; i++) {
+		(void)rd(a, HALO_XM_UNPACKED + 4 * (halo_cspl_xm + cspl_words[i]), &cspl[i]);
+	}
+	cs_say("cs35l41 %#x: core %s: control %#x, HALO_STATE %u, heartbeat %#x then %#x (%s), FIRMWARE_STATE %#x; protection: enable %u, state %u, "
+	    "error %u, temperature %#x, calibration status %u; violations X %#x Y %#x P %#x\n", a->addr, when, control, state, beat1,
+	    beat2, beat1 != beat2 ? "IT COUNTS" : "not counting", fw_state, cspl[0], cspl[1], cspl[2], cspl[3], cspl[4], violation[0],
+	    violation[1], violation[2]);
+	return beat1 != beat2 || state == 2;
 }
 
 /* With the amplifier powered up: the firmware told to run; only if it says it does, the stock gain. */
@@ -1109,6 +1189,15 @@ halo_after_power_up(struct cs_amp *a)
 {
 	if (!amp_protected) {
 		return;
+	}
+	cs_wait_us(5000);                       /* the PLL has locked (3 ms): the core has its clock */
+	if (!halo_look(a, "after the power-up")) {
+		/* started while the amplifier's clocks stood still, the core may never have seen its reset: once more, now */
+		(void)upd(a, HALO_CORE_CONTROL, 0x201, 0x201);
+		cs_wait_us(1000);
+		(void)upd(a, HALO_CORE_CONTROL, 0x200, 0);
+		cs_wait_us(20000);
+		(void)halo_look(a, "after a second reset with the clocks running");
 	}
 	if (halo_mailbox(a, 2, 0) == 0 && upd(a, AMP_GAIN_CTRL, 0x3e0, 17u << 5) == 0) {
 		amp_loud = true;
@@ -1175,7 +1264,8 @@ bool
 hakios_amp_prepare(uint8_t address, int vol_db)
 {
 	struct pmic_gpio *g = &amp_gpios[address == 0x41 ? 1 : 0];
-	uint32_t want_firmware = 1;             /* boot-arg amp_fw=0: the plain path, no firmware */
+	uint32_t want_firmware = 0;             /* default to plain path (ASP direct) until CAL_R calibration is wired */
+	uint32_t gain = 10;                     /* Google unassisted analog gain: 10 (10.5 dB) */
 
 	if (!AMP_OK(address) || the_gpio != NULL || !arbiter_map() || !gpio_look(g) || !g->ours) {
 		say("amp: %#x cannot be prepared (its reset line is not ours, or an amplifier is in use)\n", address);
@@ -1191,8 +1281,11 @@ hakios_amp_prepare(uint8_t address, int vol_db)
 	the_amp.addr = address;
 	the_amp.out_mute = 1;
 	the_amp.clk = 1;
+	PE_parse_boot_argn("amp_gain", &gain, sizeof(gain));
 	PE_parse_boot_argn("amp_fw", &want_firmware, sizeof(want_firmware));
-	/* without the protection firmware: never above 6 dB under full digital volume, the boost bypassed, the lowest analog gain */
+	/* with the firmware asked for, the gain starts at its lowest and goes to the stock 17 only when the firmware answers */
+	the_amp.amp_gain = want_firmware ? 0 : (int)MIN(gain, 10u);
+	/* without the protection firmware: ASP direct, up to 10.5 dB analog gain, digital volume from adsp_below */
 	if (cs_probe(&the_amp) != 0 || cs_config(&the_amp, want_firmware ? vol_db : MIN(vol_db, -6), want_firmware != 0) != 0 ||
 	    cs_verify(&the_amp) != 0) {
 		say("amp: %#x did not take its configuration: powered down, back into reset\n", address);
