@@ -10,6 +10,11 @@
  *   bt=2   ... and the serial engine's clock made 7.3728 MHz (GPLL0 even, M/N 384/15625, gcc-sdmmagpie.c's table: 115200
  *          baud x 16 x 4) and voted on, the pins given to it (qup03, Android's pulls), its identity read: protocol 2 is a
  *          UART. Nothing is sent.
+ *   bt=3   ... and the first words with the chip, as upstream hci_qca does for the WCN3990: the UART set up in FIFO mode (the
+ *          register values of the Mi 10S port's GENI UART, hakios-thyme, which drives the same block), the power pulses
+ *          (0xC0 at 2400 baud: boot mode; 0xFC at 115200: on; 100 ms), then HCI Reset, Read Local Version and the QCA
+ *          version command (0xFC00, 0x19); every event received is said in hex. GENI samples 32 times a bit on this SoC
+ *          (msm_geni_serial.c, no HALF_SAMPLING): 115200 is the 7.3728 MHz clock / 32 / 2 (bt_div=N overrides the 2).
  */
 #include <sys/param.h>
 #include <stdarg.h>
@@ -158,11 +163,11 @@ look(void)
 		say("bt: the serial engine's clocks do not all run: its registers are left alone\n");
 		return;
 	}
-	vm_offset_t uart = ml_io_map(UART_PA, 0x4000);
+	vm_offset_t se = ml_io_map(UART_PA, 0x4000);
 
-	if (uart != 0) {
-		say("bt: the serial engine: GENI_FW_REVISION %#x, GENI_STATUS %#x, SE_HW_PARAM_0 %#x, protocol %u\n", rd(uart + 0x68),
-		    rd(uart + 0x40), rd(uart + 0xe24), (rd(uart + 0x68) >> 8) & 0xff);
+	if (se != 0) {
+		say("bt: the serial engine: GENI_FW_REVISION %#x, GENI_STATUS %#x, SE_HW_PARAM_0 %#x, protocol %u\n", rd(se + 0x68),
+		    rd(se + 0x40), rd(se + 0xe24), (rd(se + 0x68) >> 8) & 0xff);
 	}
 }
 
@@ -212,21 +217,239 @@ pins_to_uart(void)
 	}
 }
 
+/* ---- the UART (GENI FIFO mode) ---- */
+
+static vm_offset_t uart;
+
+static inline void
+uw(uint32_t offset, uint32_t value)
+{
+	__asm__ volatile ("dmb oshst" ::: "memory");
+	*(volatile uint32_t *)(uart + offset) = value;
+	__asm__ volatile ("dsb osh" ::: "memory");
+}
+
+static inline uint32_t
+ur(uint32_t offset)
+{
+	uint32_t v = *(volatile uint32_t *)(uart + offset);
+
+	__asm__ volatile ("dmb oshld" ::: "memory");
+	return v;
+}
+
+static void
+uart_divider(uint32_t divider)
+{
+	uw(0x48, divider << 4 | 1);     /* GENI_SER_M_CLK_CFG: SER_CLK_EN, the divider */
+	uw(0x4c, divider << 4 | 1);     /* ... S */
+	uw(0x7c, 0);                    /* SE_GENI_CLK_SEL */
+	delay(1000);
+}
+
+/* stopped, both FIFOs emptied, the interrupts cleared (thyme's bt_uart_quiesce) */
+static void
+uart_quiesce(void)
+{
+	for (unsigned attempt = 0; attempt < 2; attempt++) {
+		uint32_t active = ur(0x40);
+
+		if (!(active & 0x1001)) {
+			break;
+		}
+		if (active & 1) {
+			uw(0x604, attempt ? 2 : 4);
+		}
+		if (active & 0x1000) {
+			uw(0x634, attempt ? 2 : 4);
+		}
+		for (unsigned t = 0; t < 10000 && (ur(0x40) & 0x1001); t++) {
+			delay(1);
+		}
+	}
+	for (unsigned words = ur(0x804) & 0x1ffffff; words != 0 && words < 64; words--) {
+		(void)ur(0x780);
+	}
+	uw(0x618, 0xffffffff);
+	uw(0x648, 0xffffffff);
+}
+
+static void
+uart_setup(uint32_t divider)
+{
+	uart_quiesce();
+	uart_divider(divider);
+	uw(0x258, 0); uw(0x22c, 0);                     /* FIFO mode, no loopback */
+	uw(0x25c, 2); uw(0x280, 0);                     /* TX: CTS ignored; RX: plain */
+	uw(0x260, 0xf); uw(0x264, 0);                   /* TX packing: one byte a word */
+	uw(0x284, 0x4380e); uw(0x288, 0xc3e0e);         /* RX packing: four bytes a word */
+	uw(0x268, 8); uw(0x28c, 8); uw(0x26c, 0);       /* 8 bits, 1 stop bit */
+	uw(0x294, 160); uw(0x2a4, 0); uw(0x2a8, 0);     /* RX stale count, no parity */
+	uw(0x80c, 1); uw(0x810, 0); uw(0x814, 6);       /* watermarks */
+	uw(0x618, 0xffffffff); uw(0x648, 0xffffffff);
+	uw(0x630, 1u << 27 | 0x80);                     /* S_CMD0: START_READ, RFR open */
+}
+
+static uint8_t rx_ring[1024];
+static unsigned rx_head, rx_tail;
+
+static void
+uart_rx_take(void)
+{
+	uw(0x648, ur(0x640));
+	for (unsigned budget = 0; budget < 64; budget++) {
+		uint32_t status = ur(0x804), words = status & 0x1ffffff, last = (status >> 28) & 7, bytes, word;
+
+		if (words == 0) {
+			return;
+		}
+		bytes = words == 1 && (status >> 31) && last ? last : 4;
+		word = ur(0x780);
+		for (unsigned b = 0; b < bytes && rx_head - rx_tail < sizeof(rx_ring); b++) {
+			rx_ring[rx_head++ % sizeof(rx_ring)] = (uint8_t)(word >> (8 * b));
+		}
+	}
+}
+
+static bool
+uart_tx(const uint8_t *bytes, unsigned length)
+{
+	unsigned sent = 0;
+
+	uw(0x618, 0xffffffff);
+	uw(0x270, length);              /* TX_TRANS_LEN */
+	uw(0x600, 1u << 27);            /* M_CMD0: START_TX */
+	for (unsigned waited = 0; waited < 200000; waited++) {
+		unsigned used = ur(0x800) & 0x0fffffff;
+
+		uart_rx_take();
+		for (unsigned room = used < 16 ? 16 - used : 0; room != 0 && sent < length; room--) {
+			uw(0x700, bytes[sent++]);
+		}
+		if (sent == length && (ur(0x610) & 1)) {
+			uw(0x618, ur(0x610));
+			return true;
+		}
+		delay(1);
+	}
+	say("bt: TX timed out (%u of %u sent, M_IRQ %#x, TX FIFO %#x)\n", sent, length, ur(0x610), ur(0x800));
+	uw(0x604, 4);
+	return false;
+}
+
+/* the next HCI event (H4: 0x04, code, length, data), waiting up to `ms'; its length, or 0 */
+static unsigned
+hci_event(uint8_t *event, unsigned capacity, unsigned ms)
+{
+	for (unsigned waited = 0; waited <= ms * 10; waited++) {
+		uart_rx_take();
+		while (rx_head != rx_tail && rx_ring[rx_tail % sizeof(rx_ring)] != 0x04) {
+			uint8_t b = rx_ring[rx_tail++ % sizeof(rx_ring)];
+
+			say("bt: a byte outside an event: %#04x\n", b);
+		}
+		if (rx_head - rx_tail >= 3) {
+			unsigned length = 3u + rx_ring[(rx_tail + 2) % sizeof(rx_ring)];
+
+			if (rx_head - rx_tail >= length) {
+				unsigned n = MIN(length, capacity);
+
+				for (unsigned i = 0; i < length; i++) {
+					uint8_t b = rx_ring[rx_tail++ % sizeof(rx_ring)];
+
+					if (i < n) {
+						event[i] = b;
+					}
+				}
+				return n;
+			}
+		}
+		delay(100);
+	}
+	return 0;
+}
+
+static void
+say_event(const char *what, const uint8_t *e, unsigned n)
+{
+	char line[200];
+	int at = 0;
+
+	for (unsigned i = 0; i < n && at < (int)sizeof(line) - 4; i++) {
+		at += snprintf(line + at, sizeof(line) - (size_t)at, " %02x", e[i]);
+	}
+	say("bt: %s: %s\n", what, n ? line : " NOTHING");
+}
+
+static unsigned
+hci_command(const char *what, uint16_t opcode, const uint8_t *params, unsigned plen, uint8_t *event, unsigned capacity)
+{
+	uint8_t packet[260] = { 1, (uint8_t)opcode, (uint8_t)(opcode >> 8), (uint8_t)plen };
+	unsigned n;
+
+	memcpy(packet + 4, params, plen);
+	if (!uart_tx(packet, plen + 4)) {
+		return 0;
+	}
+	n = hci_event(event, capacity, 1000);
+	say_event(what, event, n);
+	return n;
+}
+
+static void
+talk(void)
+{
+	uint32_t divider = 2;
+	uint8_t pulse, event[64];
+	static const uint8_t version_request[] = { 0x19 };      /* EDL_PATCH_VER_REQ_CMD */
+
+	PE_parse_boot_argn("bt_div", &divider, sizeof(divider));
+	uart = ml_io_map(UART_PA, 0x4000);
+	if (uart == 0) {
+		return;
+	}
+	/* boot mode: 0xC0 at 2400 baud (divider x 48 of 115200's) */
+	uart_setup(divider * 48);
+	pulse = 0xc0;
+	(void)uart_tx(&pulse, 1);
+	delay(10000);
+	/* on: 0xFC at 115200, then 100 ms */
+	uart_setup(divider);
+	pulse = 0xfc;
+	(void)uart_tx(&pulse, 1);
+	delay(100000);
+	uart_rx_take();
+	say("bt: after the pulses: %u bytes waiting, GENI_STATUS %#x, RX FIFO %#x\n", rx_head - rx_tail, ur(0x40), ur(0x804));
+	(void)hci_command("HCI Reset", 0x0c03, NULL, 0, event, sizeof(event));
+	(void)hci_command("Read Local Version", 0x1001, NULL, 0, event, sizeof(event));
+	(void)hci_command("QCA version (0xfc00 0x19)", 0xfc00, version_request, sizeof(version_request), event, sizeof(event));
+	/* off again: 0xC0 at 2400 */
+	uart_setup(divider * 48);
+	pulse = 0xc0;
+	(void)uart_tx(&pulse, 1);
+	delay(10000);
+	uart_quiesce();
+	say("bt: the chip told to power off (0xC0 at 2400 baud); the UART stopped\n");
+}
+
 static void
 bt_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	say("bt: level %u\n", level);
 	look();
 	if (level >= 2 && clock_on()) {
-		vm_offset_t uart = ml_io_map(UART_PA, 0x4000);
+		vm_offset_t se = ml_io_map(UART_PA, 0x4000);
 
 		pins_to_uart();
-		if (uart != 0) {
-			uint32_t fw = rd(uart + 0x68);
+		if (se != 0) {
+			uint32_t fw = rd(se + 0x68);
 
 			say("bt: the serial engine: GENI_FW_REVISION %#x (protocol %u%s, version %#x), GENI_STATUS %#x, SE_HW_PARAM_0 %#x\n",
 			    fw, (fw >> 8) & 0xff, ((fw >> 8) & 0xff) == 2 ? ": A UART" : ((fw >> 8) & 0xff) == 0 ? ": NONE LOADED" : "",
-			    fw & 0xff, rd(uart + 0x40), rd(uart + 0xe24));
+			    fw & 0xff, rd(se + 0x40), rd(se + 0xe24));
+		}
+		if (level >= 3) {
+			talk();
 		}
 	}
 	say("bt: done\n");
