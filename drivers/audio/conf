@@ -9,3 +9,7 @@ driver CS35L41_SUNFISH
 	file    bsd/dev/hakios.cs35l41_sunfish.c
 	requires HAPTIC_DRV2624
 	help    the two speaker amplifiers (CS35L41 at 0x40/0x41 on the vibration chip's I2C lines): found and identified (amp=N)
+
+driver RT5514_SUNFISH
+	file    bsd/dev/hakios.rt5514_sunfish.c
+	help    the microphones: the Realtek RT5514 they go through (mic=N; I2C on GPIO 34/35, TDM to the audio DSP)
