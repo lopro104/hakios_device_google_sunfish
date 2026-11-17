@@ -34,3 +34,8 @@ CONFIG_FASTBOOT_BUF_SIZE=0x8000000
 # CONFIG_EFI_CAPSULE_ON_DISK is not set
 # CONFIG_EFI_CAPSULE_FIRMWARE_RAW is not set
 # CONFIG_TOOLS_MKEFICAPSULE is not set
+# boot logo (the user's BootLogo.bmp, as drivers/video/u_boot_logo.bmp)
+CONFIG_VIDEO_LOGO=y
+CONFIG_BMP=y
+CONFIG_CMD_BMP=y
+CONFIG_VIDEO_BMP_RLE8=y
