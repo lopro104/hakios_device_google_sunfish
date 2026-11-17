@@ -55,11 +55,17 @@ extern bool hakios_sunfish_i2c(uint8_t address, const uint8_t *tx, unsigned nt, 
 
 static void say(const char *format, ...) __printflike(1, 2);
 
+static bool say_nothing;        /* set by hakios_amp_quiesce: printf on the way back to the loader panics */
+
 static void
 say(const char *format, ...)
 {
 	char text[256];
 	va_list arguments;
+
+	if (say_nothing) {
+		return;
+	}
 
 	va_start(arguments, format);
 	vsnprintf(text, sizeof(text), format, arguments);
@@ -1441,6 +1447,7 @@ void hakios_amp_quiesce(void);
 void
 hakios_amp_quiesce(void)
 {
+	say_nothing = true;
 	for (unsigned i = 0; i < 2; i++) {
 		struct pmic_gpio *g = slots[i].gpio;
 

@@ -120,11 +120,17 @@ static const char *fw_dir = "/redwood/fw-adsp/";
 /* A line into the kernel's log and the loader's. */
 static void say(const char *format, ...) __printflike(1, 2);
 
+static bool say_nothing;        /* set on the way back to the loader: printf there panics (console I/O with interrupts off) */
+
 static void
 say(const char *format, ...)
 {
 	char line[256];
 	va_list arguments;
+
+	if (say_nothing) {
+		return;
+	}
 
 	va_start(arguments, format);
 	vsnprintf(line, sizeof(line), format, arguments);
@@ -1213,6 +1219,15 @@ step_tone(bool darwin)
 			amp_ready = true;
 			say("adsp: sound: STEREO: the earpiece's amplifier (0x40) is the left speaker, the bottom one (0x41) the right\n");
 		}
+		/*
+		 * The first power-up is slow (the firmware's core is started then, with a reset and the DSP clock cycled: some
+		 * 100 ms each), and done in the middle of a sound it cost frames (6304 lost at the first sound, logs/154212-run.log):
+		 * done once here, with the port's clock running and nothing playing, then paused; a sound later only resumes.
+		 */
+		if (amp_ready && hakios_amp_start() && hakios_amp_pause()) {
+			say("adsp: sound: the amplifiers warmed up and paused before anything plays\n");
+		}
+		amp_ready = hakios_amp_count() != 0;
 	}
 	if (!amp_ready) {
 		say("adsp: the amplifier is not ready: the stream is run without it (nothing will be heard)\n");
@@ -1547,6 +1562,7 @@ hakios_adsp_quiesce(void)
 {
 	uint64_t answer = 0;
 
+	say_nothing = true;
 	hakios_amp_quiesce();
 	if (dsp_started) {
 		(void)scm("shutdown at the run's end", SCM_64 | SCM_SIP | SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_ADSP, 0, 0, &answer);
