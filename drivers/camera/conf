@@ -1,0 +1,5 @@
+# devices/sunfish/drivers/camera/conf: what only the Pixel 4a has.
+
+driver TORCH_SUNFISH
+	file    bsd/dev/hakios.torch_sunfish.c
+	help    the flashlight: the flash LED module of the PM6150L, both rear channels (torch=N, as drivers/camera's TORCH)
