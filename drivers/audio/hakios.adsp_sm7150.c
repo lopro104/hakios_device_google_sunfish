@@ -845,8 +845,16 @@ glink_poll(void)
 			}
 		} else if (msg.cmd == 7) {                      /* RX_INTENT_REQ: param1 its channel id, param2 the size it wants of us */
 			struct glink_msg ack = { .cmd = 8, .param1 = msg.param1, .param2 = msg.param1 == apr.id ? 1 : 0 };
+			static uint32_t next_intent = 9;
 
 			rx_advance(sizeof(msg));
+			if (msg.param1 == apr.id) {     /* granted: the intent itself first (a grant alone gives the DSP nothing to send into) */
+				struct { struct glink_msg msg; uint32_t size, id; } __attribute__((packed)) more =
+				    { { 5, apr.id, 1 }, MAX(msg.param2, 4096u), next_intent++ };
+
+				(void)tx(&more, sizeof(more));
+				say("adsp: GLINK: the DSP asked for an intent of %u bytes: one more given (id %u)\n", msg.param2, more.id);
+			}
 			(void)tx(&ack, sizeof(ack));
 		} else if (msg.cmd == 6 || msg.cmd == 14 || msg.cmd == 8 || msg.cmd == 15 || msg.cmd == 13 || msg.cmd == 3 || msg.cmd == 11) {
 			/* done with what we sent (the intent is ours to use again), an intent request's answer, signals, notices, closes */
@@ -883,10 +891,16 @@ apr_step(uint32_t steps)
 			struct glink_msg msg;
 			char name[16];
 		} __attribute__((packed)) open;
+		/*
+		 * INTENT: param1 our channel id, param2 how many; (size, id) each. Eight, not one: with the speaker's events
+		 * coming 100 times a second, an answer met the one intent still in use, the DSP asked for another, and the
+		 * answer was never seen (the microphone's ADM open, logs/235410-run.log: 3 s lost, a path left open).
+		 */
 		struct {
-			struct glink_msg msg;           /* INTENT: param1 our channel id, param2 one of them */
-			uint32_t size, id;
-		} __attribute__((packed)) intent = { { 5, apr.id, 1 }, 4096, 1 };
+			struct glink_msg msg;
+			uint32_t pairs[16];
+		} __attribute__((packed)) intent = { { 5, apr.id, 8 }, { 4096, 1, 4096, 2, 4096, 3, 4096, 4, 4096, 5, 4096, 6, 4096, 7,
+		    4096, 8 } };
 
 		memset(&open, 0, sizeof(open));
 		open.msg.cmd = 2;
@@ -894,7 +908,7 @@ apr_step(uint32_t steps)
 		open.msg.param2 = sizeof("apr_audio_svc");
 		memcpy(open.name, "apr_audio_svc", sizeof("apr_audio_svc"));
 		apr.open_sent = tx(&open, sizeof(open)) && tx(&intent, sizeof(intent));
-		say("adsp: GLINK: apr_audio_svc opened from here as channel %u, one intent of 4096 bytes offered: %s\n", apr.id,
+		say("adsp: GLINK: apr_audio_svc opened from here as channel %u, eight intents of 4096 bytes offered: %s\n", apr.id,
 		    apr.open_sent ? "sent" : "NOT sent");
 		return;
 	}
