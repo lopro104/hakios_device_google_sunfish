@@ -602,7 +602,7 @@ static int cs_config(struct cs_amp *a, int vol_db, int boost)
 		uint32_t w = a->slot32 ? 32u : 16u;
 		err |= upd(a, SP_FORMAT, 0xffff0755, w << 24 | w << 16 | 2u << 8);
 	}
-	err |= upd(a, SP_RX_SLOT, 0x3f, 0);
+	err |= upd(a, SP_RX_SLOT, 0x3f, a->addr == 0x41 ? 1 : 0);        /* 0x40 the left channel, 0x41 the right (stock) */
 	err |= upd(a, SP_RX_WL, 0x3f, 16);
 	err |= upd(a, SP_HIZ_CTRL, 0x3, 3);
 	err |= upd(a, SP_ENABLES, 1u << 16, 1u << 16);
@@ -828,10 +828,28 @@ static void cs_power_down(struct cs_amp *a)
 #define ALG_PROTECTION          0xcdu
 
 static uint32_t halo_mpu_open = 1;     /* boot-arg amp_mpu: 1 every access word 0xffffffff (mainline Linux's lock_regions), 0 Google's older driver's */
-static uint32_t halo_cspl_xm;   /* where the protection algorithm's X memory begins */
-static uint32_t halo_xm_base;   /* where the firmware's own X memory begins: its first word is a heartbeat counter */
-static bool amp_protected;      /* the firmware is loaded and the samples are routed through it */
-static bool amp_loud;           /* ... and the stock gain is on (only while the firmware says it runs) */
+/*
+ * Two amplifiers, each with its own state: 0x40 (the top one, the earpiece, the left channel: slot 0) and 0x41 (the bottom
+ * speaker, the right channel: slot 1), as the stock system plays stereo. Every operation below works on `cur'.
+ */
+struct amp_slot {
+	struct cs_amp amp;
+	struct pmic_gpio *gpio;         /* its reset line, NULL: not prepared */
+	bool is_protected;              /* the firmware is loaded and the samples are routed through it */
+	bool loud;                      /* ... and the stock gain is on (only while the firmware says it runs) */
+	bool started_once;
+	uint32_t xm_base;               /* where the firmware's own X memory begins (its second word is a heartbeat counter) */
+	uint32_t cspl_xm;               /* where the protection algorithm's X memory begins */
+};
+static struct amp_slot slots[2];
+static struct amp_slot *cur = &slots[1];
+#define halo_cspl_xm            (cur->cspl_xm)
+#define halo_xm_base            (cur->xm_base)
+#define amp_protected           (cur->is_protected)
+#define amp_loud                (cur->loud)
+#define the_amp                 (cur->amp)
+#define the_gpio                (cur->gpio)
+#define amp_started_once        (cur->started_once)
 
 static int
 fw_file(const char *name, uint8_t **data, uint32_t *size)
@@ -1251,9 +1269,6 @@ halo_before_power_down(struct cs_amp *a)
 /* ---- for the DSP's driver (hakios.adsp_sm7150.c): one amplifier, brought up while the port's clock runs ---- */
 
 static struct pmic_gpio amp_gpios[2] = { { .name = "PM6150L GPIO 8", .peripheral = 0xc7 }, { .name = "PM6150L GPIO 11", .peripheral = 0xca } };
-static struct cs_amp the_amp;
-static struct pmic_gpio *the_gpio;
-static bool amp_started_once;
 
 static bool
 arbiter_map(void)
@@ -1272,8 +1287,8 @@ bool hakios_amp_prepare(uint8_t address, int vol_db);
 bool hakios_amp_start(void);
 void hakios_amp_stop(void);
 
-void
-hakios_amp_stop(void)
+static void
+one_stop(void)
 {
 	if (the_gpio == NULL) {
 		return;
@@ -1289,8 +1304,8 @@ hakios_amp_stop(void)
 	the_gpio = NULL;
 }
 
-bool
-hakios_amp_prepare(uint8_t address, int vol_db)
+static bool
+one_prepare(uint8_t address, int vol_db)
 {
 	struct pmic_gpio *g = &amp_gpios[address == 0x41 ? 1 : 0];
 	uint32_t want_firmware = 1;             /* the protection firmware (runs since 2026-11-17); boot-arg amp_fw=0: the plain path */
@@ -1318,7 +1333,7 @@ hakios_amp_prepare(uint8_t address, int vol_db)
 	if (cs_probe(&the_amp) != 0 || cs_config(&the_amp, want_firmware ? vol_db : MIN(vol_db, -6), want_firmware != 0) != 0 ||
 	    cs_verify(&the_amp) != 0) {
 		say("amp: %#x did not take its configuration: powered down, back into reset\n", address);
-		hakios_amp_stop();
+		one_stop();
 		return false;
 	}
 	if (want_firmware) {
@@ -1328,7 +1343,7 @@ hakios_amp_prepare(uint8_t address, int vol_db)
 			if (upd(&the_amp, HALO_CORE_CONTROL, 1, 0) != 0 || upd(&the_amp, DAC_PCM1_SRC, 0x7f, 0x08) != 0 ||
 			    upd(&the_amp, PWR_CTRL2, 0x30, 1u << 4) != 0 || upd(&the_amp, AMP_DIG_VOL, 0x7ffu << 3, ((0x800u - 48u) & 0x7ffu) << 3) != 0) {
 				say("amp: %#x could not be put back on the plain path: powered down, back into reset\n", address);
-				hakios_amp_stop();
+				one_stop();
 				return false;
 			}
 			say("amp: %#x: WITHOUT the protection firmware: 6 dB down, lowest gain, boost bypassed\n", address);
@@ -1338,9 +1353,8 @@ hakios_amp_prepare(uint8_t address, int vol_db)
 }
 
 /* Between sounds: GLOBAL_EN off, the configuration kept (a few milliseconds each way, where a full set-up is a second or two). */
-bool hakios_amp_pause(void);
-bool
-hakios_amp_pause(void)
+static bool
+one_pause(void)
 {
 	if (the_gpio == NULL) {
 		return false;
@@ -1350,9 +1364,8 @@ hakios_amp_pause(void)
 }
 
 /* Still without an error bit? (false: the caller stops it) */
-bool hakios_amp_healthy(void);
-bool
-hakios_amp_healthy(void)
+static bool
+one_healthy(void)
 {
 	uint32_t status = 0;
 
@@ -1375,8 +1388,8 @@ hakios_amp_healthy(void)
 }
 
 /* GLOBAL_EN: true when the amplifier says its power-up is done (whether its PLL locked to the bit clock is said). */
-bool
-hakios_amp_start(void)
+static bool
+one_start(void)
 {
 	bool up;
 
@@ -1395,6 +1408,86 @@ hakios_amp_start(void)
 	}
 	amp_started_once = true;
 	return up;
+}
+
+/* ---- the interface: every operation on each prepared amplifier; one that fails is powered down, the other goes on ---- */
+
+bool hakios_amp_pause(void);
+bool hakios_amp_healthy(void);
+unsigned hakios_amp_count(void);
+
+bool
+hakios_amp_prepare(uint8_t address, int vol_db)
+{
+	cur = &slots[address == 0x41 ? 1 : 0];
+	return one_prepare(address, vol_db);
+}
+
+void
+hakios_amp_stop(void)
+{
+	for (unsigned i = 0; i < 2; i++) {
+		cur = &slots[i];
+		one_stop();
+	}
+}
+
+/*
+ * On the way back to the loader (a shutdown, a restart, a panic): both amplifiers straight into reset through their reset
+ * lines -- PMIC writes only, no I2C (no lock that a stopped processor could be holding, nothing that waits on another
+ * thread). A powered amplifier whose clock stops under it made a two-second noise at a power-off (the user, 2026-11-17).
+ */
+void hakios_amp_quiesce(void);
+void
+hakios_amp_quiesce(void)
+{
+	for (unsigned i = 0; i < 2; i++) {
+		struct pmic_gpio *g = slots[i].gpio;
+
+		if (g != NULL) {
+			for (int r = 5; r >= 0; r--) {
+				(void)sp_write(g, gpio_regs[r], g->before[r]);
+			}
+			slots[i].gpio = NULL;
+		}
+	}
+}
+
+unsigned
+hakios_amp_count(void)
+{
+	return (slots[0].gpio != NULL) + (slots[1].gpio != NULL);
+}
+
+static bool
+each(bool (*operation)(void))
+{
+	for (unsigned i = 0; i < 2; i++) {
+		cur = &slots[i];
+		if (cur->gpio != NULL && !operation()) {
+			say("amp: %#x failed: powered down, the other amplifier goes on\n", cur->amp.addr);
+			one_stop();
+		}
+	}
+	return hakios_amp_count() != 0;
+}
+
+bool
+hakios_amp_start(void)
+{
+	return each(one_start);
+}
+
+bool
+hakios_amp_pause(void)
+{
+	return each(one_pause);
+}
+
+bool
+hakios_amp_healthy(void)
+{
+	return each(one_healthy);
 }
 
 static void

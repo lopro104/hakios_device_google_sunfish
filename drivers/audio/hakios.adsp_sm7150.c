@@ -78,7 +78,9 @@ extern bool hakios_amp_prepare(uint8_t address, int vol_db);      /* hakios.cs35
 extern bool hakios_amp_start(void);
 extern void hakios_amp_stop(void);
 extern bool hakios_amp_pause(void);
-extern bool hakios_amp_healthy(void);            /* hakios.mpss_sm7150.c: the one mailbox, the one sender */
+extern bool hakios_amp_healthy(void);
+extern unsigned hakios_amp_count(void);
+extern void hakios_amp_quiesce(void);            /* hakios.mpss_sm7150.c: the one mailbox, the one sender */
 
 #define WIMG_WCOMB              0x6u    /* VM_WIMG_WCOMB: not cacheable | coherent (osfmk/arm/memory_types.h) */
 #define WIMG_IO                 0x7u    /* VM_WIMG_IO: guarded, coherent, not cacheable */
@@ -1091,7 +1093,7 @@ darwin_fill(int16_t *p)
 	static uint32_t dc_periods;
 	uint32_t out = ring_out, have = ring_in - out, n = MIN(have, (uint32_t)PERIOD_FRAMES);
 	int32_t sum = 0;
-	bool sound = false, mono = true;        /* the earpiece's amplifier (0x40, the second speaker) is not driven yet */
+	bool sound = false, mono = hakios_amp_count() < 2;     /* one speaker: both channels into it */
 
 	for (uint32_t f = 0; f < PERIOD_FRAMES; f++) {
 		int16_t l = 0, r = 0;
@@ -1203,6 +1205,15 @@ step_tone(bool darwin)
 	    TONE_DSP_ADDRESS, TONE_SID);
 	/* the amplifier configured and read back before anything plays; GLOBAL_EN only once the DSP is taking samples */
 	amp_ready = hakios_amp_prepare(0x41, volume);
+	if (darwin) {
+		uint32_t stereo = 1;            /* boot-arg adsp_stereo=0: the bottom speaker alone */
+
+		PE_parse_boot_argn("adsp_stereo", &stereo, sizeof(stereo));
+		if (stereo && hakios_amp_prepare(0x40, volume)) {
+			amp_ready = true;
+			say("adsp: sound: STEREO: the earpiece's amplifier (0x40) is the left speaker, the bottom one (0x41) the right\n");
+		}
+	}
 	if (!amp_ready) {
 		say("adsp: the amplifier is not ready: the stream is run without it (nothing will be heard)\n");
 	}
@@ -1527,6 +1538,20 @@ adsp_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	say("adsp: done\n");
 	thread_terminate(current_thread());
+}
+
+/* Called by loader_return() on the way back to the loader: the amplifiers into reset, then the DSP shut down by TrustZone. */
+void hakios_adsp_quiesce(void);
+void
+hakios_adsp_quiesce(void)
+{
+	uint64_t answer = 0;
+
+	hakios_amp_quiesce();
+	if (dsp_started) {
+		(void)scm("shutdown at the run's end", SCM_64 | SCM_SIP | SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_ADSP, 0, 0, &answer);
+		dsp_started = false;
+	}
 }
 
 static thread_call_t adsp_call;
