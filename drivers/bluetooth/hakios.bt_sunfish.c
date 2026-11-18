@@ -1266,7 +1266,30 @@ bt_thread(__unused void *parameter, __unused wait_result_t result)
 	thread_terminate(current_thread());
 }
 
-static thread_call_t bt_call;
+static thread_call_t bt_call, bt_publish_call;
+
+/*
+ * The "bluetooth" service published long before the chip is up, not ready, with the address but no commands (the
+ * chip's own are put in by runtime_start): bluetoothd, started by launchd at about 25 s, looks for it and, not finding
+ * it, said "No bluetooth on this device" and quit, twice more, while SpringBoard tried to attach in between ("error 9")
+ * and never tried again: no Bluetooth in Control Center (logs/002224-run.log). With the service there it stays, and
+ * BlueTool's stand-in holds it until HakiosBluetoothReady. (inject_bluetooth.c reads the commands as bluetoothd starts,
+ * for one patch, and makes the same choice with none as with this chip's.)
+ */
+static void
+bt_publish(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	uint8_t commands[64] = { 0 }, address[6];
+	int error;
+
+	bd_address();
+	for (unsigned i = 0; i < 6; i++) {
+		address[i] = bd_address_lsb[5 - i];
+	}
+	if ((error = hakios_bt_sunfish_publish(address, commands, BT_SPEED)) != 0) {
+		say("bt: the IOService could not be published early: %d\n", error);
+	}
+}
 
 static void
 bt_go(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
@@ -1295,6 +1318,11 @@ hakios_bt_sunfish_init(void)
 	uint32_t delay_s = 30;
 
 	PE_parse_boot_argn("bt_delay", &delay_s, sizeof(delay_s));
+	if (level >= 5) {
+		bt_publish_call = thread_call_allocate(bt_publish, NULL);
+		clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
+		thread_call_enter_delayed(bt_publish_call, deadline);
+	}
 	bt_call = thread_call_allocate(bt_go, NULL);
 	clock_interval_to_deadline(MIN(delay_s, 120u), NSEC_PER_SEC, &deadline);
 	thread_call_enter_delayed(bt_call, deadline);

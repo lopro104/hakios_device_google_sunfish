@@ -26,8 +26,19 @@ extern "C" int
 hakios_bt_sunfish_publish(const uint8_t address[6], const uint8_t commands[64], uint32_t speed)
 {
 	IOService *platform = IOService::getPlatform();
-	IOService *service = new IOService;
+	IOService *service;
 	OSData *mac, *supported;
+
+	/* published once, early, with no commands and not ready (see hakios.bt_sunfish.c): now the controller's own */
+	if (bluetooth_service != NULL) {
+		if ((supported = OSData::withBytes(commands, 64)) == NULL) {
+			return ENOMEM;
+		}
+		bluetooth_service->setProperty("HakiosBluetoothSupportedCommands", supported);
+		supported->release();
+		return 0;
+	}
+	service = new IOService;
 
 	if (platform == NULL || service == NULL || !service->init()) {
 		OSSafeReleaseNULL(service);
