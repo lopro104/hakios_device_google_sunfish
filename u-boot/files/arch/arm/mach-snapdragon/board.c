@@ -200,6 +200,48 @@ static void qcom_psci_fixup(void *fdt)
 		log_err("Failed to delete /psci node: %d\n", ret);
 }
 
+/*
+ * The phone's own addresses from ABL's configuration data (/chosen/cdt/cdb2 in the DT ABL hands over: bt_addr,
+ * wlan_mac1, wlan_mac2, text "AA:BB:CC:DD:EE:FF"), kept here while that DT is still where ABL left it, and put back into
+ * the DT handed on (ft_board_setup in of_fixup.c), where the HakiOS loader reads the Bluetooth one. Only these three:
+ * the rest of cdb2 (IMEIs, serial numbers) is not passed on. In .data, as prevbl_ddr_banks: there is no BSS yet.
+ */
+static const char * const qcom_cdt_names[] = { "bt_addr", "wlan_mac1", "wlan_mac2" };
+static char qcom_cdt_values[3][24] __section(".data") = { { 0 } };
+
+static void qcom_keep_cdt(const void *fdt)
+{
+	int offset = fdt_path_offset(fdt, "/chosen/cdt/cdb2");
+
+	for (int i = 0; offset >= 0 && i < ARRAY_SIZE(qcom_cdt_names); i++) {
+		int len;
+		const char *value = fdt_getprop(fdt, offset, qcom_cdt_names[i], &len);
+
+		if (value && len >= 17 && len < sizeof(qcom_cdt_values[i])) {
+			memcpy(qcom_cdt_values[i], value, 17);
+			qcom_cdt_values[i][17] = 0;
+		}
+	}
+}
+
+int qcom_fixup_cdt(void *blob)
+{
+	int chosen, cdt, cdb2, ret = 0;
+
+	if (!qcom_cdt_values[0][0] && !qcom_cdt_values[1][0] && !qcom_cdt_values[2][0])
+		return 0;
+	chosen = fdt_find_or_add_subnode(blob, 0, "chosen");
+	cdt = chosen < 0 ? chosen : fdt_find_or_add_subnode(blob, chosen, "cdt");
+	cdb2 = cdt < 0 ? cdt : fdt_find_or_add_subnode(blob, cdt, "cdb2");
+	if (cdb2 < 0)
+		return cdb2;
+	for (int i = 0; i < ARRAY_SIZE(qcom_cdt_names) && ret == 0; i++) {
+		if (qcom_cdt_values[i][0])
+			ret = fdt_setprop_string(blob, cdb2, qcom_cdt_names[i], qcom_cdt_values[i]);
+	}
+	return ret;
+}
+
 /* We support booting U-Boot with an internal DT when running as a first-stage bootloader
  * or for supporting quirky devices where it's easier to leave the downstream DT in place
  * to improve ABL compatibility. Otherwise, we use the DT provided by ABL.
@@ -241,9 +283,10 @@ int board_fdt_blob_setup(void **fdtp)
 		panic("No valid memory ranges found!\n");
 
 	/* If we have an external FDT, it can only have come from the Android bootloader. */
-	if (external_valid)
+	if (external_valid) {
 		qcom_boot_source = QCOM_BOOT_SOURCE_ANDROID;
-	else
+		qcom_keep_cdt(external_fdt);
+	} else
 		qcom_boot_source = QCOM_BOOT_SOURCE_XBL;
 
 	debug("ram_base = %#011lx, ram_size = %#011llx\n",
