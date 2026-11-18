@@ -12,4 +12,5 @@ export PATH="$HOME/hakios/xnu-deps/host/bin:$HOME/theos/toolchain/linux/iphone/b
 mkdir -p build/apps && for app in devices/sunfish/apps/*/; do
 	[ -x "$app/build.sh" ] && "$app/build.sh" >/dev/null 2>&1 && rm -rf "build/apps/$(basename "$app").app" && cp -R "$app/build/$(basename "$app").app" build/apps/
 done
-BLUETOOTH=${BLUETOOTH:-1} BT_NAME="${BT_NAME:-Pixel 4a}" EXTRA_APPS="$PWD/build/apps" CRYPTEXES=flash FLASHBOOT=1 GL=1 REST=1 RC_JOBS=${RC_JOBS:-rc.jobs.daily} DENY_MORE="${DENY_MORE:-voicemail.vmd fairplayd fairplaydeviceidentityd}" userland/build.sh
+# JB=ssh (the default): sshd and a shell in the boot volume, root by the key in ssh/authorized_keys (git ignored); JB= for none
+JB=${JB-ssh} BLUETOOTH=${BLUETOOTH:-1} BT_NAME="${BT_NAME:-Pixel 4a}" EXTRA_APPS="$PWD/build/apps" CRYPTEXES=flash FLASHBOOT=1 GL=1 REST=1 RC_JOBS=${RC_JOBS:-rc.jobs.daily} DENY_MORE="${DENY_MORE:-voicemail.vmd fairplayd fairplaydeviceidentityd}" userland/build.sh
