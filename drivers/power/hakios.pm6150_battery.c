@@ -2,7 +2,7 @@
  * The Pixel 4a's battery, read off the PM6150: SunFish has no DSP battery service and no firmware charger page to ask, so
  * this gives drivers/power/hakios.battery.c what those give on the reference phone. Only with boot-arg pm6150_battery=1.
  *
- * THIS DRIVER ONLY READS. The one thing it writes is the command word that asks the arbiter for a read (as
+ * THIS DRIVER ONLY READS (but with bat_measure=, below: USB input suspended for a minute). The one thing it writes is the command word that asks the arbiter for a read (as
  * drivers/power/hakios.pmic.c), and it writes nothing to a PMIC. It does not control charging: whether the phone charges
  * is up to the PMIC's hardware and what was set before it. It says what it sees.
  *
@@ -24,6 +24,7 @@
 #include <kern/clock.h>
 #include <kern/startup.h>
 #include <kern/thread_call.h>
+#include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
@@ -33,6 +34,7 @@
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void hakios_spmi_lock(void);
 extern void hakios_spmi_unlock(void);
+extern kern_return_t thread_terminate(thread_t);
 
 #define ARB_CORE_PA     0x0c440000UL
 #define ARB_CFG_PA      0x0c40a000UL
@@ -154,6 +156,137 @@ read16(unsigned address, uint16_t *value)
 	}
 	*value = (uint16_t)(b[0] | b[1] << 8);
 	return true;
+}
+
+/*
+ * ---- bat_measure=T [bat_measure_s=N]: the phone's own draw, measured with the cable in ----
+ * T seconds after boot the charger is told to take nothing from USB (USBIN_SUSPEND, bit 0 of USBIN_CMD_IL 0x1340, as
+ * Linux's qcom smb5 driver does it): the phone then runs from its battery, and the gauge's current is what the phone
+ * draws. Logged every second for N s (default 60, at most 120), then the bit is cleared again -- always; and at the
+ * driver's start it is cleared if a run before left it set. THE ONE WRITE THIS DRIVER MAKES, only with bat_measure.
+ */
+#define ARB_CHNLS_PA    0x0c600000UL    /* writes: 0x10000 per channel */
+#define USBIN_CMD_IL    0x1340u
+#define USBIN_SUSPEND   0x01u
+
+static uint32_t measure_at, measure_for = 60;
+static bool measure_done;
+
+static bool
+write8(unsigned address, uint8_t value)
+{
+	unsigned channel = channel_of(address >> 8);
+	vm_offset_t ch;
+	uint64_t start, interval;
+	uint32_t status;
+	uint8_t back = 0xff;
+
+	if (channel == NO_CHANNEL || (rd(arb_cfg + 0x700u + 4u * channel) & 7u) != 0) {
+		printf("pm6150_battery: %#x: no channel this system may write through\n", address);
+		return false;
+	}
+	ch = ml_io_map(ARB_CHNLS_PA + 0x10000UL * channel, 0x1000);
+	if (ch == 0) {
+		return false;
+	}
+	nanoseconds_to_absolutetime(READ_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
+	start = mach_absolute_time();
+	hakios_spmi_lock();
+	*(volatile uint32_t *)(ch + 0x10) = value;                                     /* WDATA0 */
+	*(volatile uint32_t *)(ch + OBS_COMMAND) = (address & 0xffu) << 4;             /* extended write, 1 byte */
+	__asm__ volatile("dsb osh" ::: "memory");
+	do {
+		status = rd(ch + OBS_STATUS);
+	} while (!(status & STATUS_DONE) && mach_absolute_time() - start < interval);
+	hakios_spmi_unlock();
+	if (!(status & STATUS_DONE) || (status & STATUS_BAD) || !read8(address, &back) || back != value) {
+		printf("pm6150_battery: %#x <- %#x failed (status %#x, reads %#x)\n", address, value, status, back);
+		return false;
+	}
+	return true;
+}
+
+static bool
+usb_suspend(bool on)
+{
+	uint8_t now;
+
+	if (!read8(USBIN_CMD_IL, &now)) {
+		return false;
+	}
+	if (((now & USBIN_SUSPEND) != 0) == on) {
+		return true;
+	}
+	return write8(USBIN_CMD_IL, on ? (uint8_t)(now | USBIN_SUSPEND) : (uint8_t)(now & ~USBIN_SUSPEND));
+}
+
+static int
+current_ma(bool *ok)
+{
+	uint8_t subtype;
+	uint16_t raw;
+
+	*ok = read8(0x4805, &subtype) && (subtype == 3 || subtype == 4) && read16(0x48c2, &raw) && raw != 0x8000;
+	if (!*ok) {
+		return 0;
+	}
+	int signed_raw = (raw & 0x8000u) ? (int)raw - 65536 : (int)raw;
+
+	return (int)(-((int64_t)signed_raw * (subtype == 3 ? 152588 : 305176)) / 1000000);
+}
+
+static void
+measure_run(__unused void *parameter, __unused wait_result_t result)
+{
+	int64_t sum = 0;
+	unsigned n = 0;
+	int low = 1 << 30, high = -(1 << 30);
+
+	if (!usb_suspend(true)) {
+		printf("pm6150_battery: measure: USB input could not be suspended\n");
+		thread_terminate(current_thread());
+		return;
+	}
+	printf("pm6150_battery: measure: USB input suspended for %u s, the phone on its battery\n", measure_for);
+	delay_for_interval(3, NSEC_PER_SEC);    /* (the current settles) */
+	for (unsigned i = 0; i < measure_for; i++) {
+		bool ok;
+		int ma = current_ma(&ok);
+
+		if (ok) {
+			sum += ma;
+			n++;
+			low = ma < low ? ma : low;
+			high = ma > high ? ma : high;
+			printf("pm6150_battery: measure: %u s %d mA\n", i, ma);
+		}
+		delay_for_interval(1, NSEC_PER_SEC);
+	}
+	for (int tries = 0; tries < 5 && !usb_suspend(false); tries++) {
+		delay_for_interval(100, NSEC_PER_MSEC);
+	}
+	printf("pm6150_battery: measure: MEAN %lld mA over %u readings (%d to %d); USB input back on\n",
+	    n ? (long long)(sum / n) : 0LL, n, low, high);
+	thread_terminate(current_thread());
+}
+
+static void
+measure_check(void)
+{
+	uint64_t now;
+	thread_t thread;
+
+	if (measure_at == 0 || measure_done) {
+		return;
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+	if (now / NSEC_PER_SEC < measure_at) {
+		return;
+	}
+	measure_done = true;
+	if (kernel_thread_start(measure_run, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
 }
 
 /* The curve, between its points. */
@@ -317,8 +450,15 @@ poll_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 			return;
 		}
 		printf("pm6150_battery: reading the PM6150 every %d s, read only; the temperature is not measured\n", PERIOD_SECONDS);
+		/* a run before this one may have stopped while measuring: USB input back on */
+		uint8_t cmd;
+
+		if (read8(USBIN_CMD_IL, &cmd) && (cmd & USBIN_SUSPEND)) {
+			printf("pm6150_battery: USB input was left suspended: %s\n", usb_suspend(false) ? "on again" : "COULD NOT BE TURNED ON");
+		}
 	}
 	poll_once();
+	measure_check();
 	poll_again();
 }
 
@@ -328,6 +468,9 @@ pm6150_battery_init(void)
 {
 	uint32_t enabled = 0;
 
+	PE_parse_boot_argn("bat_measure", &measure_at, sizeof(measure_at));
+	PE_parse_boot_argn("bat_measure_s", &measure_for, sizeof(measure_for));
+	measure_for = measure_for == 0 ? 60 : (measure_for > 120 ? 120 : measure_for);
 	if (!PE_parse_boot_argn("pm6150_battery", &enabled, sizeof(enabled)) || !enabled) {
 		return;
 	}
