@@ -662,6 +662,18 @@ static struct {
 	uint32_t read_done, read_errors, read_bytes[8];  /* the capture stream's events (adsp=10): bit p, buffer p is filled */
 } apr;
 
+/*
+ * sns=1: the sensors' road, first step. The DSP's QRTR channel (IPCRTR, which it opens itself) opened from here too, its
+ * HELLO answered, and a lookup of every service sent; each service the DSP announces is said. The sensors run inside
+ * this DSP on this SoC (no SLPI): Qualcomm's SEE framework, whose client service is QMI service 400 ("sns_client").
+ */
+static struct {
+	bool remote_open, open_sent, intent_busy, hello_sent, lookup_sent;
+	uint16_t id;
+	uint32_t intent_id, intent_size, remote_node, servers;
+} qr;
+static uint32_t sns_level;
+
 #define APR_HDR_SIZE        20
 #define APR_SVC_CORE        0x03
 #define APR_DOMAIN_ADSP     0x04
@@ -747,6 +759,8 @@ apr_received(const uint8_t *p, uint32_t len)
 	}
 }
 
+static void qrtr_received(const uint8_t *p, uint32_t len);
+
 static void
 glink_poll(void)
 {
@@ -787,6 +801,10 @@ glink_poll(void)
 				apr.remote_open = true;
 				apr.id = msg.param1;
 			}
+			if (strcmp(name, "IPCRTR") == 0) {
+				qr.remote_open = true;
+				qr.id = msg.param1;
+			}
 		} else if (msg.cmd == 4) {                      /* OPEN_ACK: param1 our id */
 			rx_advance(sizeof(msg));
 			if (apr.open_sent && msg.param1 == apr.id) {
@@ -808,6 +826,11 @@ glink_poll(void)
 				uint32_t pair[2];
 
 				rx_peek((tail + (uint32_t)sizeof(msg) + i * 8) % FIFO_SIZE, pair, sizeof(pair));
+				if (msg.param1 == qr.id && qr.remote_open && pair[0] >= 64 && qr.intent_size == 0) {
+					qr.intent_size = pair[0];
+					qr.intent_id = pair[1];
+					say("adsp: QRTR: the DSP offers an intent of %u bytes on IPCRTR\n", pair[0]);
+				}
 				if (msg.param1 == apr.id && apr.remote_open && pair[0] >= 64 && apr.intent_size == 0) {
 					apr.intent_size = pair[0];
 					apr.intent_id = pair[1];
@@ -831,7 +854,15 @@ glink_poll(void)
 			if (have < packet) {
 				return;
 			}
-			if (msg.param1 == apr.id && apr.remote_open) {
+			if (msg.param1 == qr.id && qr.remote_open) {
+				struct glink_msg done = { .cmd = 14, .param1 = qr.id, .param2 = msg.param2 };
+				uint32_t n = MIN(sizes[0], (uint32_t)sizeof(data));
+
+				rx_peek((tail + (uint32_t)sizeof(msg) + 8) % FIFO_SIZE, data, n);
+				rx_advance(packet);
+				(void)tx(&done, sizeof(done));
+				qrtr_received(data, n);
+			} else if (msg.param1 == apr.id && apr.remote_open) {
 				struct glink_msg done = { .cmd = 14, .param1 = apr.id, .param2 = msg.param2 };    /* RX_DONE, the intent kept */
 				uint32_t n = MIN(sizes[0], (uint32_t)sizeof(data));
 
@@ -861,6 +892,12 @@ glink_poll(void)
 			if (msg.cmd == 8) {
 				say("adsp: GLINK: our request for an intent is %s\n", msg.param2 ? "granted" : "REFUSED");
 			}
+			if ((msg.cmd == 6 || msg.cmd == 14) && msg.param1 == qr.id && qr.remote_open) {
+				qr.intent_busy = false;
+				if (msg.cmd == 6) {
+					qr.intent_size = 0;
+				}
+			}
 			if ((msg.cmd == 6 || msg.cmd == 14) && msg.param1 == apr.id) {
 				apr.intent_busy = false;
 			}
@@ -878,6 +915,117 @@ glink_poll(void)
 }
 
 /* Our half of apr_audio_svc, one thing a pass; then the two questions. */
+/* ---- QRTR on IPCRTR (sns=1) ---- */
+
+struct qrtr_hdr {
+	uint32_t version, type, src_node, src_port, confirm_rx, size, dst_node, dst_port;
+} __attribute__((packed));
+
+#define QRTR_HELLO              2
+#define QRTR_NEW_SERVER         4
+#define QRTR_NEW_LOOKUP         10
+#define QRTR_CTRL_PORT          0xfffffffeu
+#define QRTR_OUR_NODE           1               /* the application processors, as the modem driver names them */
+
+static bool
+qrtr_send(uint32_t type, uint32_t dst_node, uint32_t dst_port, uint32_t src_port, const void *body, uint32_t len)
+{
+	struct {
+		struct glink_msg msg;
+		uint32_t chunk, left;
+		struct qrtr_hdr q;
+		uint8_t body[64];
+	} __attribute__((packed)) packet;
+	uint32_t size = (uint32_t)sizeof(struct qrtr_hdr) + ((len + 3) & ~3u);
+
+	if (len > sizeof(packet.body) || qr.intent_size == 0 || qr.intent_busy || size > qr.intent_size) {
+		return false;
+	}
+	memset(&packet, 0, sizeof(packet));
+	packet.msg.cmd = 9;
+	packet.msg.param1 = qr.id;
+	packet.msg.param2 = qr.intent_id;
+	packet.chunk = size;
+	packet.q.version = 1;
+	packet.q.type = type;
+	packet.q.src_node = QRTR_OUR_NODE;
+	packet.q.src_port = src_port;
+	packet.q.size = len;
+	packet.q.dst_node = dst_node;
+	packet.q.dst_port = dst_port;
+	memcpy(packet.body, body, len);
+	qr.intent_busy = true;
+	if (!tx(&packet, 16 + (size_t)size)) {
+		qr.intent_busy = false;
+		return false;
+	}
+	return true;
+}
+
+static void
+qrtr_received(const uint8_t *p, uint32_t len)
+{
+	struct qrtr_hdr q;
+	uint32_t cmd = 0, w[4] = { 0 };
+
+	if (len < sizeof(q)) {
+		return;
+	}
+	memcpy(&q, p, sizeof(q));
+	if (len >= sizeof(q) + 4) {
+		memcpy(&cmd, p + sizeof(q), 4);
+		memcpy(w, p + sizeof(q) + 4, MIN(len - (uint32_t)sizeof(q) - 4, (uint32_t)sizeof(w)));
+	}
+	if (q.type == QRTR_HELLO) {
+		qr.remote_node = q.src_node;
+		say("adsp: QRTR: HELLO from node %u\n", q.src_node);
+	} else if (q.type == QRTR_NEW_SERVER) {
+		qr.servers++;
+		/* (service, instance, node, port) */
+		say("adsp: QRTR: SERVICE %u (instance %#x) at node %u port %u%s\n", w[0], w[1], w[2], w[3],
+		    w[0] == 400 ? ": THE SENSORS' CLIENT (sns_client)" : w[0] == 64 ? ": servreg locator" : w[0] == 66 ? ": servreg notifier" : "");
+	} else {
+		say("adsp: QRTR: type %u from node %u port %u, %u bytes\n", q.type, q.src_node, q.src_port, q.size);
+	}
+}
+
+static void
+qrtr_step(void)
+{
+	if (!sns_level || !qr.remote_open) {
+		return;
+	}
+	if (!qr.open_sent) {
+		struct { struct glink_msg msg; char name[8]; } __attribute__((packed)) open;
+		struct { struct glink_msg msg; uint32_t pairs[8]; } __attribute__((packed)) intent =
+		    { { 5, qr.id, 4 }, { 4096, 101, 4096, 102, 4096, 103, 4096, 104 } };
+
+		memset(&open, 0, sizeof(open));
+		open.msg.cmd = 2;
+		open.msg.param1 = qr.id;
+		open.msg.param2 = sizeof("IPCRTR");
+		memcpy(open.name, "IPCRTR", sizeof("IPCRTR"));
+		qr.open_sent = tx(&open, sizeof(open)) && tx(&intent, sizeof(intent));
+		say("adsp: QRTR: IPCRTR opened from here (channel %u), four intents offered: %s\n", qr.id, qr.open_sent ? "sent" : "NOT sent");
+		return;
+	}
+	if (qr.remote_node != 0 && !qr.hello_sent) {
+		uint32_t hello = QRTR_HELLO;
+
+		qr.hello_sent = qrtr_send(QRTR_HELLO, qr.remote_node, QRTR_CTRL_PORT, QRTR_CTRL_PORT, &hello, sizeof(hello));
+		if (qr.hello_sent) {
+			say("adsp: QRTR: our HELLO sent to node %u\n", qr.remote_node);
+		}
+	} else if (qr.hello_sent && !qr.lookup_sent) {
+		uint32_t lookup[5] = { QRTR_NEW_LOOKUP, 0, 0, 0, 0 };   /* every service, every instance */
+
+		qr.lookup_sent = qrtr_send(QRTR_NEW_LOOKUP, qr.remote_node, QRTR_CTRL_PORT, QRTR_CTRL_PORT, lookup, sizeof(lookup));
+		if (qr.lookup_sent) {
+			say("adsp: QRTR: a lookup of every service sent\n");
+		}
+	}
+}
+
 static void
 apr_step(uint32_t steps)
 {
@@ -1705,6 +1853,7 @@ step_tone(bool darwin)
 
 			sleep_ms(1);
 			glink_poll();
+			qrtr_step();
 			for (uint32_t p = 0; p < PERIODS && wrote; p++) {
 				if (apr.done_periods & (1u << p)) {
 					apr.done_periods &= ~(1u << p);
@@ -1962,6 +2111,7 @@ step_watch(uint32_t seconds, uint32_t steps)
 		} else {
 			glink_poll();
 			apr_step(steps);
+			qrtr_step();
 			if (steps >= 6 && !port_done && apr.received >= 2 && apr.intent_size != 0) {
 				uint32_t hold = 3;
 
@@ -1991,6 +2141,7 @@ adsp_thread(__unused void *parameter, __unused wait_result_t result)
 	PE_parse_boot_argn("adsp_delay", &delay, sizeof(delay));
 	PE_parse_boot_argn("adsp_watch", &watch, sizeof(watch));
 	PE_parse_boot_argn("adsp_keep", &keep, sizeof(keep));
+	PE_parse_boot_argn("sns", &sns_level, sizeof(sns_level));
 	sleep_ms(delay * 1000);
 	say("adsp: the audio DSP of the SM7150, steps 1 to %u\n", steps);
 	if (step_look() && steps >= 2 && step_ours() && steps >= 3 && step_start() && steps >= 4) {
