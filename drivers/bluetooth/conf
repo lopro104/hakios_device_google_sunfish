@@ -2,4 +2,5 @@
 
 driver BT_SUNFISH
 	file    bsd/dev/hakios.bt_sunfish.c
+	file    iokit/Kernel/hakios.bt_sunfish.cpp iokitcpp
 	help    Bluetooth: the WCN3990 on the GENI UART of QUP0 SE3 (bt=N)

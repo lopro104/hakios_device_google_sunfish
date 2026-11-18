@@ -299,7 +299,7 @@ uart_setup(uint32_t divider)
 	uw(0x630, 1u << 27 | 0x80);                     /* S_CMD0: START_READ, RFR open */
 }
 
-static uint8_t rx_ring[1024];
+static uint8_t rx_ring[16384];
 static unsigned rx_head, rx_tail;
 
 static void
@@ -468,6 +468,14 @@ fw_load(const char *name, uint8_t **data, uint32_t *size)
 	return error;
 }
 
+static void
+fw_free(uint8_t *data, uint32_t size)
+{
+	if (data != NULL) {
+		kmem_free(kernel_map, (vm_offset_t)data, round_page(size));
+	}
+}
+
 static bool
 qca_tlv_ack(const uint8_t *e, unsigned n)
 {
@@ -512,6 +520,100 @@ qca_download(const char *what, const uint8_t *tlv, uint32_t size, bool skip_even
 	return true;
 }
 
+/*
+ * The address. The NVM's own (tag 2) is the same on every Pixel 4a, and Android writes the phone's in at boot. Here it is
+ * made from the SoC's serial number: the same on every boot of one phone (pairings last), different between phones, and
+ * never written to a log. LSB first, as HCI and the NVM have it; bit 1 of the top byte set (locally administered).
+ */
+static uint8_t bd_address_lsb[6];
+
+extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
+extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
+
+#define SMEM_PA                 0x86000000ul
+#define SMEM_SIZE               0x200000ul
+#define WIMG_WCOMB              0x6u
+
+/*
+ * The SoC's serial number, from SMEM item 137 (socinfo, serial_num at byte 96) in the global partition (hosts 0xfffe),
+ * through mappings made for the moment and taken back, as the modem driver reads SMEM. (HakiOS's socinfo driver maps the
+ * whole 2 MB and keeps it: with it on, this phone met a kmem_alloc of 384 KiB that found no space and panicked.)
+ */
+static uint32_t
+soc_serial(void)
+{
+	vm_offset_t page = ml_io_map_unmappable(SMEM_PA + SMEM_SIZE - 0x4000, 0x4000, WIMG_WCOMB), part;
+	uint32_t serial = 0, offset = 0, size = 0;
+	const uint8_t *toc;
+
+	if (page == 0) {
+		return 0;
+	}
+	toc = (const uint8_t *)page + 0x4000 - 0x1000;
+	if (memcmp(toc, "$TOC", 4) == 0) {
+		uint32_t entries = *(const volatile uint32_t *)(toc + 8);
+
+		for (uint32_t i = 0; i < entries && i < 32; i++) {
+			const uint8_t *e = toc + 32 + 48 * i;          /* (Linux smem_ptable: a 32-byte header, 48-byte entries) offset, size, flags, host0, host1 */
+
+			if (*(const volatile uint16_t *)(e + 12) == 0xfffe && *(const volatile uint16_t *)(e + 14) == 0xfffe) {
+				offset = *(const volatile uint32_t *)e;
+				size = *(const volatile uint32_t *)(e + 4);
+			}
+		}
+	}
+	ml_io_unmap(page, 0x4000);
+	if (size == 0 || offset + size > SMEM_SIZE || size > 0x100000) {
+		return 0;
+	}
+	/* (mapped from the page it begins in: a mapping of an address not on a page panicked in the pmap) */
+	vm_offset_t base = trunc_page(SMEM_PA + offset), map_size = round_page(SMEM_PA + offset + size) - base, window;
+
+	window = ml_io_map_unmappable(base, map_size, WIMG_WCOMB);
+	if (window == 0) {
+		return 0;
+	}
+	part = window + (SMEM_PA + offset - base);
+	if (memcmp((const void *)part, "$PRT", 4) == 0) {
+		uint32_t end = MIN(*(const volatile uint32_t *)(part + 12), size);       /* offset_free_uncached */
+
+		for (uint32_t at = 32; at + 16 <= end;) {
+			uint16_t canary = *(const volatile uint16_t *)(part + at), item = *(const volatile uint16_t *)(part + at + 2);
+			uint32_t length = *(const volatile uint32_t *)(part + at + 4);
+			uint16_t pad_hdr = *(const volatile uint16_t *)(part + at + 10);
+			uint32_t data = at + 16 + pad_hdr;
+
+			if (canary != 0xa5a5 || data + length > end) {
+				break;
+			}
+			if (item == 137 && length >= 100) {
+				serial = *(const volatile uint32_t *)(part + data + 96);
+				break;
+			}
+			at = data + length;
+		}
+	}
+	ml_io_unmap(window, map_size);
+	return serial;
+}
+
+static void
+bd_address(void)
+{
+	uint64_t h = 0xcbf29ce484222325ull;
+	uint32_t serial = soc_serial();
+
+	for (unsigned i = 0; i < 4; i++) {
+		h = (h ^ ((serial >> (8 * i)) & 0xff)) * 0x100000001b3ull;      /* FNV-1a */
+	}
+	h = (h ^ 0x42) * 0x100000001b3ull;
+	for (unsigned i = 0; i < 6; i++) {
+		bd_address_lsb[i] = (uint8_t)(h >> (8 * i));
+	}
+	bd_address_lsb[5] = (uint8_t)((bd_address_lsb[5] & 0xfc) | 0x02);
+	say("bt: the address made from the SoC's serial number%s\n", serial ? "" : " (NOT KNOWN: the same on every phone)");
+}
+
 /* the NVM's records (tag, length, 8 reserved bytes, data): tag 17 (HCI transport) gets the speed in byte 2, its IBS bit off */
 static bool
 nvm_tags(uint8_t *nvm, uint32_t at, uint32_t end, uint8_t baud_index)
@@ -523,6 +625,10 @@ nvm_tags(uint8_t *nvm, uint32_t at, uint32_t end, uint8_t baud_index)
 
 		if (at + 12 + length > end) {
 			break;
+		}
+		if (tag == 2 && length == 6) {
+			memcpy(nvm + at + 12, bd_address_lsb, 6);      /* this phone's address (see bd_address()); never logged */
+			say("bt: NVM tag 2 (the address) given this phone's own\n");
 		}
 		if (tag == 17 && length >= 3) {
 			say("bt: NVM tag 17 was %02x %02x %02x: IBS bit cleared, speed index %u in byte 2\n", nvm[at + 12], nvm[at + 13],
@@ -586,28 +692,74 @@ clock_rate(uint32_t m, uint32_t n)
 	}
 }
 
+static uint32_t divider = 2;
+
+/* the power pulses, then the ROM's answers: true when the chip said its QCA version */
+static bool
+chip_up(void)
+{
+	uint8_t pulse, event[64];
+	static const uint8_t version_request[] = { 0x19 };      /* EDL_PATCH_VER_REQ_CMD */
+	unsigned n;
+
+	PE_parse_boot_argn("bt_div", &divider, sizeof(divider));
+	uart = ml_io_map(UART_PA, 0x4000);
+	if (uart == 0) {
+		return false;
+	}
+	/* boot mode: 0xC0 at 2400 baud (divider x 48 of 115200's) */
+	uart_setup(divider * 48);
+	pulse = 0xc0;
+	(void)uart_tx(&pulse, 1);
+	delay(10000);
+	/* on: 0xFC at 115200, then 100 ms */
+	uart_setup(divider);
+	pulse = 0xfc;
+	(void)uart_tx(&pulse, 1);
+	delay(100000);
+	uart_rx_take();
+	say("bt: after the pulses: %u bytes waiting, GENI_STATUS %#x, RX FIFO %#x\n", rx_head - rx_tail, ur(0x40), ur(0x804));
+	(void)hci_command("HCI Reset", 0x0c03, NULL, 0, event, sizeof(event));
+	(void)hci_command("Read Local Version", 0x1001, NULL, 0, event, sizeof(event));
+	n = hci_command("QCA version (0xfc00 0x19)", 0xfc00, version_request, sizeof(version_request), event, sizeof(event));
+	return n >= 17 && event[1] == 0xff;
+}
+
 static void
-firmware_and_scan(void)
+chip_off(void)
+{
+	uint8_t pulse = 0xc0;
+
+	clock_rate(384, 15625);
+	uart_setup(divider * 48);
+	(void)uart_tx(&pulse, 1);
+	delay(10000);
+	uart_quiesce();
+	say("bt: the chip told to power off (0xC0 at 2400 baud); the UART stopped\n");
+}
+
+/* 3 Mbaud, the rampatch and the NVM, a reset: true when the patched firmware answers */
+static bool
+chip_firmware(void)
 {
 	uint8_t *patch = NULL, *nvm = NULL, event[64];
-	uint32_t patch_size = 0, nvm_size = 0, heard = 0;
-	static const uint8_t to_3m[] = { 14 };          /* QCA_BAUDRATE_3000000 */
-	static const uint8_t scan_params[] = { 0, 0x10, 0, 0x10, 0, 0, 0 };     /* passive, 10 ms, public, all */
-	static const uint8_t scan_on[] = { 1, 0 }, scan_off[] = { 0, 0 };
-	uint8_t seen[64][6];
+	uint32_t patch_size = 0, nvm_size = 0;
+	uint8_t packet[5] = { 1, 0x48, 0xfc, 1, 14 };   /* QCA_BAUDRATE_3000000 */
 	unsigned n;
 
 	if (fw_load("crbtfw21.tlv", &patch, &patch_size) != 0 || fw_load("crnv21.bin", &nvm, &nvm_size) != 0) {
 		say("bt: the firmware files are not in the image (FW_ADSP at build time)\n");
-		return;
+		return false;
 	}
+	bd_address();
 	if (!nvm_prepare(nvm, nvm_size, 14)) {
-		return;
+		fw_free(patch, patch_size);
+		fw_free(nvm, nvm_size);
+		return false;
 	}
 	/* 3,000,000 baud: the chip told, then the host (96 MHz / 32) */
-	uint8_t packet[5] = { 1, 0x48, 0xfc, 1, to_3m[0] };
 	if (!uart_tx(packet, sizeof(packet))) {
-		return;
+		return false;
 	}
 	delay(10000);
 	uart_quiesce();
@@ -617,20 +769,33 @@ firmware_and_scan(void)
 	n = hci_event(event, sizeof(event), 200);
 	say_event("after the speed change", event, n);
 	if (!hci_command("Read Local Version at 3 Mbaud", 0x1001, NULL, 0, event, sizeof(event))) {
-		return;
+		return false;
 	}
 	if (!qca_download("rampatch crbtfw21.tlv", patch, patch_size, patch_size > 14 && patch[14] == 3)) {
-		return;
+		return false;
 	}
 	n = hci_event(event, sizeof(event), 100);       /* the chip's NOP once the patch runs */
 	say_event("after the rampatch", event, n);
 	if (!qca_download("NVM crnv21.bin", nvm, nvm_size, false)) {
-		return;
+		return false;
 	}
 	delay(10000);
+	fw_free(patch, patch_size);
+	fw_free(nvm, nvm_size);
 	(void)hci_command("HCI Reset after the firmware", 0x0c03, NULL, 0, event, sizeof(event));
-	(void)hci_command("Read Local Version after the firmware", 0x1001, NULL, 0, event, sizeof(event));
-	n = hci_command("Read BD_ADDR", 0x1009, NULL, 0, event, 7);
+	n = hci_command("Read Local Version after the firmware", 0x1001, NULL, 0, event, sizeof(event));
+	return n >= 15 && event[6] == 0;
+}
+
+static void
+chip_scan(void)
+{
+	uint8_t event[64], seen[64][6];
+	uint32_t heard = 0;
+	static const uint8_t scan_params[] = { 0, 0x10, 0, 0x10, 0, 0, 0 };     /* passive, 10 ms, public, all */
+	static const uint8_t scan_on[] = { 1, 0 }, scan_off[] = { 0, 0 };
+	unsigned n;
+
 	(void)hci_command("LE Set Scan Parameters", 0x200b, scan_params, sizeof(scan_params), event, sizeof(event));
 	(void)hci_command("LE Set Scan Enable", 0x200c, scan_on, sizeof(scan_on), event, sizeof(event));
 	for (unsigned ms = 0; ms < 10000; ms += 10) {
@@ -652,47 +817,338 @@ firmware_and_scan(void)
 	}
 	(void)hci_command("LE Set Scan Enable (off)", 0x200c, scan_off, sizeof(scan_off), event, sizeof(event));
 	say("bt: THE RADIO HEARS: %u different Bluetooth LE advertisers in 10 s\n", heard);
-	/* back to 115200 for the power-off pulse that follows */
-	clock_rate(384, 15625);
+}
+
+/* ---- bt=5: Darwin's. The kernel control com.hakios.bluetooth carries H4 between bluetoothd and the chip ---- */
+/*
+ * As the Mi 10S port does it (hakios-thyme: kernel control, termios answers, the IOService of hakios.bt_sunfish.cpp,
+ * userland/src/inject_bluetooth.c in bluetoothd, umi_bluetool for BlueTool), without its in-band sleep: the NVM has IBS
+ * off here, so packets go both ways as they are.
+ */
+#include <sys/kern_control.h>
+#include <sys/kpi_mbuf.h>
+#include <sys/termios.h>
+#include <sys/ttycom.h>
+#include <kern/locks.h>
+
+extern int hakios_bt_sunfish_publish(const uint8_t address[6], const uint8_t commands[64], uint32_t speed);
+extern void hakios_bt_sunfish_set_ready(bool ready);
+
+#define BT_SPEED                3000000u
+#define TXQ_SIZE                65536u
+#define H4_MAX                  4096u
+
+static LCK_GRP_DECLARE(ctl_lock_group, "hakios-bt");
+static LCK_MTX_DECLARE(ctl_lock, &ctl_lock_group);
+static kern_ctl_ref ctl_ref;
+static uint32_t ctl_unit, ctl_generation;
+static bool ctl_fault;
+static uint8_t txq[TXQ_SIZE];
+static uint32_t txq_head, txq_tail;
+static struct termios ctl_termios;
+
+struct h4 {
+	uint8_t bytes[H4_MAX];
+	uint32_t used, wanted, header;
+	bool complete;
+};
+
+/* 0: incomplete, 1: a packet, -1: a bad type, -2: too long (hakios-thyme's hakios_bt_h4_push, without IBS) */
+static int
+h4_push(struct h4 *p, uint8_t byte)
+{
+	if (p->complete) {
+		p->used = p->wanted = p->header = 0;
+		p->complete = false;
+	}
+	if (p->used == 0) {
+		switch (byte) {
+		case 1: case 3: p->header = 4; break;
+		case 2: case 5: p->header = 5; break;
+		case 4: p->header = 3; break;
+		default: return -1;
+		}
+		p->wanted = p->header;
+	}
+	if (p->used >= H4_MAX) {
+		return -2;
+	}
+	p->bytes[p->used++] = byte;
+	if (p->used == p->header) {
+		uint32_t length = p->bytes[0] == 1 || p->bytes[0] == 3 ? p->bytes[3] : p->bytes[0] == 4 ? p->bytes[2] :
+		    (p->bytes[3] | (uint32_t)p->bytes[4] << 8) & (p->bytes[0] == 5 ? 0x3fff : 0xffff);
+
+		if (length > H4_MAX - p->header) {
+			p->used = p->wanted = p->header = 0;
+			return -2;
+		}
+		p->wanted = p->header + length;
+	}
+	if (p->used == p->wanted) {
+		p->complete = true;
+		return 1;
+	}
+	return 0;
+}
+
+static errno_t
+ctl_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *address, void **info)
+{
+	uid_t uid = kauth_cred_getuid(kauth_cred_get());
+	int error;
+
+	if (uid != 0 && uid != 501) {
+		return EPERM;
+	}
+	lck_mtx_lock(&ctl_lock);
+	error = ctl_fault ? EIO : ctl_unit ? EBUSY : 0;
+	if (error == 0) {
+		ctl_unit = address->sc_unit;
+		ctl_generation++;
+		txq_head = txq_tail = 0;
+		*info = NULL;
+	}
+	lck_mtx_unlock(&ctl_lock);
+	if (error == 0) {
+		say("bt: bluetoothd connected (uid %u)\n", uid);
+	}
+	return error;
+}
+
+static errno_t
+ctl_disconnect(__unused kern_ctl_ref ref, uint32_t unit, __unused void *info)
+{
+	lck_mtx_lock(&ctl_lock);
+	if (ctl_unit == unit) {
+		ctl_unit = 0;
+		ctl_generation++;
+		txq_head = txq_tail = 0;
+	}
+	lck_mtx_unlock(&ctl_lock);
+	say("bt: bluetoothd disconnected\n");
+	return 0;
+}
+
+static errno_t
+ctl_send(__unused kern_ctl_ref ref, uint32_t unit, __unused void *info, mbuf_t message, __unused int flags)
+{
+	size_t length = mbuf_pkthdr_len(message);
+	int error = 0;
+
+	lck_mtx_lock(&ctl_lock);
+	if (ctl_fault) {
+		error = EIO;
+	} else if (unit != ctl_unit) {
+		error = ENOTCONN;
+	} else if (length > TXQ_SIZE - (txq_head - txq_tail)) {
+		error = ENOBUFS;
+	}
+	for (size_t offset = 0; error == 0 && offset < length;) {
+		uint8_t bytes[256];
+		size_t count = MIN(length - offset, sizeof(bytes));
+
+		error = mbuf_copydata(message, offset, count, bytes);
+		for (size_t i = 0; error == 0 && i < count; i++) {
+			txq[txq_head++ % TXQ_SIZE] = bytes[i];
+		}
+		offset += count;
+	}
+	lck_mtx_unlock(&ctl_lock);
+	mbuf_freem(message);
+	return error;
+}
+
+static errno_t
+ctl_getopt(__unused kern_ctl_ref ref, __unused uint32_t unit, __unused void *info, int option, void *data, size_t *length)
+{
+	int modem = TIOCM_CTS | TIOCM_DSR | TIOCM_CAR;
+	size_t wanted;
+
+	if (option == (int)TIOCGETA) {
+		wanted = sizeof(ctl_termios);
+	} else if (option == (int)TIOCMGET) {
+		wanted = sizeof(modem);
+	} else {
+		say("bt: bluetoothd asks for option %#x: not known\n", option);
+		return ENOPROTOOPT;
+	}
+	if (data == NULL) {
+		*length = wanted;
+		return 0;
+	}
+	if (*length < wanted) {
+		return EMSGSIZE;
+	}
+	lck_mtx_lock(&ctl_lock);
+	memcpy(data, option == (int)TIOCGETA ? (void *)&ctl_termios : (void *)&modem, wanted);
+	lck_mtx_unlock(&ctl_lock);
+	*length = wanted;
+	return 0;
+}
+
+static errno_t
+ctl_setopt(__unused kern_ctl_ref ref, __unused uint32_t unit, __unused void *info, int option, void *data, size_t length)
+{
+	uint32_t o = (uint32_t)option;
+
+	if (o == (uint32_t)TIOCSETA || o == (uint32_t)TIOCSETAW || o == (uint32_t)TIOCSETAF) {
+		const struct termios *settings = data;
+
+		if (length != sizeof(struct termios) || data == NULL) {
+			return EINVAL;
+		}
+		if ((settings->c_ispeed && settings->c_ispeed != BT_SPEED) || (settings->c_ospeed && settings->c_ospeed != BT_SPEED)) {
+			say("bt: bluetoothd asks for %lu baud: the link runs at %u\n", (unsigned long)settings->c_ospeed, BT_SPEED);
+			return EINVAL;
+		}
+		lck_mtx_lock(&ctl_lock);
+		ctl_termios = *settings;
+		lck_mtx_unlock(&ctl_lock);
+		return 0;
+	}
+	if (o == (uint32_t)TIOCSDTR || o == (uint32_t)TIOCCDTR || o == (uint32_t)TIOCMSET || o == (uint32_t)TIOCMBIS ||
+	    o == (uint32_t)TIOCMBIC || o == (uint32_t)TIOCFLUSH) {
+		return 0;
+	}
+	say("bt: bluetoothd sets option %#x: not known\n", option);
+	return ENOPROTOOPT;
+}
+
+static void
+ctl_worker(__unused void *parameter, __unused wait_result_t result)
+{
+	static struct h4 tx, rx;
+	uint32_t generation = 0, commands = 0, events = 0;
+	bool have_rx = false;
+
+	for (;;) {
+		uint32_t unit;
+		bool fault;
+
+		lck_mtx_lock(&ctl_lock);
+		unit = ctl_unit;
+		if (generation != ctl_generation) {
+			generation = ctl_generation;
+			memset(&tx, 0, sizeof(tx));
+		}
+		while (unit && !ctl_fault && !tx.complete && txq_head != txq_tail) {
+			int state = h4_push(&tx, txq[txq_tail++ % TXQ_SIZE]);
+
+			if (state < 0 || (tx.used && tx.bytes[0] == 4)) {
+				ctl_fault = true;
+				say("bt: bluetoothd sent what is not H4: the link is given up\n");
+			}
+		}
+		fault = ctl_fault;
+		lck_mtx_unlock(&ctl_lock);
+		if (unit && !fault && tx.complete) {
+			if (tx.bytes[0] == 1 && commands++ < 64) {
+				say("bt: bluetoothd sends HCI command %#06x (%u bytes)\n", tx.bytes[1] | tx.bytes[2] << 8, tx.used);
+			}
+			if (!uart_tx(tx.bytes, tx.used)) {
+				lck_mtx_lock(&ctl_lock);
+				ctl_fault = true;
+				lck_mtx_unlock(&ctl_lock);
+				hakios_bt_sunfish_set_ready(false);
+				say("bt: the UART stopped taking bytes: the link is given up\n");
+			}
+			memset(&tx, 0, sizeof(tx));
+		}
+		/* what the chip sent: whole H4 packets to bluetoothd (never logged: events carry others' addresses) */
+		uart_rx_take();
+		while (!have_rx && rx_head != rx_tail) {
+			int state = h4_push(&rx, rx_ring[rx_tail++ % sizeof(rx_ring)]);
+
+			if (state < 0) {
+				say("bt: the chip sent what is not H4 (%d): the packet dropped\n", state);
+				memset(&rx, 0, sizeof(rx));
+			} else if (state == 1) {
+				have_rx = true;
+			}
+		}
+		if (have_rx) {
+			int queued = unit ? ctl_enqueuedata(ctl_ref, unit, rx.bytes, rx.used, 0) : 0;
+
+			if (queued != ENOBUFS) {
+				have_rx = false;
+				if (rx.bytes[0] == 4 && rx.bytes[1] == 0x0e && rx.used >= 7 && rx.bytes[6] != 0 && events++ < 32) {
+					say("bt: the chip refused command %#06x (status %#x)\n", rx.bytes[4] | rx.bytes[5] << 8, rx.bytes[6]);
+				}
+			}
+		}
+		if (!(unit && (tx.complete || txq_head != txq_tail)) && !have_rx && rx_head == rx_tail) {
+			delay(500);
+		}
+	}
+}
+
+static bool
+runtime_start(void)
+{
+	struct kern_ctl_reg registration;
+	uint8_t event[80], commands[64] = { 0 }, address[6];
+	thread_t thread;
+	unsigned n;
+	int error;
+
+	n = hci_command("Read Local Supported Commands", 0x1002, NULL, 0, event, sizeof(event));
+	if (n >= 71) {
+		memcpy(commands, event + 7, 64);
+	}
+	for (unsigned i = 0; i < 6; i++) {
+		address[i] = bd_address_lsb[5 - i];     /* display order, as bluetoothd reads local-mac-address */
+	}
+	memset(&registration, 0, sizeof(registration));
+	strlcpy(registration.ctl_name, "com.hakios.bluetooth", sizeof(registration.ctl_name));
+	registration.ctl_flags = CTL_FLAG_REG_SOCK_STREAM;
+	registration.ctl_sendsize = TXQ_SIZE;
+	registration.ctl_recvsize = TXQ_SIZE;
+	registration.ctl_connect = ctl_connect;
+	registration.ctl_disconnect = ctl_disconnect;
+	registration.ctl_send = ctl_send;
+	registration.ctl_getopt = ctl_getopt;
+	registration.ctl_setopt = ctl_setopt;
+	ctl_termios.c_cflag = CS8 | CREAD | CLOCAL;
+	ctl_termios.c_ispeed = ctl_termios.c_ospeed = BT_SPEED;
+	if ((error = ctl_register(&registration, &ctl_ref)) != 0) {
+		say("bt: the kernel control could not be registered: %d\n", error);
+		return false;
+	}
+	if ((error = hakios_bt_sunfish_publish(address, commands, BT_SPEED)) != 0) {
+		say("bt: the IOService could not be published: %d\n", error);
+		ctl_deregister(ctl_ref);
+		return false;
+	}
+	if (kernel_thread_start(ctl_worker, NULL, &thread) != KERN_SUCCESS) {
+		ctl_deregister(ctl_ref);
+		return false;
+	}
+	thread_deallocate(thread);
+	hakios_bt_sunfish_set_ready(true);
+	say("bt: BLUETOOTH IS DARWIN'S: com.hakios.bluetooth ready at %u baud, the \"bluetooth\" service published\n", BT_SPEED);
+	return true;
 }
 
 static void
 talk(void)
 {
-	uint32_t divider = 2;
-	uint8_t pulse, event[64];
-	static const uint8_t version_request[] = { 0x19 };      /* EDL_PATCH_VER_REQ_CMD */
-
-	PE_parse_boot_argn("bt_div", &divider, sizeof(divider));
-	uart = ml_io_map(UART_PA, 0x4000);
-	if (uart == 0) {
+	if (!chip_up()) {
+		say("bt: the chip did not say its version\n");
+		chip_off();
 		return;
 	}
-	/* boot mode: 0xC0 at 2400 baud (divider x 48 of 115200's) */
-	uart_setup(divider * 48);
-	pulse = 0xc0;
-	(void)uart_tx(&pulse, 1);
-	delay(10000);
-	/* on: 0xFC at 115200, then 100 ms */
-	uart_setup(divider);
-	pulse = 0xfc;
-	(void)uart_tx(&pulse, 1);
-	delay(100000);
-	uart_rx_take();
-	say("bt: after the pulses: %u bytes waiting, GENI_STATUS %#x, RX FIFO %#x\n", rx_head - rx_tail, ur(0x40), ur(0x804));
-	(void)hci_command("HCI Reset", 0x0c03, NULL, 0, event, sizeof(event));
-	(void)hci_command("Read Local Version", 0x1001, NULL, 0, event, sizeof(event));
-	(void)hci_command("QCA version (0xfc00 0x19)", 0xfc00, version_request, sizeof(version_request), event, sizeof(event));
-	if (level >= 4) {
-		firmware_and_scan();
+	if (level == 4) {
+		if (chip_firmware()) {
+			chip_scan();
+		}
+		chip_off();
+	} else if (level >= 5) {
+		if (!chip_firmware() || !runtime_start()) {
+			chip_off();
+		}
+	} else {
+		chip_off();
 	}
-	/* off again: 0xC0 at 2400 */
-	uart_setup(divider * 48);
-	pulse = 0xc0;
-	(void)uart_tx(&pulse, 1);
-	delay(10000);
-	uart_quiesce();
-	say("bt: the chip told to power off (0xC0 at 2400 baud); the UART stopped\n");
 }
 
 static void
