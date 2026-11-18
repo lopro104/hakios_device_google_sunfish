@@ -30,6 +30,7 @@
 #include <kern/clock.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include <pexpert/device_tree.h>
 #include <sys/fcntl.h>
 #include <sys/vnode.h>
 #include <sys/kauth.h>
@@ -601,7 +602,21 @@ static void
 bd_address(void)
 {
 	uint64_t h = 0xcbf29ce484222325ull;
-	uint32_t serial = soc_serial();
+	uint32_t serial;
+	DTEntry chosen;
+	const void *real = NULL;
+	unsigned int real_size = 0;
+
+	/* the phone's own, when the loader found it on the bootloader's command line (androidboot.btmacaddr, in display order) */
+	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
+	    SecureDTGetProperty(chosen, "hakios-bluetooth-address", &real, &real_size) == kSuccess && real_size == 6) {
+		for (unsigned i = 0; i < 6; i++) {
+			bd_address_lsb[i] = ((const uint8_t *)real)[5 - i];
+		}
+		say("bt: the address is the phone's own, from its bootloader\n");
+		return;
+	}
+	serial = soc_serial();
 
 	for (unsigned i = 0; i < 4; i++) {
 		h = (h ^ ((serial >> (8 * i)) & 0xff)) * 0x100000001b3ull;      /* FNV-1a */
@@ -1200,10 +1215,18 @@ runtime_start(void)
 static void
 talk(void)
 {
-	if (!chip_up()) {
-		say("bt: the chip did not say its version\n");
+	/*
+	 * The chip answers only once its supplies are on, which happens some time into the boot and not from the bootloader
+	 * (at 3 s it said nothing, logs/161520-run.log): with bt=5 it is asked again every 3 s, for 90 s at most.
+	 */
+	for (unsigned tries = 1; !chip_up(); tries++) {
 		chip_off();
-		return;
+		if (level < 5 || tries >= 30) {
+			say("bt: the chip did not say its version\n");
+			return;
+		}
+		say("bt: the chip does not answer yet (try %u): again in 3 s\n", tries);
+		delay_for_interval(3, NSEC_PER_SEC);
 	}
 	if (level == 4) {
 		if (chip_firmware()) {
@@ -1264,8 +1287,16 @@ hakios_bt_sunfish_init(void)
 	if (!PE_parse_boot_argn("bt", &level, sizeof(level)) || level == 0) {
 		return;
 	}
+	/*
+	 * 30 s: started at 3 s the chip did not answer and the driver stalled in its first exchange (logs/162013-run.log);
+	 * from 30 s on it has always worked. BlueTool's stand-in waits for the controller meanwhile (userland/src/umi_bluetool.c),
+	 * so bluetoothd does not come and go and SpringBoard can attach. bt_delay=S changes it.
+	 */
+	uint32_t delay_s = 30;
+
+	PE_parse_boot_argn("bt_delay", &delay_s, sizeof(delay_s));
 	bt_call = thread_call_allocate(bt_go, NULL);
-	clock_interval_to_deadline(30, NSEC_PER_SEC, &deadline);       /* after Wi-Fi has powered the shared supplies */
+	clock_interval_to_deadline(MIN(delay_s, 120u), NSEC_PER_SEC, &deadline);
 	thread_call_enter_delayed(bt_call, deadline);
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, hakios_bt_sunfish_init);
