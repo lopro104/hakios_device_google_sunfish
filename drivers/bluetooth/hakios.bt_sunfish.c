@@ -1020,6 +1020,13 @@ ctl_worker(__unused void *parameter, __unused wait_result_t result)
 	static struct h4 tx, rx;
 	uint32_t generation = 0, commands = 0, events = 0;
 	bool have_rx = false;
+	/* what went by, said every 10 s while it changes (no address, no data): ACL bytes out and in, connections */
+	uint64_t acl_out = 0, acl_in = 0, said_out = 0, said_in = 0, next_report = 0;
+	uint32_t connections = 0, disconnections = 0, said_conn = 0, said_disc = 0;
+	/* per connection handle (the 12 bits of an ACL header): bytes each way, for the first eight handles seen */
+	uint16_t handles[8];
+	uint64_t h_out[8] = { 0 }, h_in[8] = { 0 };
+	unsigned nh = 0;
 
 	for (;;) {
 		uint32_t unit;
@@ -1042,6 +1049,20 @@ ctl_worker(__unused void *parameter, __unused wait_result_t result)
 		fault = ctl_fault;
 		lck_mtx_unlock(&ctl_lock);
 		if (unit && !fault && tx.complete) {
+			if (tx.bytes[0] == 2 && tx.used >= 3) {
+				uint16_t h = (uint16_t)((tx.bytes[1] | tx.bytes[2] << 8) & 0xfff);
+				unsigned k;
+
+				acl_out += tx.used;
+				for (k = 0; k < nh && handles[k] != h; k++) {
+				}
+				if (k == nh && nh < 8) {
+					handles[nh++] = h;
+				}
+				if (k < 8) {
+					h_out[k] += tx.used;
+				}
+			}
 			if (tx.bytes[0] == 1 && commands++ < 64) {
 				say("bt: bluetoothd sends HCI command %#06x (%u bytes)\n", tx.bytes[1] | tx.bytes[2] << 8, tx.used);
 			}
@@ -1066,15 +1087,62 @@ ctl_worker(__unused void *parameter, __unused wait_result_t result)
 				have_rx = true;
 			}
 		}
+		/*
+		 * The chip's own diagnostic log comes as ACL data on handle 0xedc (QCA's debug handle 0x2edc): Linux's hci_qca
+		 * takes it aside; here it went to bluetoothd, which said "connection handle ... is invalid" for each. Dropped.
+		 */
+		if (have_rx && rx.bytes[0] == 2 && rx.used >= 3 && ((rx.bytes[1] | rx.bytes[2] << 8) & 0xfff) == 0xedc) {
+			have_rx = false;
+			acl_in += rx.used;
+		}
 		if (have_rx) {
 			int queued = unit ? ctl_enqueuedata(ctl_ref, unit, rx.bytes, rx.used, 0) : 0;
 
 			if (queued != ENOBUFS) {
 				have_rx = false;
+				if (rx.bytes[0] == 2 && rx.used >= 3) {
+					uint16_t h = (uint16_t)((rx.bytes[1] | rx.bytes[2] << 8) & 0xfff);
+					unsigned k;
+
+					acl_in += rx.used;
+					for (k = 0; k < nh && handles[k] != h; k++) {
+					}
+					if (k == nh && nh < 8) {
+						handles[nh++] = h;
+					}
+					if (k < 8) {
+						h_in[k] += rx.used;
+					}
+				} else if (rx.bytes[0] == 4 && rx.bytes[1] == 0x03 && rx.used >= 6) {
+					connections++;
+					say("bt: link: a classic connection: status %#x, handle %#x, link type %u\n", rx.bytes[3],
+					    (rx.bytes[4] | rx.bytes[5] << 8) & 0xfff, rx.used >= 14 ? rx.bytes[13] : 99);
+				} else if (rx.bytes[0] == 4 && rx.bytes[1] == 0x3e && rx.used >= 7 && (rx.bytes[3] == 0x01 || rx.bytes[3] == 0x0a)) {
+					connections++;
+					say("bt: link: an LE connection: status %#x, handle %#x\n", rx.bytes[4], (rx.bytes[5] | rx.bytes[6] << 8) & 0xfff);
+				} else if (rx.bytes[0] == 4 && rx.bytes[1] == 0x05 && rx.used >= 7) {
+					disconnections++;
+					say("bt: link: a disconnection: status %#x, handle %#x, reason %#x\n", rx.bytes[3],
+					    (rx.bytes[4] | rx.bytes[5] << 8) & 0xfff, rx.bytes[6]);
+				}
 				if (rx.bytes[0] == 4 && rx.bytes[1] == 0x0e && rx.used >= 7 && rx.bytes[6] != 0 && events++ < 32) {
 					say("bt: the chip refused command %#06x (status %#x)\n", rx.bytes[4] | rx.bytes[5] << 8, rx.bytes[6]);
 				}
 			}
+		}
+		if (mach_absolute_time() >= next_report) {
+			if (acl_out != said_out || acl_in != said_in || connections != said_conn || disconnections != said_disc) {
+				say("bt: link: %u connections, %u disconnections; ACL out %llu KB (%llu KB/s), in %llu KB\n", connections,
+				    disconnections, acl_out / 1024, (acl_out - said_out) / 10240, acl_in / 1024);
+				for (unsigned k = 0; k < nh; k++) {
+					say("bt: link:   handle %#x: out %llu bytes, in %llu bytes\n", handles[k], h_out[k], h_in[k]);
+				}
+				said_out = acl_out;
+				said_in = acl_in;
+				said_conn = connections;
+				said_disc = disconnections;
+			}
+			clock_interval_to_deadline(10, NSEC_PER_SEC, &next_report);
 		}
 		if (!(unit && (tx.complete || txq_head != txq_tail)) && !have_rx && rx_head == rx_tail) {
 			delay(500);
