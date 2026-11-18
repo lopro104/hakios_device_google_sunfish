@@ -33,6 +33,7 @@
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void hakios_cpufreq_osm_raise(void);
 extern uint64_t hakios_cpufreq_osm_cmd_db(void);
+extern bool ml_cpu_idle_time(int cpu_id, uint64_t *idle);
 
 #define OSM_DOMAINS             2
 #define OSM_DOMAIN_SIZE         0x1400UL
@@ -190,9 +191,13 @@ hakios_cpufreq_osm_cmd_db(void)
  */
 #define TM_STATUS(n)            (0xa0 + 4 * (n))
 #define TM_VALID                (1u << 21)
-#define GOV_MS                  500
+#define GOV_MS                  100             /* the load's look; the temperature's is every fifth of them (500 ms) */
+#define GOV_THERMAL_EVERY       5
 #define GOV_COOL_LOOKS          4
 #define GOV_BLIND_LOOKS         10
+#define GOV_BUSY_UP             60              /* percent busy (the busiest core of a group): straight to the top row */
+#define GOV_BUSY_DOWN           25              /* under this: a row down each look */
+#define GOV_MAX_CPUS            8
 
 extern const struct hakios_thermal_sensor hakios_thermal_sm7150[HAKIOS_THERMAL_SM7150_SENSORS];
 
@@ -231,16 +236,68 @@ gov_hottest(uint32_t d, int *hottest, const char **name)
 	return any;
 }
 
+/*
+ * The load (cpu_gov, on unless cpu_gov=0). The firmware left every group at its top row and it stayed there: an idle phone ran
+ * its big cores at 2.2 GHz and their voltage and sat at 76-81 C with 1-3 % of the processors busy (logs/115955-run.log). Every
+ * 100 ms each group's busiest core is looked at (the scheduler's idle time, ml_cpu_idle_time): 60 % or more, the group goes to
+ * its top row at once (a touch is not kept waiting); under 25 %, one row down a look. The temperature's limit above stays the
+ * ceiling: the row written is the lower of the two.
+ */
+static uint32_t gov_load_on = 1, gov_ticks;
+static int load_row[OSM_DOMAINS], written_row[OSM_DOMAINS];
+static uint64_t gov_idle_before[GOV_MAX_CPUS], gov_then;
+
+static void
+gov_load(int busiest[OSM_DOMAINS])
+{
+	ml_topology_info_t *topology = ml_get_topology_info();
+	uint64_t now = mach_absolute_time(), span = now - gov_then;
+
+	busiest[0] = busiest[1] = 0;
+	for (unsigned i = 0; topology != NULL && i < topology->num_cpus && i < GOV_MAX_CPUS; i++) {
+		uint64_t idle = 0, busy;
+		uint32_t core = (topology->cpus[i].phys_id >> 8) & 0xff, d = core >= 6 ? 1 : 0;
+
+		if (!ml_cpu_idle_time((int)topology->cpus[i].cpu_id, &idle)) {
+			continue;
+		}
+		if (gov_then != 0 && span != 0) {
+			busy = span > idle - gov_idle_before[i] ? span - (idle - gov_idle_before[i]) : 0;
+			busiest[d] = MAX(busiest[d], (int)(busy * 100 / span));
+		}
+		gov_idle_before[i] = idle;
+	}
+	gov_then = now;
+}
+
 static void
 gov_look(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
 	uint64_t deadline;
+	int busiest[OSM_DOMAINS] = { 100, 100 };
+	bool thermal = ++gov_ticks % GOV_THERMAL_EVERY == 0;
 
+	if (gov_load_on) {
+		gov_load(busiest);
+	}
 	for (uint32_t d = 0; d < OSM_DOMAINS; d++) {
-		int hot = 0, want;
+		int hot = 0, want, row;
 		const char *name = "?";
 
 		if (top_row_of[d] < 0) {
+			continue;
+		}
+		if (!gov_load_on || busiest[d] >= GOV_BUSY_UP) {
+			load_row[d] = top_row_of[d];
+		} else if (busiest[d] < GOV_BUSY_DOWN && load_row[d] > 0) {
+			load_row[d]--;
+		}
+		row = MIN(load_row[d], cap[d]);
+		if (row != written_row[d]) {
+			*(volatile uint32_t *)(osm_base[d] + OSM_PERF_STATE) = (uint32_t)row;
+			written_row[d] = row;
+		}
+		if (!thermal) {
 			continue;
 		}
 		want = cap[d];
@@ -268,10 +325,14 @@ gov_look(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 			if (want < cap[d]) {
 				gov_throttles++;
 			}
-			*(volatile uint32_t *)(osm_base[d] + OSM_PERF_STATE) = (uint32_t)want;
-			say("cpufreq: %s: %s at %d.%d C (limit %d): row %d -> %d, %u MHz\n", osm_name[d], name, hot / 10, hot % 10,
-			    gov_limit_c, cap[d], want, row_khz[d][want] / 1000);
+			say("cpufreq: %s: %s at %d.%d C (limit %d): its ceiling row %d -> %d, %u MHz\n", osm_name[d], name, hot / 10,
+			    hot % 10, gov_limit_c, cap[d], want, row_khz[d][want] / 1000);
 			cap[d] = want;
+			row = MIN(load_row[d], cap[d]);
+			if (row != written_row[d]) {
+				*(volatile uint32_t *)(osm_base[d] + OSM_PERF_STATE) = (uint32_t)row;
+				written_row[d] = row;
+			}
 		}
 	}
 	clock_interval_to_deadline(GOV_MS, NSEC_PER_MSEC, &deadline);
@@ -296,7 +357,12 @@ governor_start(void)
 		say("cpufreq: no governor: could not map the sensors\n");
 		return;
 	}
-	say("cpufreq: governor: a group is slowed at %u C, and sped up again under %u C\n", limit, limit - 5);
+	PE_parse_boot_argn("cpu_gov", &gov_load_on, sizeof(gov_load_on));
+	for (uint32_t d = 0; d < OSM_DOMAINS; d++) {
+		load_row[d] = written_row[d] = top_row_of[d] < 0 ? 0 : top_row_of[d];
+	}
+	say("cpufreq: governor: a group is slowed at %u C, and sped up again under %u C; %s\n", limit, limit - 5,
+	    gov_load_on ? "and by its load: the top row at 60 % busy, a row down a tenth of a second under 25 %" : "load not looked at (cpu_gov=0)");
 	gov_call = thread_call_allocate(gov_look, NULL);
 	clock_interval_to_deadline(GOV_MS, NSEC_PER_MSEC, &deadline);
 	thread_call_enter_delayed(gov_call, deadline);
