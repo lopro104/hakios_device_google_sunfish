@@ -41,6 +41,7 @@ extern kern_return_t kernel_thread_start_priority(thread_continue_t, void *, int
 #define SWEET_WLAN_PRI 92       /* above the iOS start-up load: the host side has to answer the firmware's rings on time */
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include <pexpert/device_tree.h>
 #include <vm/vm_kern.h>
 #include <sys/sysctl.h>
 #include <sys/random.h>
@@ -3406,7 +3407,31 @@ static bool jn_wmi_event(uint32_t evid, const uint8_t *t, uint32_t len);
 static bool jn_htt(const uint8_t *pl, uint32_t plen);
 
 /* ---- passive scan (the fork's 1120/1123): HTT version + setup, WMI chain masks, channels, regdomain, vdev, start scan ---- */
-static const uint8_t wp_mac[6] = { 0x02, 0x00, 0x5e, 0x77, 0xe0, 0x01 };
+/*
+ * The station's address: the phone's own when the loader passed it on (/chosen hakios-wlan-address, from ABL's
+ * wlan_mac1 by way of U-Boot), else this made-up one -- the same in every build, so two phones on one network clashed.
+ * Taken once, before the VDEV_CREATE that gives it to the firmware (wp_mac_take); never printed.
+ */
+static uint8_t wp_mac[6] = { 0x02, 0x00, 0x5e, 0x77, 0xe0, 0x01 };
+
+static void
+wp_mac_take(void)
+{
+	static bool taken;
+	DTEntry chosen;
+	const void *real = NULL;
+	unsigned int size = 0;
+
+	if (taken) {
+		return;
+	}
+	taken = true;
+	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
+	    SecureDTGetProperty(chosen, "hakios-wlan-address", &real, &size) == kSuccess && size == 6) {
+		memcpy(wp_mac, real, 6);
+		printf("wlan: the address is the phone's own, from its bootloader\n");
+	}
+}
 static const uint16_t wp_chans[] = {
 	2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
 	5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320,
@@ -3701,6 +3726,7 @@ wp_scan_setup(void)
 	{
 		uint32_t v[5] = { 0, 2, 0, 0, 0 };                        /* VDEV_CREATE: vdev 0, station */
 
+		wp_mac_take();
 		memcpy(&v[3], wp_mac, 6);
 		n = wp_cmd(c, 0x5001, 86, v, 20);
 		if (!wp_wmi("vdev create", c, n)) {
@@ -5482,6 +5508,7 @@ ew_if_create(void)
 	ew.lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
 	g_bss_lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
 	ew.txq = kalloc_data(EW_TXQ * EW_FRAME_MAX, Z_WAITOK | Z_ZERO);
+	wp_mac_take();                  /* before en0 is made with it: the radio and en0 must have the same one */
 	memcpy(ew_link.address, wp_mac, ETHER_ADDR_LEN);
 	if (ew.txq == NULL || !hakios_net_attach(&ew_link)) {
 		ev("EW: hakios_net_attach failed");
