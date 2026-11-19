@@ -629,15 +629,12 @@ tx(const void *data, size_t len)
 	uint32_t head = descs[1], tail = descs[0];
 	uint32_t room = tail <= head ? FIFO_SIZE - head + tail : tail - head;
 	size_t aligned = (len + 7) & ~(size_t)7;
-	uint8_t padded[256];
 
-	if (aligned > sizeof(padded) || room < aligned + 16) {
+	if (aligned > FIFO_SIZE / 2 || room < aligned + 16) {
 		return false;
 	}
-	memset(padded, 0, sizeof(padded));
-	memcpy(padded, data, len);
 	for (size_t i = 0; i < aligned; i++) {
-		tx_fifo[(head + i) % FIFO_SIZE] = padded[i];
+		tx_fifo[(head + i) % FIFO_SIZE] = i < len ? ((const uint8_t *)data)[i] : 0;
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
 	descs[1] = (head + (uint32_t)aligned) % FIFO_SIZE;
@@ -670,9 +667,14 @@ static struct {
  * this DSP on this SoC (no SLPI): Qualcomm's SEE framework, whose client service is QMI service 400 ("sns_client").
  */
 static struct {
-	bool remote_open, open_sent, intent_busy, hello_sent, lookup_sent;
+	bool remote_open, open_sent, intent_busy, hello_sent, lookup_sent, said_intent;
 	uint16_t id;
 	uint32_t intent_id, intent_size, remote_node, servers;
+	uint32_t in_id[16], in_size[16];        /* the DSP's intents for us on IPCRTR: its id, size (0: an empty slot) */
+	bool in_free[16];
+	uint32_t asked_at, polls, next_intent;
+	uint32_t service[32][4];                /* what the DSP announced: service, instance, node, port */
+	uint32_t user_in, user_out, user_dropped, resumes;
 } qr;
 static uint32_t sns_level;
 
@@ -1085,6 +1087,215 @@ rpc_make_node(void)
 	    devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "hakios-fastrpc") != NULL ? "made" : "CANNOT BE MADE");
 }
 
+/*
+ * sns=2: QRTR for a program (/dev/hakios-qrtr): Yofuness/ios-sunfish's sensor client (phone/sensors, MIT; ios-redfin's
+ * sensor.c under it) speaks QMI to the sensors' service 400 from client ports 0x40-0x47 of our node. A write is one
+ * message { lport, node, port, length } + data; a read gives what came for those ports { lport, node, port, length } +
+ * data, waiting up to a second. HAKIOS_QRTR_LOOKUP says where a service the DSP announced lives.
+ */
+#define QR_MSG_MAX              9216u           /* the DSP's biggest seen: 8880 bytes (Yofuness's cam39) */
+#define QR_PORT0                0x40u
+#define QR_PORTS                8u
+#define QR_QUEUE                16u
+
+struct hakios_qrtr_hdr {
+	uint32_t lport, node, port, length;
+};
+struct hakios_qrtr_lookup {
+	uint32_t service, instance, node, port;         /* in: service (and instance, 0: any); out: the rest */
+};
+#define HAKIOS_QRTR_LOOKUP      _IOWR('Q', 1, struct hakios_qrtr_lookup)
+
+static struct qr_msg { struct hakios_qrtr_hdr h; uint8_t b[QR_MSG_MAX]; } qr_in[QR_QUEUE];
+static struct qr_out { struct hakios_qrtr_hdr h; uint8_t b[1024]; } qr_out[QR_QUEUE];
+static uint32_t qr_in_head, qr_in_tail, qr_out_head, qr_out_tail;
+static bool qr_opened;
+static LCK_MTX_DECLARE(qr_lock, &rpc_group);
+
+/* The DSP's intents on IPCRTR: offered (5), given back for reuse (14), used up (6). */
+static void
+qr_intent(uint32_t cmd, uint32_t id, uint32_t size)
+{
+	int empty = -1;
+
+	if (cmd == 5) {
+		qr.asked_at = 0;
+	}
+	for (int i = 0; i < 16; i++) {
+		if (qr.in_size[i] != 0 && qr.in_id[i] == id) {
+			if (cmd == 5) {
+				qr.in_size[i] = size;
+				qr.in_free[i] = true;
+			} else if (cmd == 14) {
+				qr.in_free[i] = true;
+			} else {
+				qr.in_size[i] = 0;
+				qr.in_free[i] = false;
+			}
+			return;
+		}
+		if (qr.in_size[i] == 0 && empty < 0) {
+			empty = i;
+		}
+	}
+	if (cmd == 5 && empty >= 0 && size != 0) {
+		qr.in_id[empty] = id;
+		qr.in_size[empty] = size;
+		qr.in_free[empty] = true;
+	}
+}
+
+/* A DATA packet for one of the program's ports (the driver's thread). */
+static void
+qr_to_program(uint32_t lport, uint32_t node, uint32_t port, const uint8_t *p, uint32_t len)
+{
+	lck_mtx_lock(&qr_lock);
+	if (!qr_opened || qr_in_head - qr_in_tail >= QR_QUEUE || len > QR_MSG_MAX) {
+		qr.user_dropped++;
+	} else {
+		struct qr_msg *m = &qr_in[qr_in_head % QR_QUEUE];
+
+		m->h.lport = lport;
+		m->h.node = node;
+		m->h.port = port;
+		m->h.length = len;
+		memcpy(m->b, p, len);
+		qr_in_head++;
+		qr.user_in++;
+		wakeup(&qr_in_head);
+	}
+	lck_mtx_unlock(&qr_lock);
+}
+
+static int
+qr_dev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	int error = 0;
+
+	lck_mtx_lock(&qr_lock);
+	if (qr_opened) {
+		error = EBUSY;
+	} else {
+		qr_opened = true;
+		qr_in_tail = qr_in_head;
+	}
+	lck_mtx_unlock(&qr_lock);
+	return error;
+}
+
+static int
+qr_dev_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	lck_mtx_lock(&qr_lock);
+	qr_opened = false;
+	lck_mtx_unlock(&qr_lock);
+	return 0;
+}
+
+static int
+qr_dev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	struct qr_out m;
+	int error;
+
+	if (!qr.lookup_sent) {
+		return ENOTCONN;
+	}
+	if (uio_resid(uio) < (user_ssize_t)sizeof(m.h) || uio_resid(uio) > (user_ssize_t)sizeof(m)) {
+		return EINVAL;
+	}
+	if ((error = uiomove((caddr_t)&m.h, sizeof(m.h), uio)) != 0) {
+		return error;
+	}
+	if (m.h.lport < QR_PORT0 || m.h.lport >= QR_PORT0 + QR_PORTS || m.h.length != (uint32_t)uio_resid(uio)) {
+		return EINVAL;
+	}
+	if ((error = uiomove((caddr_t)m.b, (int)m.h.length, uio)) != 0) {
+		return error;
+	}
+	lck_mtx_lock(&qr_lock);
+	if (qr_out_head - qr_out_tail >= QR_QUEUE) {
+		error = EAGAIN;
+	} else {
+		qr_out[qr_out_head % QR_QUEUE] = m;
+		qr_out_head++;
+	}
+	lck_mtx_unlock(&qr_lock);
+	return error;
+}
+
+static int
+qr_dev_read(__unused dev_t dev, struct uio *uio, int ioflag)
+{
+	struct timespec second = { 1, 0 };
+	struct qr_msg *m;
+	int error = 0;
+
+	lck_mtx_lock(&qr_lock);
+	while (qr_in_tail == qr_in_head && error == 0) {
+		if (ioflag & IO_NDELAY) {
+			error = EAGAIN;
+			break;
+		}
+		error = msleep(&qr_in_head, (lck_mtx_t *)&qr_lock, PCATCH, "qrtr", &second);
+		if (error == EWOULDBLOCK) {
+			error = EAGAIN;
+		}
+	}
+	if (error == 0) {
+		m = &qr_in[qr_in_tail % QR_QUEUE];
+		if (uio_resid(uio) < (user_ssize_t)(sizeof(m->h) + m->h.length)) {
+			error = EMSGSIZE;
+		} else {
+			error = uiomove((caddr_t)m, (int)(sizeof(m->h) + m->h.length), uio);
+		}
+		qr_in_tail++;
+	}
+	lck_mtx_unlock(&qr_lock);
+	return error;
+}
+
+static int
+qr_dev_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
+{
+	struct hakios_qrtr_lookup *l = (struct hakios_qrtr_lookup *)data;
+
+	if (cmd != HAKIOS_QRTR_LOOKUP) {
+		return ENOTTY;
+	}
+	for (uint32_t i = 0; i < 32; i++) {
+		if (qr.service[i][0] == l->service && (l->instance == 0 || qr.service[i][1] == l->instance) &&
+		    (qr.service[i][2] | qr.service[i][3]) != 0) {
+			l->instance = qr.service[i][1];
+			l->node = qr.service[i][2];
+			l->port = qr.service[i][3];
+			return 0;
+		}
+	}
+	return ENOENT;
+}
+
+static const struct cdevsw qr_cdevsw = {
+	.d_open = qr_dev_open, .d_close = qr_dev_close, .d_read = qr_dev_read, .d_write = qr_dev_write,
+	.d_ioctl = qr_dev_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
+	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+};
+
+static void
+qr_make_node(void)
+{
+	static bool made;
+	int major;
+
+	if (made || sns_level < 2) {
+		return;
+	}
+	made = true;
+	major = cdevsw_add(-1, &qr_cdevsw);
+	say("adsp: QRTR: /dev/hakios-qrtr %s\n", major >= 0 &&
+	    devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "hakios-qrtr") != NULL ? "made" : "CANNOT BE MADE");
+}
+
 static void qrtr_received(const uint8_t *p, uint32_t len);
 
 static void
@@ -1161,10 +1372,12 @@ glink_poll_once(void)
 					rpc_intent(5, pair[1], pair[0]);
 					lck_mtx_unlock(&rpc_lock);
 				}
-				if (msg.param1 == qr.id && qr.remote_open && pair[0] >= 64 && qr.intent_size == 0) {
-					qr.intent_size = pair[0];
-					qr.intent_id = pair[1];
-					say("adsp: QRTR: the DSP offers an intent of %u bytes on IPCRTR\n", pair[0]);
+				if (msg.param1 == qr.id && qr.remote_open) {
+					qr_intent(5, pair[1], pair[0]);
+					if (!qr.said_intent) {
+						qr.said_intent = true;
+						say("adsp: QRTR: the DSP offers an intent of %u bytes on IPCRTR\n", pair[0]);
+					}
 				}
 				if (msg.param1 == apr.id && apr.remote_open && pair[0] >= 64 && apr.intent_size == 0) {
 					apr.intent_size = pair[0];
@@ -1190,13 +1403,25 @@ glink_poll_once(void)
 				return;
 			}
 			if (msg.param1 == qr.id && qr.remote_open) {
-				struct glink_msg done = { .cmd = 14, .param1 = qr.id, .param2 = msg.param2 };
-				uint32_t n = MIN(sizes[0], (uint32_t)sizeof(data));
+				/* a QRTR packet may come in pieces (cmd 12 continues, `left' bytes still to come): put together here */
+				static uint8_t whole[QR_MSG_MAX + 64];
+				static uint32_t have_now;
+				uint32_t n;
 
-				rx_peek((tail + (uint32_t)sizeof(msg) + 8) % FIFO_SIZE, data, n);
+				if (msg.cmd == 9) {
+					have_now = 0;
+				}
+				n = MIN(sizes[0], (uint32_t)sizeof(whole) - have_now);
+				rx_peek((tail + (uint32_t)sizeof(msg) + 8) % FIFO_SIZE, whole + have_now, n);
+				have_now += n;
 				rx_advance(packet);
-				(void)tx(&done, sizeof(done));
-				qrtr_received(data, n);
+				if (sizes[1] == 0) {
+					struct glink_msg done = { .cmd = 14, .param1 = qr.id, .param2 = msg.param2 };
+
+					(void)tx(&done, sizeof(done));
+					qrtr_received(whole, have_now);
+					have_now = 0;
+				}
 			} else if (msg.param1 == rpc.id && rpc.remote_open) {
 				struct glink_msg done = { .cmd = 14, .param1 = rpc.id, .param2 = msg.param2 };
 				uint32_t n = MIN(sizes[0], (uint32_t)sizeof(data));
@@ -1219,7 +1444,8 @@ glink_poll_once(void)
 			}
 		} else if (msg.cmd == 7) {                      /* RX_INTENT_REQ: param1 its channel id, param2 the size it wants of us */
 			bool for_rpc = rpc.remote_open && msg.param1 == rpc.id && msg.param2 <= 512;
-			struct glink_msg ack = { .cmd = 8, .param1 = msg.param1, .param2 = msg.param1 == apr.id || for_rpc ? 1 : 0 };
+			bool for_qr = qr.remote_open && msg.param1 == qr.id && msg.param2 <= QR_MSG_MAX;
+			struct glink_msg ack = { .cmd = 8, .param1 = msg.param1, .param2 = msg.param1 == apr.id || for_rpc || for_qr ? 1 : 0 };
 			static uint32_t next_intent = 9;
 
 			rx_advance(sizeof(msg));
@@ -1229,6 +1455,12 @@ glink_poll_once(void)
 
 				(void)tx(&more, sizeof(more));
 				say("adsp: GLINK: the DSP asked for an intent of %u bytes: one more given (id %u)\n", msg.param2, more.id);
+			} else if (for_qr) {     /* (the sensors' big answers, ~8.9 KB: Yofuness's cam39) */
+				struct { struct glink_msg msg; uint32_t size, id; } __attribute__((packed)) more =
+				    { { 5, qr.id, 1 }, MAX(msg.param2, 4096u), 400 + qr.next_intent++ };
+
+				(void)tx(&more, sizeof(more));
+				say("adsp: QRTR: the DSP asked for an intent of %u bytes: given (id %u)\n", msg.param2, more.id);
 			} else if (for_rpc) {
 				struct { struct glink_msg msg; uint32_t size, id; } __attribute__((packed)) more =
 				    { { 5, rpc.id, 1 }, 512, next_intent++ + 300 };
@@ -1242,10 +1474,7 @@ glink_poll_once(void)
 				say("adsp: GLINK: our request for an intent is %s\n", msg.param2 ? "granted" : "REFUSED");
 			}
 			if ((msg.cmd == 6 || msg.cmd == 14) && msg.param1 == qr.id && qr.remote_open) {
-				qr.intent_busy = false;
-				if (msg.cmd == 6) {
-					qr.intent_size = 0;
-				}
+				qr_intent(msg.cmd, msg.param2, 0);
 			}
 			if ((msg.cmd == 6 || msg.cmd == 14) && msg.param1 == apr.id) {
 				apr.intent_busy = false;
@@ -1275,6 +1504,7 @@ glink_poll(void)
 {
 	glink_poll_once();
 	rpc_make_node();
+	qr_make_node();
 	rpc_step();
 }
 
@@ -1293,21 +1523,39 @@ struct qrtr_hdr {
 static bool
 qrtr_send(uint32_t type, uint32_t dst_node, uint32_t dst_port, uint32_t src_port, const void *body, uint32_t len)
 {
-	struct {
+	static struct {
 		struct glink_msg msg;
 		uint32_t chunk, left;
 		struct qrtr_hdr q;
-		uint8_t body[64];
+		uint8_t body[1024];
 	} __attribute__((packed)) packet;
 	uint32_t size = (uint32_t)sizeof(struct qrtr_hdr) + ((len + 3) & ~3u);
+	int slot = -1;
 
-	if (len > sizeof(packet.body) || qr.intent_size == 0 || qr.intent_busy || size > qr.intent_size) {
+	if (len > sizeof(packet.body)) {
+		return false;
+	}
+	for (int i = 0; i < 16; i++) {
+		if (qr.in_free[i] && qr.in_size[i] >= size) {
+			slot = i;
+			break;
+		}
+	}
+	if (slot < 0) {
+		/* none of the DSP's intents free or big enough: ask for one (it offers 128 bytes), again after ~half a second */
+		if (qr.asked_at == 0 || qr.polls - qr.asked_at > 500) {
+			struct glink_msg ask = { .cmd = 7, .param1 = qr.id, .param2 = size };
+
+			if (tx(&ask, sizeof(ask))) {
+				qr.asked_at = qr.polls ? qr.polls : 1;
+			}
+		}
 		return false;
 	}
 	memset(&packet, 0, sizeof(packet));
 	packet.msg.cmd = 9;
 	packet.msg.param1 = qr.id;
-	packet.msg.param2 = qr.intent_id;
+	packet.msg.param2 = qr.in_id[slot];
 	packet.chunk = size;
 	packet.q.version = 1;
 	packet.q.type = type;
@@ -1317,11 +1565,10 @@ qrtr_send(uint32_t type, uint32_t dst_node, uint32_t dst_port, uint32_t src_port
 	packet.q.dst_node = dst_node;
 	packet.q.dst_port = dst_port;
 	memcpy(packet.body, body, len);
-	qr.intent_busy = true;
 	if (!tx(&packet, 16 + (size_t)size)) {
-		qr.intent_busy = false;
 		return false;
 	}
+	qr.in_free[slot] = false;
 	return true;
 }
 
@@ -1343,6 +1590,12 @@ qrtr_received(const uint8_t *p, uint32_t len)
 		qr.remote_node = q.src_node;
 		say("adsp: QRTR: HELLO from node %u\n", q.src_node);
 	} else if (q.type == QRTR_NEW_SERVER) {
+		for (uint32_t i = 0; i < 32; i++) {
+			if (qr.service[i][0] == 0 || (qr.service[i][0] == w[0] && qr.service[i][1] == w[1])) {
+				memcpy(qr.service[i], w, sizeof(qr.service[i]));
+				break;
+			}
+		}
 		qr.servers++;
 		/* (service, instance, node, port) */
 		say("adsp: QRTR: SERVICE %u (instance %#x) at node %u port %u%s\n", w[0], w[1], w[2], w[3],
@@ -1350,8 +1603,15 @@ qrtr_received(const uint8_t *p, uint32_t len)
 	} else if (q.type != 1) {
 		/* control: (cmd, then service, instance, node, port for the server/lookup ones) */
 		say("adsp: QRTR: control %u from %u:%#x: %u %u %#x %u %#x\n", q.type, q.src_node, q.src_port, cmd, w[0], w[1], w[2], w[3]);
+	} else if (q.dst_port >= QR_PORT0 && q.dst_port < QR_PORT0 + QR_PORTS) {
+		qr_to_program(q.dst_port, q.src_node, q.src_port, p + sizeof(q), MIN(q.size, len - (uint32_t)sizeof(q)));
+		if (q.confirm_rx) {     /* the sender waits for this before it sends more to that port */
+			uint32_t resume[5] = { 7, QRTR_OUR_NODE, q.dst_port, 0, 0 };
+
+			qr.resumes += qrtr_send(7, q.src_node, QRTR_CTRL_PORT, QRTR_CTRL_PORT, resume, sizeof(resume)) ? 1 : 0;
+		}
 	} else {
-		say("adsp: QRTR: data from %u:%#x to port %#x, %u bytes%s\n", q.src_node, q.src_port, q.dst_port, q.size,
+		say("adsp: QRTR: data from %u:%#x to port %#x, %u bytes%s: no one's\n", q.src_node, q.src_port, q.dst_port, q.size,
 		    q.confirm_rx ? " (wants a RESUME_TX)" : "");
 	}
 }
@@ -1361,6 +1621,20 @@ qrtr_step(void)
 {
 	if (!sns_level || !qr.remote_open) {
 		return;
+	}
+	qr.polls++;
+	if (qr.lookup_sent) {
+		lck_mtx_lock(&qr_lock);
+		while (qr_out_tail != qr_out_head) {
+			struct qr_out *m = &qr_out[qr_out_tail % QR_QUEUE];
+
+			if (!qrtr_send(1, m->h.node, m->h.port, m->h.lport, m->b, m->h.length)) {
+				break;
+			}
+			qr_out_tail++;
+			qr.user_out++;
+		}
+		lck_mtx_unlock(&qr_lock);
 	}
 	if (!qr.open_sent) {
 		struct { struct glink_msg msg; char name[8]; } __attribute__((packed)) open;
