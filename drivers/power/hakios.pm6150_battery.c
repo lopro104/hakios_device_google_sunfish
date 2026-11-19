@@ -106,8 +106,8 @@ channel_of(unsigned block)
 static bool
 read_regs(unsigned address, uint8_t *bytes, unsigned count)
 {
-	static uint16_t channels[256];
-	static bool looked[256];
+	static uint16_t channels[4096];        /* (slave << 8 | peripheral: slave 0 and others, pmic_dump) */
+	static bool looked[4096];
 	unsigned block = address >> 8;
 	vm_offset_t ch;
 	uint64_t start, interval;
@@ -289,6 +289,42 @@ measure_check(void)
 	}
 }
 
+/*
+ * Boot-arg pmic_dump=1: every peripheral of the PM6150 (slave 1) and the PM6150L (slave 5), where PMIC5 keeps its
+ * regulators, said once:
+ * its type, whether it is ready (STATUS1 bit 7) and enabled (EN_CTL bit 7), and its voltage (VSET, mV). For the
+ * battery: which supplies are on that Android leaves off (research/power, 2026-11-19). Reads only.
+ */
+static void
+pmic_dump(void)
+{
+	static const unsigned slaves[2] = { 1, 5 };     /* (the regulators: the second address of each PMIC) */
+	unsigned on = 0;
+
+	for (unsigned s = 0; s < 2; s++) {
+		for (unsigned periph = 0x10; periph < 0xc0; periph++) {
+			unsigned base = (slaves[s] << 16) | (periph << 8);
+			uint8_t type, subtype, status, enable, lo, hi;
+
+			if (!read8(base + 0x04, &type) || type == 0 || type == 0xff || !read8(base + 0x05, &subtype) ||
+			    !read8(base + 0x08, &status) || !read8(base + 0x46, &enable)) {
+				continue;
+			}
+			/* PMIC5's regulators: types 0x04 (LDO, HF/FT SMPS on some), 0x1c, 0x1d, 0x21, 0x22, 0x2c (BOB) */
+			/* (all of them: the regulators are told apart by their type afterwards) */
+			lo = hi = 0;
+			read8(base + 0x40, &lo);
+			read8(base + 0x41, &hi);
+			if ((enable & 0x80) || (status & 0x80)) {
+				on++;
+			}
+			printf("pmic_dump: sid %u periph %#04x type %#04x/%#04x status %#04x enable %#04x %u mV%s\n", slaves[s], periph,
+			    type, subtype, status, enable, (unsigned)(lo | hi << 8), (enable & 0x80) || (status & 0x80) ? "  ON" : "");
+		}
+	}
+	printf("pmic_dump: %u regulators on\n", on);
+}
+
 /* The curve, between its points. */
 static unsigned
 percent_at(unsigned mv)
@@ -456,9 +492,22 @@ poll_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 		if (read8(USBIN_CMD_IL, &cmd) && (cmd & USBIN_SUSPEND)) {
 			printf("pm6150_battery: USB input was left suspended: %s\n", usb_suspend(false) ? "on again" : "COULD NOT BE TURNED ON");
 		}
+
 	}
 	poll_once();
 	measure_check();
+	{
+		/* (at 90 s: what the kernel says before about a minute does not reach the run's log) */
+		static bool dumped;
+		uint32_t dump = 0;
+		uint64_t now;
+
+		absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+		if (!dumped && now / NSEC_PER_SEC >= 90 && PE_parse_boot_argn("pmic_dump", &dump, sizeof(dump)) && dump) {
+			dumped = true;
+			pmic_dump();
+		}
+	}
 	poll_again();
 }
 

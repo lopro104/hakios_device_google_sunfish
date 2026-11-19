@@ -621,3 +621,75 @@ out:
 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
 	return error;
 }
+
+/*
+ * Boot-arg rail_release=S: S seconds after boot the votes made for the remote processors' start dropped, as Linux drops
+ * its proxy votes once a remote processor has handed over (qcom_q6v5 handover): cx and mss (the modem, TURBO 384),
+ * lcx and lmx (the audio DSP, 384) and the crypto engine's path (CE0, SN11, SN0, for the PAS calls). Held for good
+ * they kept the chip's main rail at its highest level: the battery's suspect after the memory, the audio DSP and the
+ * GPU's clock gave 170 mA of the 630 the phone drew idle (2026-11-19). A test: off by default.
+ */
+#include <kern/thread_call.h>
+#include <kern/startup.h>
+
+static thread_call_t rail_release_call;
+
+static void
+rail_release(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	static const char *const modem[2] = { "cx.lvl", "mss.lvl" }, *const dsp[2] = { "lcx.lvl", "lmx.lvl" };
+	static const uint32_t none[2] = { 0, 0 };
+	uint32_t addresses[3] = { 0, 0, 0 }, values[3];
+	int error = 0;
+
+	for (int tries = 0; tries < 20; tries++) {
+		if ((error = hakios_rpmh_arc_votes(modem, none, 2)) != EBUSY) {
+			break;
+		}
+		delay_for_interval(50, NSEC_PER_MSEC);
+	}
+	printf("rpmh: rail_release: the modem's rails (cx, mss) given back: %d\n", error);
+	for (int tries = 0; tries < 20; tries++) {
+		if ((error = hakios_rpmh_arc_votes(dsp, none, 2)) != EBUSY) {
+			break;
+		}
+		delay_for_interval(50, NSEC_PER_MSEC);
+	}
+	printf("rpmh: rail_release: the audio DSP's rails (lcx, lmx) given back: %d\n", error);
+	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+		printf("rpmh: rail_release: busy, the crypto path left as it is\n");
+		return;
+	}
+	error = rh_poisoned ? EIO : rh_map();
+	if (!error) {
+		error = rh_lookup("CE0", RH_BCM, &addresses[0]);
+	}
+	if (!error) {
+		error = rh_lookup("SN11", RH_BCM, &addresses[1]);
+	}
+	if (!error) {
+		error = rh_lookup("SN0", RH_BCM, &addresses[2]);
+	}
+	if (!error) {
+		values[0] = values[1] = values[2] = BCM_VOTE(0, 0);
+		error = rh_send(addresses, values, 3, "crypto path released");
+	}
+	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+	printf("rpmh: rail_release: the crypto engine's path given back: %d\n", error);
+}
+
+__startup_func
+static void
+rail_release_init(void)
+{
+	uint32_t seconds = 0;
+	uint64_t deadline;
+
+	if (!PE_parse_boot_argn("rail_release", &seconds, sizeof(seconds)) || seconds == 0) {
+		return;
+	}
+	rail_release_call = thread_call_allocate(rail_release, NULL);
+	clock_interval_to_deadline(seconds, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(rail_release_call, deadline);
+}
+STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, rail_release_init);
