@@ -10,6 +10,7 @@
  * votes for a busy GPU (icc-bcm-voter.c: commit, valid, 14-bit average and peak). The BCM takes the
  * highest of its levels the vote reaches. The same ACTIVE TCS sender as the L11C vote.
  */
+#include <pexpert/pexpert.h>
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/errno.h>
@@ -531,6 +532,19 @@ hakios_rpmh_ddr_vote(uint32_t vote, bool send)
 
 	if (vote == 0 || vote > 0x3fffu) {
 		return EINVAL;
+	}
+	/*
+	 * Boot-arg ddr_cap=N: no vote above N. The GPU and the audio DSP both vote the most there is (0x3fff) as they start and
+	 * leave it: the memory then runs at its top clock all the time, the battery's biggest suspect (the phone drew about
+	 * 600 mA idle, screen off or on, 2026-11-19). A test of what the memory costs and what the screen loses with less.
+	 */
+	{
+		uint32_t cap = 0;
+
+		if (PE_parse_boot_argn("ddr_cap", &cap, sizeof(cap)) && cap >= 1 && cap < vote) {
+			printf("rpmh: DDR vote %u capped at %u (ddr_cap)\n", vote, cap);
+			vote = cap;
+		}
 	}
 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
 		return EBUSY;
