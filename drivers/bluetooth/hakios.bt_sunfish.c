@@ -37,6 +37,33 @@
 #include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+
+/*
+ * Each register block mapped once: the helpers below asked ml_io_map for theirs on every call, and talk() calls them
+ * again every 3 s while the chip does not answer -- with the modem off (mpss=0) it never does, the kernel's address
+ * space for mappings ran out and io_map panicked (kmem_alloc ... failed with 3, logs/045833-run.log).
+ */
+static vm_offset_t
+bt_map(vm_offset_t pa, vm_size_t size)
+{
+	static struct { vm_offset_t pa, va; vm_size_t size; } maps[24];
+	static unsigned used;
+
+	for (unsigned i = 0; i < used; i++) {
+		if (maps[i].pa == pa && maps[i].size >= size) {
+			return maps[i].va;
+		}
+	}
+	vm_offset_t va = ml_io_map(pa, size);
+
+	if (va != 0 && used < sizeof(maps) / sizeof(maps[0])) {
+		maps[used].pa = pa;
+		maps[used].va = va;
+		maps[used].size = size;
+		used++;
+	}
+	return va;
+}
 extern void loader_log_putc(char c);
 extern kern_return_t thread_terminate(thread_t);
 extern void hakios_spmi_lock(void);
@@ -84,8 +111,8 @@ pmic_read(uint32_t sid, uint32_t addr)
 	bool done = false;
 
 	if (sp_core == 0) {
-		sp_core = ml_io_map(SP_CORE_PA, 0x2000);
-		sp_obs = ml_io_map(SP_OBS_PA, 0x10000);
+		sp_core = bt_map(SP_CORE_PA, 0x2000);
+		sp_obs = bt_map(SP_OBS_PA, 0x10000);
 	}
 	if (sp_core == 0 || sp_obs == 0) {
 		return -1;
@@ -137,7 +164,7 @@ look(void)
 		{ "I/O (PM6150 L10)", 0, 0x4900 },
 	};
 	static const char *const pins[] = { "CTS", "RTS", "TX", "RX" };
-	vm_offset_t gcc = ml_io_map(GCC_PA + 0x17000, 0x1000), vote = ml_io_map(GCC_PA + 0x52000, 0x1000);
+	vm_offset_t gcc = bt_map(GCC_PA + 0x17000, 0x1000), vote = bt_map(GCC_PA + 0x52000, 0x1000);
 	bool running = true;
 
 	if (gcc == 0 || vote == 0) {
@@ -153,7 +180,7 @@ look(void)
 	}
 	for (unsigned p = 0; p < 4; p++) {
 		/* gpio 38..41: which tile? pinctrl-sdmmagpie.c puts 34/35 in the south one; read each where it says it is */
-		vm_offset_t page = ml_io_map(TLMM_SOUTH + 0x1000ul * (38 + p), 0x1000);
+		vm_offset_t page = bt_map(TLMM_SOUTH + 0x1000ul * (38 + p), 0x1000);
 
 		if (page != 0) {
 			uint32_t cfg = rd(page), io = rd(page + 4);
@@ -173,7 +200,7 @@ look(void)
 		say("bt: the serial engine's clocks do not all run: its registers are left alone\n");
 		return;
 	}
-	vm_offset_t se = ml_io_map(UART_PA, 0x4000);
+	vm_offset_t se = bt_map(UART_PA, 0x4000);
 
 	if (se != 0) {
 		say("bt: the serial engine: GENI_FW_REVISION %#x, GENI_STATUS %#x, SE_HW_PARAM_0 %#x, protocol %u\n", rd(se + 0x68),
@@ -186,7 +213,7 @@ look(void)
 static bool
 clock_on(void)
 {
-	vm_offset_t gcc = ml_io_map(GCC_PA + 0x17000, 0x1000), vote = ml_io_map(GCC_PA + 0x52000, 0x1000);
+	vm_offset_t gcc = bt_map(GCC_PA + 0x17000, 0x1000), vote = bt_map(GCC_PA + 0x52000, 0x1000);
 	vm_offset_t rcg;
 	uint32_t m = 384, n = 15625, mask = 0xffff;
 
@@ -219,7 +246,7 @@ pins_to_uart(void)
 	static const uint32_t pull[4] = { 0, 1, 3, 0 };
 
 	for (unsigned p = 0; p < 4; p++) {
-		vm_offset_t page = ml_io_map(TLMM_SOUTH + 0x1000ul * (38 + p), 0x1000);
+		vm_offset_t page = bt_map(TLMM_SOUTH + 0x1000ul * (38 + p), 0x1000);
 
 		if (page != 0) {
 			*(volatile uint32_t *)page = 1u << 2 | pull[p];
@@ -695,7 +722,7 @@ nvm_prepare(uint8_t *nvm, uint32_t size, uint8_t baud_index)
 static void
 clock_rate(uint32_t m, uint32_t n)
 {
-	vm_offset_t gcc = ml_io_map(GCC_PA + 0x17000, 0x1000), rcg = gcc + (RCG_S3 & 0xfff);
+	vm_offset_t gcc = bt_map(GCC_PA + 0x17000, 0x1000), rcg = gcc + (RCG_S3 & 0xfff);
 
 	*(volatile uint32_t *)(rcg + 0x8) = m;
 	*(volatile uint32_t *)(rcg + 0xc) = ~(n - m) & 0xffff;
@@ -718,7 +745,7 @@ chip_up(void)
 	unsigned n;
 
 	PE_parse_boot_argn("bt_div", &divider, sizeof(divider));
-	uart = ml_io_map(UART_PA, 0x4000);
+	uart = bt_map(UART_PA, 0x4000);
 	if (uart == 0) {
 		return false;
 	}
@@ -1248,7 +1275,7 @@ bt_thread(__unused void *parameter, __unused wait_result_t result)
 	say("bt: level %u\n", level);
 	look();
 	if (level >= 2 && clock_on()) {
-		vm_offset_t se = ml_io_map(UART_PA, 0x4000);
+		vm_offset_t se = bt_map(UART_PA, 0x4000);
 
 		pins_to_uart();
 		if (se != 0) {

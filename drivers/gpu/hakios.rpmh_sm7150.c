@@ -678,12 +678,115 @@ rail_release(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	printf("rpmh: rail_release: the crypto engine's path given back: %d\n", error);
 }
 
+/*
+ * Boot-arg bcm_zero=NAME,NAME,...: at 150 s our channel's vote on those BCMs set to nothing (average and peak 0), as
+ * Linux's interconnect does at the end of boot (sync_state) with every path no driver claimed: the boot loaders' votes
+ * otherwise stay. A test, one group at a time (the system and config NoCs, the storage's path and QUP are not for it).
+ */
+static thread_call_t bcm_zero_call;
+static char bcm_zero_names[96];
+
+static void
+bcm_zero(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	char *name = bcm_zero_names, *comma;
+
+	while (name && *name) {
+		uint32_t address = 0, value = BCM_VOTE(0, 0);
+		int error;
+
+		comma = strchr(name, ',');
+		if (comma) {
+			*comma = 0;
+		}
+		if (strncmp(name, "SN", 2) == 0 || strncmp(name, "CN", 2) == 0 || strncmp(name, "QUP", 3) == 0 ||
+		    strncmp(name, "ACV", 3) == 0) {
+			printf("rpmh: bcm_zero: %s is not for this test\n", name);
+		} else if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+			printf("rpmh: bcm_zero: busy at %s\n", name);
+		} else {
+			error = rh_poisoned ? EIO : rh_map();
+			if (!error) {
+				error = rh_lookup(name, RH_BCM, &address);
+			}
+			if (!error) {
+				error = rh_send(&address, &value, 1, "bcm_zero");
+			}
+			__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+			printf("rpmh: bcm_zero: %s (%#x) to nothing: %d\n", name, address, error);
+		}
+		name = comma ? comma + 1 : NULL;
+	}
+}
+
+/* Boot-arg rpmh_list=1: the names and addresses of cmd-db's bus clock managers (BCMs), at 95 s. Reads only. */
+static thread_call_t rpmh_list_call;
+
+static void
+rpmh_list(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	char line[512];
+	size_t at = 0;
+
+	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+		printf("rpmh: rpmh_list: busy\n");
+		return;
+	}
+	if (rh_poisoned || rh_map() != 0) {
+		__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+		return;
+	}
+	for (unsigned i = 0; i < 8; ++i) {
+		uint32_t h = 8u + 16u * i;
+		unsigned slave = rh_db16(h);
+
+		if (!slave) {
+			break;
+		}
+		if (slave != RH_BCM) {
+			continue;
+		}
+		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
+		unsigned count = rh_db16(h + 6);
+
+		for (unsigned j = 0; j < count && j < 128; ++j) {
+			uint32_t e = entries + RH_DB_ENTRY * j, k[2] = { rh_read(rh_db, e), rh_read(rh_db, e + 4) };
+			char name[9];
+
+			for (unsigned b = 0; b < 8; b++) {
+				name[b] = (char)(k[b / 4] >> (8 * (b % 4)));
+			}
+			name[8] = 0;
+			at += (size_t)snprintf(line + at, sizeof(line) - at, " %s=%#x", name, rh_read(rh_db, e + 16));
+			if (at > 400) {
+				printf("rpmh: BCMs:%s\n", line);
+				at = 0;
+			}
+		}
+	}
+	if (at) {
+		printf("rpmh: BCMs:%s\n", line);
+	}
+	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+}
+
 __startup_func
 static void
 rail_release_init(void)
 {
-	uint32_t seconds = 0;
+	uint32_t seconds = 0, list = 0;
 	uint64_t deadline;
+
+	if (PE_parse_boot_arg_str("bcm_zero", bcm_zero_names, sizeof(bcm_zero_names)) && bcm_zero_names[0]) {
+		bcm_zero_call = thread_call_allocate(bcm_zero, NULL);
+		clock_interval_to_deadline(150, NSEC_PER_SEC, &deadline);
+		thread_call_enter_delayed(bcm_zero_call, deadline);
+	}
+	if (PE_parse_boot_argn("rpmh_list", &list, sizeof(list)) && list) {
+		rpmh_list_call = thread_call_allocate(rpmh_list, NULL);
+		clock_interval_to_deadline(95, NSEC_PER_SEC, &deadline);
+		thread_call_enter_delayed(rpmh_list_call, deadline);
+	}
 
 	if (!PE_parse_boot_argn("rail_release", &seconds, sizeof(seconds)) || seconds == 0) {
 		return;

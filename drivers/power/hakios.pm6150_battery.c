@@ -325,6 +325,51 @@ pmic_dump(void)
 	printf("pmic_dump: %u regulators on\n", on);
 }
 
+/*
+ * With pmic_dump=1 too: the chip's power domains (GDSCs, msm-4.14 sdmmagpie-gdsc.dtsi) -- powered (bit 31) or not --
+ * for the battery: what the boot loaders left on that Android switches off. A clock controller's registers are read
+ * only when GCC says its bus clock runs (CLK_OFF, bit 31 of the branch, clear): reading one without it can hang the bus.
+ */
+static uint32_t
+phys_read32(uint64_t pa)
+{
+	vm_offset_t page = ml_io_map((vm_offset_t)(pa & ~0x3fffULL), 0x4000);
+
+	return page != 0 ? rd(page + (pa & 0x3fffULL)) : 0xffffffffu;
+}
+
+static void
+gdsc_dump(void)
+{
+	static const struct { const char *name; uint64_t pa; uint32_t ahb; } domains[] = {
+		{ "pcie_0", 0x16b004, 0 }, { "ufs_phy", 0x177004, 0 }, { "usb30_prim", 0x10f004, 0 },
+		{ "vote audio_tbu", 0x17d030, 0 }, { "vote pcie_tbu", 0x17d03c, 0 }, { "vote tbu1", 0x17d034, 0 },
+		{ "vote tbu2", 0x17d038, 0 }, { "vote mmnoc_hf0", 0x17d040, 0 }, { "vote mmnoc_hf1", 0x17d048, 0 },
+		{ "vote mmnoc_sf", 0x17d044, 0 },
+		{ "camera bps", 0xad07004, 0xb008 }, { "camera ife_0", 0xad0a004, 0xb008 }, { "camera ife_1", 0xad0b004, 0xb008 },
+		{ "camera ipe_0", 0xad08004, 0xb008 }, { "camera ipe_1", 0xad09004, 0xb008 }, { "camera titan_top", 0xad0c1c4, 0xb008 },
+		{ "display mdss_core", 0xaf03000, 0xb00c },
+		{ "gpu cx", 0x509106c, 0 }, { "gpu gx", 0x509100c, 0 },
+		{ "video mvsc", 0xab00814, 0xb004 }, { "video mvs0", 0xab00874, 0xb004 }, { "video mvs1", 0xab008b4, 0xb004 },
+		{ "npu core", 0x9911028, 0x4d004 },
+	};
+
+	for (size_t i = 0; i < sizeof(domains) / sizeof(domains[0]); i++) {
+		if (domains[i].ahb != 0) {
+			uint32_t branch = phys_read32(0x100000 + domains[i].ahb);
+
+			if (branch == 0xffffffffu || (branch & 0x80000000u)) {
+				printf("gdsc_dump: %-20s its controller's bus clock is off (GCC %#x = %#x): not read\n", domains[i].name,
+				    domains[i].ahb, branch);
+				continue;
+			}
+		}
+		uint32_t v = phys_read32(domains[i].pa);
+
+		printf("gdsc_dump: %-20s %#010x %s\n", domains[i].name, v, (v & 0x80000000u) ? "POWERED" : "off");
+	}
+}
+
 /* The curve, between its points. */
 static unsigned
 percent_at(unsigned mv)
@@ -506,6 +551,7 @@ poll_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 		if (!dumped && now / NSEC_PER_SEC >= 90 && PE_parse_boot_argn("pmic_dump", &dump, sizeof(dump)) && dump) {
 			dumped = true;
 			pmic_dump();
+			gdsc_dump();
 		}
 	}
 	poll_again();
