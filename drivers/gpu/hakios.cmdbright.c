@@ -128,7 +128,7 @@ disp_off_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
 	static const uint32_t gated[] = { 0x200c, 0x2024, 0x201c, 0x2014, 0x2004, 0x2028, 0x202c, 0x2038 };
 	volatile uint32_t *r = (volatile uint32_t *)dsi, *mdp, *cc, *gcc;
-	uint32_t words[1];
+	uint32_t words[2];
 	bool off, sleep;
 
 	if (r == 0 || (r[DSI_CTRL / 4] & 0x5u) != 0x5u) {
@@ -142,11 +142,14 @@ disp_off_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	}
 	__asm__ volatile("dsb sy" ::: "memory");
 	delay(50000);   /* a frame in flight ends */
-	words[0] = 0x80050028u;         /* short write, DT 0x05, 0x28 */
-	off = dsi_kick(r, words, 1);
+	/* as long writes (DT 0x39, one byte), the shape the brightness command has: a 4-byte short packet through this FIFO
+	 * was acknowledged by the host but the panel stayed lit (user, 2026-11-19) */
+	words[0] = 0xC0390001u;
+	words[1] = 0xFFFFFF28u;         /* 0x28 display off */
+	off = dsi_kick(r, words, 2);
 	delay(20000);
-	words[0] = 0x80050010u;         /* 0x10 */
-	sleep = dsi_kick(r, words, 1);
+	words[1] = 0xFFFFFF10u;         /* 0x10 enter sleep */
+	sleep = dsi_kick(r, words, 2);
 	delay(120000);
 	dsi = 0;        /* no more brightness: hakios_panel_brightness says ENODEV */
 	printf("disp_off: autorefresh off; display off %s, sleep %s\n", off ? "sent" : "NOT acknowledged",
