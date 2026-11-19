@@ -64,6 +64,8 @@
 #include <sys/hakios.audio.h>
 #include <sys/conf.h>
 #include <miscfs/devfs/devfs.h>
+#include <sys/ioccom.h>
+#include <kern/locks.h>
 
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
@@ -759,10 +761,320 @@ apr_received(const uint8_t *p, uint32_t len)
 	}
 }
 
+/*
+ * fastrpc=1: the DSP's FastRPC channel ("fastrpcglink-apps-dsp", which it opens itself) for a program that attaches its
+ * processes and serves their files: /dev/hakios-fastrpc. The program does the FastRPC itself (Yofuness/ios-sunfish's
+ * phone/wifi/fastrpc.c, MIT, in userland/src/hakios-fastrpc.c); this side only carries its messages, one per write and one
+ * per read, and keeps the memory the DSP reads them from: 512 KiB of ours shown to the DSP at 0x8000_0000 through a
+ * translating bank on stream 0x1b23, the first of the ADSP's FastRPC streams (Android's adsprpc-smd compute banks
+ * 0x1b23-0x1b28). The DSP is given that address with the stream's low bits in bits 32 to 35, as the audio's 0x1b21.
+ * The messages pass through queues: GLINK is only ever touched from this driver's own thread (glink_poll).
+ */
+#define RPC_SID                 0x1b23
+#define RPC_IOVA                0x80000000ull
+#define RPC_DSP_ADDRESS         (RPC_IOVA | 3ull << 32)
+#define RPC_BUF_SIZE            0x80000u
+#define RPC_MSG_MAX             240
+#define RPC_QUEUE               32
+
+struct hakios_fastrpc_info {
+	uint64_t dsp_address;           /* where the DSP sees the buffer */
+	uint32_t size, state;           /* state: bit 0 the DSP opened its channel, bit 1 we did, bits 8.. its intents for us */
+};
+struct hakios_fastrpc_copy {
+	uint32_t offset, length;
+	uint64_t address;               /* the program's */
+};
+#define HAKIOS_FASTRPC_INFO     _IOR('F', 1, struct hakios_fastrpc_info)
+#define HAKIOS_FASTRPC_WRITE    _IOW('F', 2, struct hakios_fastrpc_copy)
+#define HAKIOS_FASTRPC_READ     _IOW('F', 3, struct hakios_fastrpc_copy)
+
+static struct {
+	bool remote_open, open_sent, opened_by_program;
+	uint16_t id;
+	uint32_t intent_id[64], intent_size[64];        /* the DSP's intents for us: its id, the size; size 0: an empty slot */
+	bool intent_free[64];                           /* free to send into (not sent into, or given back for reuse) */
+	uint32_t sent, received, dropped, refused;
+} rpc;
+static uint32_t rpc_level;
+static vm_offset_t rpc_buf;
+static struct rpc_msg { uint32_t len; uint8_t b[RPC_MSG_MAX]; } rpc_out[RPC_QUEUE], rpc_in[RPC_QUEUE];
+static uint32_t rpc_out_head, rpc_out_tail, rpc_in_head, rpc_in_tail;
+static LCK_GRP_DECLARE(rpc_group, "hakios.fastrpc");
+static LCK_MTX_DECLARE(rpc_lock, &rpc_group);
+
+static void
+rpc_cache(vm_offset_t va, uint32_t len)
+{
+	for (vm_offset_t a = va & ~(vm_offset_t)63; a < va + len; a += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (a) : "memory");
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/* A message from the DSP (the driver's thread). */
+static void
+rpc_received(const uint8_t *p, uint32_t len)
+{
+	lck_mtx_lock(&rpc_lock);
+	rpc.received++;
+	if (rpc_in_head - rpc_in_tail >= RPC_QUEUE || len > RPC_MSG_MAX) {
+		rpc.dropped++;
+	} else {
+		struct rpc_msg *m = &rpc_in[rpc_in_head % RPC_QUEUE];
+
+		m->len = len;
+		memcpy(m->b, p, len);
+		rpc_in_head++;
+		wakeup(&rpc_in_head);
+	}
+	lck_mtx_unlock(&rpc_lock);
+}
+
+/* The DSP's intents on the FastRPC channel: offered (5), given back for reuse (14), used up (6). */
+static void
+rpc_intent(uint32_t cmd, uint32_t id, uint32_t size)
+{
+	int empty = -1;
+
+	for (int i = 0; i < 64; i++) {
+		if (rpc.intent_size[i] != 0 && rpc.intent_id[i] == id) {
+			if (cmd == 5) {
+				rpc.intent_size[i] = size;
+				rpc.intent_free[i] = true;
+			} else if (cmd == 14) {
+				rpc.intent_free[i] = true;
+			} else {
+				rpc.intent_size[i] = 0;
+				rpc.intent_free[i] = false;
+			}
+			return;
+		}
+		if (rpc.intent_size[i] == 0 && empty < 0) {
+			empty = i;
+		}
+	}
+	if (cmd == 5 && empty >= 0 && size != 0) {
+		rpc.intent_id[empty] = id;
+		rpc.intent_size[empty] = size;
+		rpc.intent_free[empty] = true;
+	}
+}
+
+/* The driver's thread: the channel opened from here once the DSP has, then what the program wrote, into the DSP's intents. */
+static void
+rpc_step(void)
+{
+	if (!rpc_level || !rpc.remote_open) {
+		return;
+	}
+	if (!rpc.open_sent) {
+		struct { struct glink_msg msg; char name[24]; } __attribute__((packed)) open;
+		struct { struct glink_msg msg; uint32_t pairs[16]; } __attribute__((packed)) intent =
+		    { { 5, rpc.id, 8 }, { 512, 201, 512, 202, 512, 203, 512, 204, 512, 205, 512, 206, 512, 207, 512, 208 } };
+
+		memset(&open, 0, sizeof(open));
+		open.msg.cmd = 2;
+		open.msg.param1 = rpc.id;
+		open.msg.param2 = sizeof("fastrpcglink-apps-dsp");
+		memcpy(open.name, "fastrpcglink-apps-dsp", sizeof("fastrpcglink-apps-dsp"));
+		rpc.open_sent = tx(&open, sizeof(open)) && tx(&intent, sizeof(intent));
+		say("adsp: FastRPC: fastrpcglink-apps-dsp opened from here (channel %u), eight intents of 512 bytes: %s\n", rpc.id,
+		    rpc.open_sent ? "sent" : "NOT sent");
+		return;
+	}
+	lck_mtx_lock(&rpc_lock);
+	while (rpc_out_tail != rpc_out_head) {
+		struct rpc_msg *m = &rpc_out[rpc_out_tail % RPC_QUEUE];
+		struct { struct glink_msg msg; uint32_t chunk, left; uint8_t b[RPC_MSG_MAX]; } __attribute__((packed)) packet;
+		uint32_t slot = 64;
+
+		for (uint32_t i = 0; i < 64; i++) {
+			if (rpc.intent_free[i] && rpc.intent_size[i] >= m->len) {
+				slot = i;
+				break;
+			}
+		}
+		if (slot == 64) {
+			break;                          /* no intent of the DSP's free yet: the next poll */
+		}
+		packet.msg.cmd = 9;
+		packet.msg.param1 = rpc.id;
+		packet.msg.param2 = rpc.intent_id[slot];
+		packet.chunk = m->len;
+		packet.left = 0;
+		memcpy(packet.b, m->b, m->len);
+		if (!tx(&packet, 16 + (size_t)m->len)) {
+			break;
+		}
+		rpc.intent_free[slot] = false;
+		rpc.sent++;
+		rpc_out_tail++;
+		wakeup(&rpc_out_tail);
+	}
+	lck_mtx_unlock(&rpc_lock);
+}
+
+static int
+rpc_dev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	int error = 0;
+
+	lck_mtx_lock(&rpc_lock);
+	if (rpc.opened_by_program) {
+		error = EBUSY;
+	} else {
+		rpc.opened_by_program = true;
+		rpc_in_tail = rpc_in_head;              /* nothing old */
+	}
+	lck_mtx_unlock(&rpc_lock);
+	return error;
+}
+
+static int
+rpc_dev_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	lck_mtx_lock(&rpc_lock);
+	rpc.opened_by_program = false;
+	lck_mtx_unlock(&rpc_lock);
+	return 0;
+}
+
+static int
+rpc_dev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	struct rpc_msg m;
+	int error;
+
+	if (!rpc.remote_open || !rpc.open_sent) {
+		return ENOTCONN;
+	}
+	if (uio_resid(uio) <= 0 || uio_resid(uio) > RPC_MSG_MAX) {
+		return EINVAL;
+	}
+	m.len = (uint32_t)uio_resid(uio);
+	if ((error = uiomove((caddr_t)m.b, (int)m.len, uio)) != 0) {
+		return error;
+	}
+	lck_mtx_lock(&rpc_lock);
+	if (rpc_out_head - rpc_out_tail >= RPC_QUEUE) {
+		rpc.refused++;
+		error = EAGAIN;
+	} else {
+		rpc_out[rpc_out_head % RPC_QUEUE] = m;
+		rpc_out_head++;
+	}
+	lck_mtx_unlock(&rpc_lock);
+	return error;
+}
+
+/* One message per read; waits up to a second for one (EAGAIN then, or at once with O_NONBLOCK). */
+static int
+rpc_dev_read(__unused dev_t dev, struct uio *uio, int ioflag)
+{
+	struct rpc_msg m;
+	struct timespec second = { 1, 0 };
+	int error = 0;
+
+	lck_mtx_lock(&rpc_lock);
+	while (rpc_in_tail == rpc_in_head && error == 0) {
+		if (ioflag & IO_NDELAY) {
+			error = EAGAIN;
+			break;
+		}
+		error = msleep(&rpc_in_head, (lck_mtx_t *)&rpc_lock, PCATCH, "fastrpc", &second);
+		if (error == EWOULDBLOCK) {
+			error = EAGAIN;
+		}
+	}
+	if (error == 0) {
+		m = rpc_in[rpc_in_tail % RPC_QUEUE];
+		rpc_in_tail++;
+	}
+	lck_mtx_unlock(&rpc_lock);
+	if (error != 0) {
+		return error;
+	}
+	return uiomove((caddr_t)m.b, (int)MIN(m.len, (uint32_t)uio_resid(uio)), uio);
+}
+
+static int
+rpc_dev_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
+{
+	if (cmd == HAKIOS_FASTRPC_INFO) {
+		struct hakios_fastrpc_info *info = (struct hakios_fastrpc_info *)data;
+		uint32_t intents = 0;
+
+		if (rpc_buf == 0) {
+			vm_offset_t memory = 0;
+
+			if (kmem_alloc_contig(kernel_map, &memory, RPC_BUF_SIZE, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO,
+			    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+				return ENOMEM;
+			}
+			if (!hakios_sm7150_smmu_pages(RPC_SID, RPC_IOVA, kvtophys(memory), RPC_BUF_SIZE >> 12)) {
+				kmem_free(kernel_map, memory, RPC_BUF_SIZE);
+				return ENXIO;
+			}
+			rpc_buf = memory;
+			say("adsp: FastRPC: %u KiB at pa %#llx shown to the DSP as %#llx (stream %#x)\n", RPC_BUF_SIZE >> 10,
+			    kvtophys(memory), RPC_DSP_ADDRESS, RPC_SID);
+		}
+		for (uint32_t i = 0; i < 64; i++) {
+			intents += rpc.intent_size[i] != 0;
+		}
+		info->dsp_address = RPC_DSP_ADDRESS;
+		info->size = RPC_BUF_SIZE;
+		info->state = (rpc.remote_open ? 1u : 0u) | (rpc.open_sent ? 2u : 0u) | intents << 8;
+		return 0;
+	}
+	if (cmd == HAKIOS_FASTRPC_WRITE || cmd == HAKIOS_FASTRPC_READ) {
+		struct hakios_fastrpc_copy *c = (struct hakios_fastrpc_copy *)data;
+		int error;
+
+		if (rpc_buf == 0) {
+			return ENXIO;
+		}
+		if (c->length == 0 || c->offset >= RPC_BUF_SIZE || c->length > RPC_BUF_SIZE - c->offset) {
+			return EINVAL;
+		}
+		if (cmd == HAKIOS_FASTRPC_WRITE) {
+			error = copyin((user_addr_t)c->address, (void *)(rpc_buf + c->offset), c->length);
+			rpc_cache(rpc_buf + c->offset, c->length);
+		} else {
+			rpc_cache(rpc_buf + c->offset, c->length);
+			error = copyout((const void *)(rpc_buf + c->offset), (user_addr_t)c->address, c->length);
+		}
+		return error;
+	}
+	return ENOTTY;
+}
+
+static const struct cdevsw rpc_cdevsw = {
+	.d_open = rpc_dev_open, .d_close = rpc_dev_close, .d_read = rpc_dev_read, .d_write = rpc_dev_write,
+	.d_ioctl = rpc_dev_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
+	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+};
+
+static void
+rpc_make_node(void)
+{
+	static bool made;
+	int major;
+
+	if (made || !rpc_level) {
+		return;
+	}
+	made = true;
+	major = cdevsw_add(-1, &rpc_cdevsw);
+	say("adsp: FastRPC: /dev/hakios-fastrpc %s\n", major >= 0 &&
+	    devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "hakios-fastrpc") != NULL ? "made" : "CANNOT BE MADE");
+}
+
 static void qrtr_received(const uint8_t *p, uint32_t len);
 
 static void
-glink_poll(void)
+glink_poll_once(void)
 {
 	static uint8_t data[512];
 
@@ -805,6 +1117,10 @@ glink_poll(void)
 				qr.remote_open = true;
 				qr.id = msg.param1;
 			}
+			if (strcmp(name, "fastrpcglink-apps-dsp") == 0) {
+				rpc.remote_open = true;
+				rpc.id = msg.param1;
+			}
 		} else if (msg.cmd == 4) {                      /* OPEN_ACK: param1 our id */
 			rx_advance(sizeof(msg));
 			if (apr.open_sent && msg.param1 == apr.id) {
@@ -814,7 +1130,7 @@ glink_poll(void)
 		} else if (msg.cmd == 5) {                      /* INTENT: param1 its channel id, param2 how many; then (size, id) each */
 			uint32_t count = msg.param2, packet = ((uint32_t)sizeof(msg) + count * 8 + 7) & ~7u;
 
-			if (count > 32) {
+			if (count > 64) {
 				say("adsp: GLINK: %u intents at once: the queue is out of step; dropped\n", count);
 				rx_advance(have);
 				return;
@@ -826,6 +1142,11 @@ glink_poll(void)
 				uint32_t pair[2];
 
 				rx_peek((tail + (uint32_t)sizeof(msg) + i * 8) % FIFO_SIZE, pair, sizeof(pair));
+				if (msg.param1 == rpc.id && rpc.remote_open) {
+					lck_mtx_lock(&rpc_lock);
+					rpc_intent(5, pair[1], pair[0]);
+					lck_mtx_unlock(&rpc_lock);
+				}
 				if (msg.param1 == qr.id && qr.remote_open && pair[0] >= 64 && qr.intent_size == 0) {
 					qr.intent_size = pair[0];
 					qr.intent_id = pair[1];
@@ -862,6 +1183,14 @@ glink_poll(void)
 				rx_advance(packet);
 				(void)tx(&done, sizeof(done));
 				qrtr_received(data, n);
+			} else if (msg.param1 == rpc.id && rpc.remote_open) {
+				struct glink_msg done = { .cmd = 14, .param1 = rpc.id, .param2 = msg.param2 };
+				uint32_t n = MIN(sizes[0], (uint32_t)sizeof(data));
+
+				rx_peek((tail + (uint32_t)sizeof(msg) + 8) % FIFO_SIZE, data, n);
+				rx_advance(packet);
+				(void)tx(&done, sizeof(done));
+				rpc_received(data, n);
 			} else if (msg.param1 == apr.id && apr.remote_open) {
 				struct glink_msg done = { .cmd = 14, .param1 = apr.id, .param2 = msg.param2 };    /* RX_DONE, the intent kept */
 				uint32_t n = MIN(sizes[0], (uint32_t)sizeof(data));
@@ -875,7 +1204,8 @@ glink_poll(void)
 				say("adsp: GLINK: %u bytes of data on its channel %u: not ours, let go\n", sizes[0], msg.param1);
 			}
 		} else if (msg.cmd == 7) {                      /* RX_INTENT_REQ: param1 its channel id, param2 the size it wants of us */
-			struct glink_msg ack = { .cmd = 8, .param1 = msg.param1, .param2 = msg.param1 == apr.id ? 1 : 0 };
+			bool for_rpc = rpc.remote_open && msg.param1 == rpc.id && msg.param2 <= 512;
+			struct glink_msg ack = { .cmd = 8, .param1 = msg.param1, .param2 = msg.param1 == apr.id || for_rpc ? 1 : 0 };
 			static uint32_t next_intent = 9;
 
 			rx_advance(sizeof(msg));
@@ -885,6 +1215,11 @@ glink_poll(void)
 
 				(void)tx(&more, sizeof(more));
 				say("adsp: GLINK: the DSP asked for an intent of %u bytes: one more given (id %u)\n", msg.param2, more.id);
+			} else if (for_rpc) {
+				struct { struct glink_msg msg; uint32_t size, id; } __attribute__((packed)) more =
+				    { { 5, rpc.id, 1 }, 512, next_intent++ + 300 };
+
+				(void)tx(&more, sizeof(more));
 			}
 			(void)tx(&ack, sizeof(ack));
 		} else if (msg.cmd == 6 || msg.cmd == 14 || msg.cmd == 8 || msg.cmd == 15 || msg.cmd == 13 || msg.cmd == 3 || msg.cmd == 11) {
@@ -901,6 +1236,11 @@ glink_poll(void)
 			if ((msg.cmd == 6 || msg.cmd == 14) && msg.param1 == apr.id) {
 				apr.intent_busy = false;
 			}
+			if ((msg.cmd == 6 || msg.cmd == 14) && rpc.remote_open && msg.param1 == rpc.id) {
+				lck_mtx_lock(&rpc_lock);
+				rpc_intent(msg.cmd, msg.param2, 0);
+				lck_mtx_unlock(&rpc_lock);
+			}
 			if (msg.cmd == 6 && msg.param1 == apr.id) {     /* done WITHOUT reuse: that intent is gone, the next offer is taken */
 				apr.intent_size = 0;
 				apr.intent_asked = false;
@@ -915,6 +1255,15 @@ glink_poll(void)
 }
 
 /* Our half of apr_audio_svc, one thing a pass; then the two questions. */
+/* Every poll also moves the FastRPC queues (fastrpc=1). */
+static void
+glink_poll(void)
+{
+	glink_poll_once();
+	rpc_make_node();
+	rpc_step();
+}
+
 /* ---- QRTR on IPCRTR (sns=1) ---- */
 
 struct qrtr_hdr {
@@ -2142,6 +2491,7 @@ adsp_thread(__unused void *parameter, __unused wait_result_t result)
 	PE_parse_boot_argn("adsp_watch", &watch, sizeof(watch));
 	PE_parse_boot_argn("adsp_keep", &keep, sizeof(keep));
 	PE_parse_boot_argn("sns", &sns_level, sizeof(sns_level));
+	PE_parse_boot_argn("fastrpc", &rpc_level, sizeof(rpc_level));
 	sleep_ms(delay * 1000);
 	say("adsp: the audio DSP of the SM7150, steps 1 to %u\n", steps);
 	if (step_look() && steps >= 2 && step_ours() && steps >= 3 && step_start() && steps >= 4) {
