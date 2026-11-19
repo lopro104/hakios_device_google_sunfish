@@ -17,6 +17,7 @@
 
 #define SLIDER_MAX      1024
 
+#include <pexpert/pexpert.h>
 extern "C" int hakios_panel_brightness(int level);
 extern "C" bool hakios_panel_follows_power(void);
 extern "C" void HakiosBacklightStart(int level);
@@ -115,6 +116,39 @@ AppleARMBacklight::setProperties(OSObject * properties)
 	return kIOReturnSuccess;
 }
 
+/*
+ * For Settings' native Auto-Brightness switch: MobileGestalt's "ambient-light-sensor" is whether an IOService with
+ * PrimaryUsagePage 0xff00 and PrimaryUsage 4 exists (Evsio0n/instantnoodle-xnu, 20F66). A plain service, not a HID one:
+ * CoreBrightness, which takes down backboardd on a light sensor of ours, looks only at HID services. The light itself
+ * and the curve: hakios.cmdbright.c (with boot-arg sns=2, the sensors).
+ */
+class HakiosLightSensor : public IOService
+{
+	OSDeclareDefaultStructors(HakiosLightSensor);
+};
+
+OSDefineMetaClassAndStructors(HakiosLightSensor, IOService);
+
+static void
+light_sensor_publish(IOService * platform)
+{
+	HakiosLightSensor * sensor = OSTypeAlloc(HakiosLightSensor);
+	uint32_t sns = 0;
+
+	if (!PE_parse_boot_argn("sns", &sns, sizeof(sns)) || sns < 2 || sensor == NULL || !sensor->init()) {
+		OSSafeReleaseNULL(sensor);
+		return;
+	}
+	sensor->setProperty("PrimaryUsagePage", 0xff00ULL, 32);
+	sensor->setProperty("PrimaryUsage", 4ULL, 32);
+	sensor->setName("als");
+	if (sensor->attach(platform)) {
+		sensor->registerService();
+		IOLog("cmdbright: light sensor service published: Settings' Auto-Brightness switch\n");
+	}
+	OSSafeReleaseNULL(sensor);
+}
+
 void
 HakiosBacklightStart(int level)
 {
@@ -134,5 +168,6 @@ HakiosBacklightStart(int level)
 		light->registerService();
 		IOLog("cmdbright: AppleARMBacklight published: the brightness slider\n");
 	}
+	light_sensor_publish(platform);
 	OSSafeReleaseNULL(light);
 }

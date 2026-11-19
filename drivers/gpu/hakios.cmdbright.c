@@ -83,8 +83,26 @@ dsi_kick(volatile uint32_t *r, const uint32_t *words, unsigned n)
 	return done;
 }
 
+static int panel_send(int level);
+static int level_ios = -1;              /* what iOS asked for last (the slider), whoever drives the panel */
+static bool auto_drives(void);
+static void auto_goal_now(void);
+
+/* iOS's brightness: the panel's level, or with Auto-Brightness driving it, the slider that scales the curve. */
 int
 hakios_panel_brightness(int level)
+{
+	level = level < LEVEL_MIN ? LEVEL_MIN : level > LEVEL_MAX ? LEVEL_MAX : level;
+	level_ios = level;
+	if (auto_drives()) {
+		auto_goal_now();
+		return 0;
+	}
+	return panel_send(level);
+}
+
+static int
+panel_send(int level)
 {
 	volatile uint32_t *r = (volatile uint32_t *)dsi;
 	uint32_t ctrl, words[2];
@@ -189,7 +207,10 @@ panel_power(uint64_t state)
 	lck_mtx_unlock(&cmdbright_lock);
 	printf("cmdbright: panel on (sleep out %s, display on %s)\n", a ? "sent" : "NOT acked", b ? "sent" : "NOT acked");
 	if (level_now > 0) {
-		(void)hakios_panel_brightness(level_now);
+		(void)panel_send(level_now);
+		if (auto_drives()) {
+			auto_goal_now();        /* the light may have changed while it slept */
+		}
 	}
 	return 0;
 }
@@ -265,6 +286,197 @@ disp_off_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	lck_mtx_unlock(&cmdbright_lock);
 }
 
+/*
+ * Auto-Brightness (the way Evsio0n/instantnoodle-xnu does it on the OnePlus 8, not through CoreBrightness, which
+ * crashes on a light sensor of ours): hakios-sensors writes the light (kern.hakios.auto_lux, milli-lux, ~10 a second),
+ * SpringBoard's libhakios writes the stock switch (Settings > Accessibility > Display & Text Size > Auto-Brightness,
+ * kern.hakios.auto_enabled). While both are there the panel follows a curve of the light: smoothed over 250 ms, a new
+ * goal only after it has held for 1.5 s (or at once when the slider moves), reached in steps of at most 8 every 20 ms.
+ * The slider scales the curve (middle, level 226: as is; ends: about x2 and /2). Not while the panel sleeps.
+ */
+static const struct { uint32_t lux, level; } auto_curve[] = {
+	{ 0, 8 }, { 5, 30 }, { 20, 80 }, { 50, 150 }, { 100, 220 }, { 300, 380 }, { 1000, 600 }, { 3000, 850 }, { 10000, 1023 },
+};
+#define AUTO_SLIDER_MID         226
+static int auto_enabled;                /* the stock switch, from SpringBoard */
+static uint64_t auto_lux_at;            /* when the last light came (mach time): stale after 5 s */
+static uint32_t auto_lux_f;             /* smoothed, milli-lux */
+static int auto_goal = -1, auto_cand = -1;
+static uint64_t auto_cand_at;
+static thread_call_t auto_call;
+static bool auto_ramping;
+
+static uint64_t
+auto_ms(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns / 1000000;
+}
+
+static bool
+auto_drives(void)
+{
+	return auto_enabled && auto_lux_at != 0 && auto_ms() - auto_lux_at < 5000;
+}
+
+static uint32_t
+isqrt(uint32_t v)
+{
+	uint32_t r = 0;
+
+	for (uint32_t b = 1u << 30; b != 0; b >>= 2) {
+		if (v >= r + b) {
+			v -= r + b;
+			r = (r >> 1) + b;
+		} else {
+			r >>= 1;
+		}
+	}
+	return r;
+}
+
+static int
+adiff(int a, int b)
+{
+	return a > b ? a - b : b - a;
+}
+
+static int
+auto_level_for(uint32_t mlux)
+{
+	uint32_t lux = mlux / 1000, n = sizeof(auto_curve) / sizeof(auto_curve[0]), base = auto_curve[n - 1].level;
+	int slider = level_ios > 0 ? level_ios : AUTO_SLIDER_MID, level;
+
+	for (uint32_t i = 1; i < n; i++) {
+		if (lux < auto_curve[i].lux) {
+			base = auto_curve[i - 1].level + (auto_curve[i].level - auto_curve[i - 1].level) * (lux - auto_curve[i - 1].lux) /
+			    (auto_curve[i].lux - auto_curve[i - 1].lux);
+			break;
+		}
+	}
+	/* x sqrt(slider / middle): the slider's level is itself already a curve of its position */
+	level = (int)(base * isqrt((uint32_t)slider * 1024 / AUTO_SLIDER_MID) / 32);
+	return level < LEVEL_MIN ? LEVEL_MIN : level > LEVEL_MAX ? LEVEL_MAX : level;
+}
+
+static void
+auto_ramp(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	uint64_t deadline;
+	int now, step;
+
+	lck_mtx_lock(&cmdbright_lock);
+	now = level_now;
+	lck_mtx_unlock(&cmdbright_lock);
+	if (!auto_drives() || panel_asleep || auto_goal < 0 || now < 0 || now == auto_goal) {
+		auto_ramping = false;
+		return;
+	}
+	step = auto_goal - now;
+	step = step > 8 ? 8 : step < -8 ? -8 : step;
+	(void)panel_send(now + step);
+	clock_interval_to_deadline(20, NSEC_PER_MSEC, &deadline);
+	thread_call_enter_delayed(auto_call, deadline);
+}
+
+static void
+auto_start_ramp(void)
+{
+	if (!auto_ramping && auto_call != NULL) {
+		auto_ramping = true;
+		thread_call_enter(auto_call);
+	}
+}
+
+/* The slider moved (or the switch came on): the goal at once. */
+static void
+auto_goal_now(void)
+{
+	if (auto_lux_at == 0) {
+		return;
+	}
+	auto_goal = auto_cand = auto_level_for(auto_lux_f);
+	auto_start_ramp();
+}
+
+static void
+auto_light(uint32_t mlux)
+{
+	uint64_t now = auto_ms();
+	int cand;
+
+	/* 250 ms smoothing: each new reading moves the average by dt / 250 of the way (dt at most 250 ms) */
+	if (auto_lux_at == 0 || now - auto_lux_at > 5000) {
+		auto_lux_f = mlux;
+	} else {
+		uint64_t dt = now - auto_lux_at > 250 ? 250 : now - auto_lux_at;
+
+		auto_lux_f = (uint32_t)(((uint64_t)auto_lux_f * (250 - dt) + (uint64_t)mlux * dt) / 250);
+	}
+	auto_lux_at = now;
+	if (!auto_enabled) {
+		return;
+	}
+	cand = auto_level_for(auto_lux_f);
+	if (auto_goal < 0) {
+		auto_goal = auto_cand = cand;
+		auto_start_ramp();
+		return;
+	}
+	/* a new goal only when it differs by more than 10 % (8 at least) and has held for 1.5 s */
+	if (adiff(cand, auto_goal) <= (auto_goal / 10 > 8 ? auto_goal / 10 : 8)) {
+		auto_cand = auto_goal;
+		return;
+	}
+	if (adiff(cand, auto_cand) > (auto_cand / 10 > 8 ? auto_cand / 10 : 8)) {
+		auto_cand = cand;
+		auto_cand_at = now;
+	} else if (now - auto_cand_at >= 1500) {
+		auto_goal = cand;
+		auto_start_ramp();
+	}
+}
+
+static int
+sysctl_auto_lux(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int value = (int)auto_lux_f, error = sysctl_handle_int(oidp, &value, 0, req);
+
+	if (error != 0 || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+	auto_light(value < 0 ? 0 : (uint32_t)value);
+	return 0;
+}
+
+static int
+sysctl_auto_enabled(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int value = auto_enabled, error = sysctl_handle_int(oidp, &value, 0, req);
+
+	if (error != 0 || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+	if ((value != 0) != (auto_enabled != 0)) {
+		auto_enabled = value != 0;
+		printf("cmdbright: Auto-Brightness %s\n", auto_enabled ? "on" : "off");
+		if (auto_enabled) {
+			auto_goal_now();
+		} else if (level_ios > 0) {
+			(void)panel_send(level_ios);    /* back to the slider */
+		}
+	}
+	return 0;
+}
+
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_PROC(_kern_hakios, OID_AUTO, auto_lux, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
+    sysctl_auto_lux, "I", "the light, milli-lux (hakios-sensors writes it)");
+SYSCTL_PROC(_kern_hakios, OID_AUTO, auto_enabled, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, NULL, 0,
+    sysctl_auto_enabled, "I", "the stock Auto-Brightness switch (SpringBoard's libhakios writes it)");
+
 static int
 sysctl_panel_brightness(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
 {
@@ -283,6 +495,7 @@ SYSCTL_PROC(_kern_hakios, OID_AUTO, panel_brightness, CTLTYPE_INT | CTLFLAG_RW |
 static void
 start_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
+	auto_call = thread_call_allocate(auto_ramp, NULL);
 	dsi = ml_io_map(DSI0_BASE, 0x1000);
 	if (dsi == 0) {
 		printf("cmdbright: could not map DSI0\n");
