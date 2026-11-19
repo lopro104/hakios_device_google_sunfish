@@ -28,6 +28,7 @@
 #include <pexpert/pexpert.h>
 #include <sys/hakios.thermal_sensors.h>
 #include <sys/sysctl.h>
+#include <sys/hakios.input.h>
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -243,8 +244,114 @@ gov_hottest(uint32_t d, int *hottest, const char **name)
  * its top row at once (a touch is not kept waiting); under 25 %, one row down a look. The temperature's limit above stays the
  * ceiling: the row written is the lower of the two.
  */
-static uint32_t gov_load_on = 1, gov_ticks;
+static uint32_t gov_load_on = 2, gov_ticks;
 static int load_row[OSM_DOMAINS], written_row[OSM_DOMAINS];
+
+/*
+ * cpu_gov=2 (the default since 2026-11-20), the way Nik300/ios-viva's governor does it on its MediaTek phone: every 20 ms
+ * (100 ms while a group idles at its lowest row) the busiest core of each group is looked at, and the group is put at the
+ * slowest row at which that core would be 50 % busy or less (its busy share scaled by the clock now / the row's clock);
+ * twice 80 % or more: the top row at once; going down only after 3 looks in a row that want lower. And a touch (the touch
+ * screen's driver, hakios_cpufreq_boost) or the first frame after a pause (the framebuffer) put both groups at their top
+ * row for a while, so the work a touch starts is not first measured at a low clock. cpu_gov=1: the rule before (60 % top,
+ * under 25 % a row down a look); cpu_gov=0: the load not looked at.
+ */
+#define GOV_FAST_MS             20
+#define GOV_TARGET              50
+#define GOV_JUMP                80
+#define GOV_DOWN_LOOKS          3
+static int gov_high[OSM_DOMAINS], gov_lower[OSM_DOMAINS];
+static uint64_t gov_boost_until;        /* mach time; 0: none */
+static uint32_t gov_boosts;
+SYSCTL_UINT(_kern_hakios, OID_AUTO, cpu_boosts, CTLFLAG_RD | CTLFLAG_LOCKED, &gov_boosts, 0, "touch and frame boosts of the cores");
+
+void hakios_cpufreq_boost(uint32_t ms);
+
+/* Both groups at their top row for `ms' (a touch: 250; a frame after a pause: less). Any context; cheap when one runs. */
+void
+hakios_cpufreq_boost(uint32_t ms)
+{
+	uint64_t until;
+
+	if (gov_load_on != 2 || gov_call == NULL) {
+		return;
+	}
+	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &until);
+	if (until <= gov_boost_until) {
+		return;
+	}
+	if (gov_boost_until < mach_absolute_time()) {
+		gov_boosts++;
+		gov_boost_until = until;
+		thread_call_cancel(gov_call);           /* a 100 ms idle look may be pending: look now */
+		thread_call_enter(gov_call);
+	} else {
+		gov_boost_until = until;
+	}
+}
+
+/* A frame presented (MiniIOMobileFramebuffer): the first after 200 ms without one starts something (a scroll, an
+ * animation): 100 ms at the top. Frames in a row do nothing more (their load keeps the clock up by itself). */
+extern void (*hakios_frame_hook)(void);
+extern void (*hakios_touch_hook)(uint32_t type);
+static uint64_t gov_last_frame;
+
+/* a touch going down or moving (drivers/input/hakios.input.c): 250 ms at the top */
+static void
+gov_touch(uint32_t type)
+{
+	if (type != HAKIOS_TOUCH_UP) {
+		hakios_cpufreq_boost(250);
+	}
+}
+
+static void
+gov_frame(void)
+{
+	uint64_t now = mach_absolute_time(), pause;
+
+	clock_interval_to_absolutetime_interval(200, NSEC_PER_MSEC, &pause);
+	if (now - gov_last_frame > pause) {
+		hakios_cpufreq_boost(100);
+	}
+	gov_last_frame = now;
+}
+
+/* The row the load wants (cpu_gov=2), from the busiest core's share at the row it ran at. */
+static int
+gov_row_for(uint32_t d, int busy)
+{
+	uint64_t now_khz = row_khz[d][written_row[d]];
+	int top = top_row_of[d], want = load_row[d], need = top;
+
+	if (busy >= GOV_JUMP) {
+		if (++gov_high[d] >= 2) {
+			gov_lower[d] = 0;
+			return top;
+		}
+	} else {
+		gov_high[d] = 0;
+	}
+	for (int r = 0; r <= top; r++) {
+		if ((uint64_t)busy * now_khz <= (uint64_t)GOV_TARGET * row_khz[d][r]) {
+			need = r;
+			break;
+		}
+	}
+	if (need > want) {
+		gov_lower[d] = 0;
+		return need;
+	}
+	if (need < want) {
+		if (++gov_lower[d] >= GOV_DOWN_LOOKS) {
+			gov_lower[d] = 0;
+			return need;
+		}
+		return want;
+	}
+	gov_lower[d] = 0;
+	return want;
+}
 static uint64_t gov_idle_before[GOV_MAX_CPUS], gov_then;
 
 static void
@@ -275,7 +382,22 @@ gov_look(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
 	uint64_t deadline;
 	int busiest[OSM_DOMAINS] = { 100, 100 };
-	bool thermal = ++gov_ticks % GOV_THERMAL_EVERY == 0;
+	bool boosting = gov_load_on == 2 && mach_absolute_time() < gov_boost_until, idle_floor = true;
+	uint64_t look_ms = GOV_MS, now_abs = mach_absolute_time();
+	static uint64_t thermal_next;
+	bool thermal;
+
+	/* the temperature every 500 ms whatever the look's pace */
+	if (now_abs >= thermal_next) {
+		uint64_t step;
+
+		clock_interval_to_absolutetime_interval(GOV_MS * GOV_THERMAL_EVERY, NSEC_PER_MSEC, &step);
+		thermal_next = now_abs + step;
+		thermal = true;
+	} else {
+		thermal = false;
+	}
+	gov_ticks++;
 
 	if (gov_load_on) {
 		gov_load(busiest);
@@ -287,12 +409,19 @@ gov_look(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 		if (top_row_of[d] < 0) {
 			continue;
 		}
-		if (!gov_load_on || busiest[d] >= GOV_BUSY_UP) {
+		if (!gov_load_on) {
+			load_row[d] = top_row_of[d];
+		} else if (gov_load_on == 2) {
+			load_row[d] = gov_row_for(d, busiest[d]);
+		} else if (busiest[d] >= GOV_BUSY_UP) {
 			load_row[d] = top_row_of[d];
 		} else if (busiest[d] < GOV_BUSY_DOWN && load_row[d] > 0) {
 			load_row[d]--;
 		}
-		row = MIN(load_row[d], cap[d]);
+		row = MIN(boosting ? top_row_of[d] : load_row[d], cap[d]);
+		if (load_row[d] > 0 || boosting) {
+			idle_floor = false;
+		}
 		if (row != written_row[d]) {
 			*(volatile uint32_t *)(osm_base[d] + OSM_PERF_STATE) = (uint32_t)row;
 			written_row[d] = row;
@@ -335,7 +464,10 @@ gov_look(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 			}
 		}
 	}
-	clock_interval_to_deadline(GOV_MS, NSEC_PER_MSEC, &deadline);
+	if (gov_load_on == 2 && !idle_floor) {
+		look_ms = GOV_FAST_MS;
+	}
+	clock_interval_to_deadline(look_ms, NSEC_PER_MSEC, &deadline);
 	thread_call_enter_delayed(gov_call, deadline);
 }
 
@@ -362,8 +494,13 @@ governor_start(void)
 		load_row[d] = written_row[d] = top_row_of[d] < 0 ? 0 : top_row_of[d];
 	}
 	say("cpufreq: governor: a group is slowed at %u C, and sped up again under %u C; %s\n", limit, limit - 5,
+	    gov_load_on == 2 ? "and by its load: the slowest row at which the busiest core is 50 % busy, every 20 ms; touch and frame boosts" :
 	    gov_load_on ? "and by its load: the top row at 60 % busy, a row down a tenth of a second under 25 %" : "load not looked at (cpu_gov=0)");
 	gov_call = thread_call_allocate(gov_look, NULL);
+	if (gov_load_on == 2) {
+		hakios_frame_hook = gov_frame;
+		hakios_touch_hook = gov_touch;
+	}
 	clock_interval_to_deadline(GOV_MS, NSEC_PER_MSEC, &deadline);
 	thread_call_enter_delayed(gov_call, deadline);
 }
