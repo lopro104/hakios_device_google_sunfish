@@ -18,6 +18,7 @@
 #define SLIDER_MAX      1024
 
 extern "C" int hakios_panel_brightness(int level);
+extern "C" bool hakios_panel_follows_power(void);
 extern "C" void HakiosBacklightStart(int level);
 
 static const uint16_t curve[17] = { 4, 6, 15, 30, 52, 83, 122, 169, 226, 291, 366, 451, 545, 649, 764, 888, 1023 };
@@ -103,7 +104,11 @@ AppleARMBacklight::setProperties(OSObject * properties)
 
 		if (number_of(params ? params->getObject("brightness") : d->getObject("brightness"), &value)) {
 			fValue = value > SLIDER_MAX ? SLIDER_MAX : value;
-			hakios_panel_brightness(level_of(fValue));
+			/* 0 comes just before iOS powers the display off, and again just before it powers it on: with the panel
+			 * following iOS's display power, not sent (it showed as a dim step before the screen went off) */
+			if (fValue != 0 || !hakios_panel_follows_power()) {
+				hakios_panel_brightness(level_of(fValue));
+			}
 			publish();
 		}
 	}

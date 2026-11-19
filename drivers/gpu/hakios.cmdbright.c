@@ -125,6 +125,13 @@ hakios_panel_brightness(int level)
  * All as one-byte long writes: 4-byte short packets through this FIFO were acknowledged but the panel ignored them.
  */
 extern int (*hakios_panel_power_hook)(uint64_t state);
+bool hakios_panel_follows_power(void);
+
+bool
+hakios_panel_follows_power(void)
+{
+	return hakios_panel_power_hook != NULL;
+}
 static vm_offset_t pingpongs;
 static uint32_t autorefresh_was[4];
 
