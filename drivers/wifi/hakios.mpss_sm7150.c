@@ -6333,8 +6333,25 @@ wlan_station_loop(void)
 		next_mon = nt_us() + 5000000;
 		while (!g_wlan_crashed && !g_modem_crashed && !jn.kicked) {
 			if (g_ujoin_pending) {
-				jn.kicked = true;                       /* a join asked for in Settings: leave this network, the loop's start takes it */
-				break;
+				/*
+				 * The network we are on, asked for again (same name and key): nothing to leave. Leaving it fed a loop
+				 * (2026-11-19): wifid asked twice, the second request dropped the link just made, the drop made wifid ask
+				 * again: link up and down every 3.5 s for good. Now it is told that the join is done.
+				 */
+				if (g_ujoin_new.ssid_len == jn.ssid_len && memcmp(g_ujoin_new.ssid, jn.ssid, jn.ssid_len) == 0 &&
+				    memcmp(g_ujoin_new.pmk, jn.pmk, 32) == 0) {
+					static unsigned said;
+
+					g_ujoin_pending = 0;
+					g_join_result = 1;
+					if (said++ < 5) {
+						ev("EW: a join of the network we are on: kept (no leave)");
+					}
+					ew_a80211_link_events();        /* what wifid hears after a join: SSID, BSSID, association done */
+				} else {
+					jn.kicked = true;               /* a join asked for in Settings: leave this network, the loop's start takes it */
+					break;
+				}
 			}
 			wp_poll();
 			wlan_tx_pump();
