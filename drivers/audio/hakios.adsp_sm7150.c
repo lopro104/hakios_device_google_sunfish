@@ -792,6 +792,7 @@ struct hakios_fastrpc_copy {
 static struct {
 	bool remote_open, open_sent, opened_by_program;
 	uint16_t id;
+	uint32_t asked_at, polls;                       /* our request for an intent: at which poll (0: none out) */
 	uint32_t intent_id[64], intent_size[64];        /* the DSP's intents for us: its id, the size; size 0: an empty slot */
 	bool intent_free[64];                           /* free to send into (not sent into, or given back for reuse) */
 	uint32_t sent, received, dropped, refused;
@@ -854,6 +855,9 @@ rpc_intent(uint32_t cmd, uint32_t id, uint32_t size)
 			empty = i;
 		}
 	}
+	if (cmd == 5) {
+		rpc.asked_at = 0;
+	}
 	if (cmd == 5 && empty >= 0 && size != 0) {
 		rpc.intent_id[empty] = id;
 		rpc.intent_size[empty] = size;
@@ -884,6 +888,7 @@ rpc_step(void)
 		return;
 	}
 	lck_mtx_lock(&rpc_lock);
+	rpc.polls++;
 	while (rpc_out_tail != rpc_out_head) {
 		struct rpc_msg *m = &rpc_out[rpc_out_tail % RPC_QUEUE];
 		struct { struct glink_msg msg; uint32_t chunk, left; uint8_t b[RPC_MSG_MAX]; } __attribute__((packed)) packet;
@@ -896,7 +901,16 @@ rpc_step(void)
 			}
 		}
 		if (slot == 64) {
-			break;                          /* no intent of the DSP's free yet: the next poll */
+			/* none of the DSP's intents free: ask for one (as Linux's glink does), again after ~half a second */
+			if (rpc.asked_at == 0 || rpc.polls - rpc.asked_at > 500) {
+				struct glink_msg ask = { .cmd = 7, .param1 = rpc.id, .param2 = m->len };
+
+				if (tx(&ask, sizeof(ask))) {
+					rpc.asked_at = rpc.polls;
+					say("adsp: FastRPC: an intent of %u bytes asked of the DSP\n", m->len);
+				}
+			}
+			break;
 		}
 		packet.msg.cmd = 9;
 		packet.msg.param1 = rpc.id;
@@ -1333,8 +1347,12 @@ qrtr_received(const uint8_t *p, uint32_t len)
 		/* (service, instance, node, port) */
 		say("adsp: QRTR: SERVICE %u (instance %#x) at node %u port %u%s\n", w[0], w[1], w[2], w[3],
 		    w[0] == 400 ? ": THE SENSORS' CLIENT (sns_client)" : w[0] == 64 ? ": servreg locator" : w[0] == 66 ? ": servreg notifier" : "");
+	} else if (q.type != 1) {
+		/* control: (cmd, then service, instance, node, port for the server/lookup ones) */
+		say("adsp: QRTR: control %u from %u:%#x: %u %u %#x %u %#x\n", q.type, q.src_node, q.src_port, cmd, w[0], w[1], w[2], w[3]);
 	} else {
-		say("adsp: QRTR: type %u from node %u port %u, %u bytes\n", q.type, q.src_node, q.src_port, q.size);
+		say("adsp: QRTR: data from %u:%#x to port %#x, %u bytes%s\n", q.src_node, q.src_port, q.dst_port, q.size,
+		    q.confirm_rx ? " (wants a RESUME_TX)" : "");
 	}
 }
 
@@ -1359,9 +1377,9 @@ qrtr_step(void)
 		return;
 	}
 	if (qr.remote_node != 0 && !qr.hello_sent) {
-		uint32_t hello = QRTR_HELLO;
+		uint32_t hello[5] = { QRTR_HELLO, 0, 0, 0, 0 };        /* a control packet's body is always 20 bytes (Linux's qrtr_ctrl_pkt) */
 
-		qr.hello_sent = qrtr_send(QRTR_HELLO, qr.remote_node, QRTR_CTRL_PORT, QRTR_CTRL_PORT, &hello, sizeof(hello));
+		qr.hello_sent = qrtr_send(QRTR_HELLO, qr.remote_node, QRTR_CTRL_PORT, QRTR_CTRL_PORT, hello, sizeof(hello));
 		if (qr.hello_sent) {
 			say("adsp: QRTR: our HELLO sent to node %u\n", qr.remote_node);
 		}
