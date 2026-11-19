@@ -656,6 +656,18 @@ rail_release(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 		delay_for_interval(50, NSEC_PER_MSEC);
 	}
 	printf("rpmh: rail_release: the audio DSP's rails (lcx, lmx) given back: %d\n", error);
+	/* and mx (the memories' rail), which the boot loaders may have voted on this channel and nothing here ever set */
+	{
+		uint32_t mx_none = 0;
+		uint32_t release_mx = 0;
+
+		if (PE_parse_boot_argn("rail_release_mx", &release_mx, sizeof(release_mx)) && release_mx) {
+			static const char *const mx[1] = { "mx.lvl" };
+
+			error = hakios_rpmh_arc_votes(mx, &mx_none, 1);
+			printf("rpmh: rail_release: mx given back: %d\n", error);
+		}
+	}
 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
 		printf("rpmh: rail_release: busy, the crypto path left as it is\n");
 		return;
