@@ -12,7 +12,7 @@
  *                          (a bit per channel), INT_RT_STS 0x10 (bit 0 the fault interrupt "led-fault-irq", bit 4
  *                          "all-ramp-up-done": 0xd0 while lit, in the old tree's log), LED_STATUS1/2 0x08/0x09
  *
- * Android's torch is "qcom,current-ma" 300 per channel (500 at most); at most TORCH_MA (150) per channel is written
+ * Android's torch is "qcom,current-ma" 300 per channel (500 at most); TORCH_MA (300, as Android; 150 until 2026-11-19, the old tree's most) per channel is written
  * here, the most the old tree lit (code 11). Everything else -- one function for every write, a list of the registers
  * it may touch, read-back, the arbiter's lock, the time limit, the battery and the PMIC's temperature alarm (the
  * PM6150L's, slave 4 at 0x2400), the light off at the run's end -- is the original driver's; see there.
@@ -267,9 +267,9 @@ spmi_read_once(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t
 #define ALARM_SUBTYPE           0x05            /* 0x08: the first generation, 0x09 the second */
 #define ALARM_STATUS            0x08            /* the over-temperature stage: [1:0] (first generation) or [6:4] */
 
-#define ANDROID_TORCH_MA        150             /* per channel, the most written here (Android's own torch: 300) */
+#define ANDROID_TORCH_MA        300             /* per channel: Android's own torch ("qcom,current-ma" 300) */
 #define IRES_UA                 12500           /* its resolution ("qcom,ires-ua") */
-#define ANDROID_ITARGET         11              /* round(150000 / 12500) - 1: the most ever written */
+#define ANDROID_ITARGET         23              /* 300000 / 12500 - 1 */
 #define HOTTEST_BATTERY_C       45
 
 static const uint8_t writable_regs[] = {
