@@ -317,6 +317,65 @@ gov_frame(void)
 	gov_last_frame = now;
 }
 
+/*
+ * The L3 cache's clock (on by default, l3_gov=0 to leave it; its table is said either way): the OSM's third domain at 0x18321000 (sdmmagpie.dtsi
+ * qcom,cpucc osm_l3_base; the same registers as the cores' groups, as Linux's sdm845 OSM L3 driver reads them). The firmware
+ * leaves it where it was; Linux moves it with the cores' memory latency. Here: it follows whichever group runs at the larger
+ * share of its own range (row / top row), rounded up, so the cache is never slower than the cores need.
+ */
+#define OSM_L3_PHYS             0x18321000ULL
+static vm_offset_t l3_base;
+static uint32_t l3_on = 1, l3_khz[OSM_LUT_ROWS];      /* l3_gov=0: left where the firmware put it */
+static int l3_top = -1, l3_written = -1;
+
+static void
+l3_start(void)
+{
+	uint32_t prev = 0;
+
+	PE_parse_boot_argn("l3_gov", &l3_on, sizeof(l3_on));
+	l3_base = ml_io_map(OSM_L3_PHYS, OSM_DOMAIN_SIZE);
+	if (l3_base == 0 || !(rd(l3_base, OSM_ENABLE) & 1u)) {
+		say("cpufreq: L3: not there or not enabled by the firmware: left alone\n");
+		l3_on = 0;
+		return;
+	}
+	for (uint32_t row = 0; row < OSM_LUT_ROWS; row++) {
+		uint32_t entry = rd(l3_base, OSM_FREQ_LUT + OSM_LUT_ROW * row);
+		uint32_t khz = (entry >> 30) ? XO_KHZ * (entry & 0xff) : ALTERNATE_KHZ;
+
+		if (row > 0 && khz == prev) {
+			break;
+		}
+		l3_khz[row] = khz;
+		l3_top = (int)row;
+		prev = khz;
+	}
+	say("cpufreq: L3: %d rows, %u to %u MHz; it runs at row %u now; %s\n", l3_top + 1, l3_khz[0] / 1000,
+	    l3_top >= 0 ? l3_khz[l3_top] / 1000 : 0, rd(l3_base, OSM_PERF_STATE), l3_on ? "it follows the cores (l3_gov=1)" : "left alone");
+}
+
+static void
+l3_follow(void)
+{
+	int share = 0, row;
+
+	if (!l3_on || l3_top <= 0) {
+		return;
+	}
+	for (uint32_t d = 0; d < OSM_DOMAINS; d++) {
+		if (top_row_of[d] > 0) {
+			share = MAX(share, written_row[d] * 1000 / top_row_of[d]);
+		}
+	}
+	row = (share * l3_top + 999) / 1000;
+	row = row > l3_top ? l3_top : row;
+	if (row != l3_written) {
+		*(volatile uint32_t *)(l3_base + OSM_PERF_STATE) = (uint32_t)row;
+		l3_written = row;
+	}
+}
+
 /* The row the load wants (cpu_gov=2), from the busiest core's share at the row it ran at. */
 static int
 gov_row_for(uint32_t d, int busy)
@@ -464,6 +523,7 @@ gov_look(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 			}
 		}
 	}
+	l3_follow();
 	if (gov_load_on == 2 && !idle_floor) {
 		look_ms = GOV_FAST_MS;
 	}
@@ -496,6 +556,7 @@ governor_start(void)
 	say("cpufreq: governor: a group is slowed at %u C, and sped up again under %u C; %s\n", limit, limit - 5,
 	    gov_load_on == 2 ? "and by its load: the slowest row at which the busiest core is 50 % busy, every 20 ms; touch and frame boosts" :
 	    gov_load_on ? "and by its load: the top row at 60 % busy, a row down a tenth of a second under 25 %" : "load not looked at (cpu_gov=0)");
+	l3_start();
 	gov_call = thread_call_allocate(gov_look, NULL);
 	if (gov_load_on == 2) {
 		hakios_frame_hook = gov_frame;

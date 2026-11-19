@@ -132,6 +132,7 @@ static uint32_t g_events_second;
 
 static uint32_t g_ev_dump;       /* boot-arg mpss_dump=N: the event ring every N seconds */
 static uint32_t g_ev_log;        /* boot-arg mpss_log=1: every event in the kernel's log as well */
+static uint32_t g_wifi_ps = 1;   /* boot-arg wifi_ps=0: the station's power save stays off (as before 2026-11-20) */
 
 static void
 ev(const char *format, ...)
@@ -6317,6 +6318,17 @@ wlan_station_loop(void)
 			continue;
 		}
 		wp_fault_check("join done");
+		/*
+		 * Station power save on once associated (boot-arg wifi_ps, default 1; 0: as before). The join turns it off
+		 * (WMI_STA_POWERSAVE_MODE 0 before VDEV_UP, as ath10k does), and Linux turns it back on after association
+		 * (ath10k_config_ps); this driver never did, so the radio stayed awake listening all the time.
+		 */
+		if (g_wifi_ps) {
+			uint8_t c[32];
+			uint32_t v[2] = { 0, 1 };                       /* vdev 0, WMI_STA_PS_MODE_ENABLED */
+
+			ev("EW: station power save %s", wp_wmi("power save on", c, wp_cmd(c, 0x9001, 108, v, 8)) ? "on" : "FAILED");
+		}
 		if (g_ujoin_valid && g_join_result == 0) {
 			g_join_result = 1;
 		}
@@ -7629,6 +7641,7 @@ hakios_mpss_sm7150_start(void)
 	started = true;
 	PE_parse_boot_argn("wlanprobe", &g_wlan_probe, sizeof(g_wlan_probe));
 	PE_parse_boot_argn("mpss_log", &g_ev_log, sizeof(g_ev_log));
+	PE_parse_boot_argn("wifi_ps", &g_wifi_ps, sizeof(g_wifi_ps));
 	PE_parse_boot_argn("wlan_kdhcp", &g_kdhcp, sizeof(g_kdhcp));
 	PE_parse_boot_argn("mpss_dump", &g_ev_dump, sizeof(g_ev_dump));
 	PE_parse_boot_argn("wlannoht", &swu_no_ht, sizeof(swu_no_ht));
