@@ -14,3 +14,7 @@ driver PM6150_BATTERY
 	file    bsd/dev/hakios.pm6150_battery.c
 	requires BATTERY
 	help    the battery read off the PM6150, read only, with an estimated charge (pm6150_battery=1), for hakios.battery.c
+
+driver CLOCKS_SM7150
+	file    bsd/dev/hakios.clocks_sm7150.c
+	help    the SoC's clocks for the battery: which run (clk_dump=1), and switching named ones off (clk_off=a,b*)

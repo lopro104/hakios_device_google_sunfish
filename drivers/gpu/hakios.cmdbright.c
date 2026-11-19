@@ -49,31 +49,21 @@ static thread_call_t start_call;
 
 int hakios_panel_brightness(int level);
 
-int
-hakios_panel_brightness(int level)
+/* One packet through DSI0's command FIFO: words[0] the header (data0, data1, type, flags: BIT 7 last, BIT 6 long), then the payload. */
+static bool
+dsi_kick(volatile uint32_t *r, const uint32_t *words, unsigned n)
 {
-	volatile uint32_t *r = (volatile uint32_t *)dsi;
-	uint32_t ctrl, dma;
+	uint32_t dma;
 	bool done = false;
 
-	if (dsi == 0) {
-		return ENODEV;
-	}
-	level = level < LEVEL_MIN ? LEVEL_MIN : level > LEVEL_MAX ? LEVEL_MAX : level;
-	lck_mtx_lock(&cmdbright_lock);
-	ctrl = r[DSI_CTRL / 4];
-	if ((ctrl & 0x5u) != 0x5u) {
-		lck_mtx_unlock(&cmdbright_lock);
-		printf("cmdbright: DSI0 is not on in command mode (DSI_CTRL %#x): nothing sent\n", ctrl);
-		return ENXIO;
-	}
 	r[DSI_INT_CTRL / 4] = (r[DSI_INT_CTRL / 4] & DSI_INT_KEEP) | 1u;
 	r[DSI_TPG_CTRL / 4] = 0x00030006u;
-	r[DSI_TPG_DMA_INIT / 4] = 0xC0390003u;  /* long write, DT 0x39, 3 bytes, last command */
-	r[DSI_TPG_DMA_INIT / 4] = 0xFF000051u | ((uint32_t)level & 0xffu) << 16 | ((uint32_t)level >> 8) << 8;
+	for (unsigned i = 0; i < n; i++) {
+		r[DSI_TPG_DMA_INIT / 4] = words[i];
+	}
 	dma = r[DSI_DMA_CTRL / 4];
 	r[DSI_DMA_CTRL / 4] = (dma & ~(1u << 31 | 1u << 30 | 1u << 26)) | 1u << 28;
-	r[DSI_DMA_LENGTH / 4] = 8;
+	r[DSI_DMA_LENGTH / 4] = 4 * n;
 	__asm__ volatile("dsb sy" ::: "memory");
 	r[DSI_DMA_TRIGGER / 4] = 1;
 	for (unsigned i = 0; i < 500 && !done; i++) {
@@ -89,12 +79,104 @@ hakios_panel_brightness(int level)
 	r[DSI_TPG_FIFO_RST / 4] = 0;
 	r[DSI_DMA_CTRL / 4] = dma;
 	__asm__ volatile("dsb sy" ::: "memory");
+	return done;
+}
+
+int
+hakios_panel_brightness(int level)
+{
+	volatile uint32_t *r = (volatile uint32_t *)dsi;
+	uint32_t ctrl, words[2];
+	bool done;
+
+	if (dsi == 0) {
+		return ENODEV;
+	}
+	level = level < LEVEL_MIN ? LEVEL_MIN : level > LEVEL_MAX ? LEVEL_MAX : level;
+	lck_mtx_lock(&cmdbright_lock);
+	ctrl = r[DSI_CTRL / 4];
+	if ((ctrl & 0x5u) != 0x5u) {
+		lck_mtx_unlock(&cmdbright_lock);
+		printf("cmdbright: DSI0 is not on in command mode (DSI_CTRL %#x): nothing sent\n", ctrl);
+		return ENXIO;
+	}
+	words[0] = 0xC0390003u;         /* long write, DT 0x39, 3 bytes, last command */
+	words[1] = 0xFF000051u | ((uint32_t)level & 0xffu) << 16 | ((uint32_t)level >> 8) << 8;
+	done = dsi_kick(r, words, 2);
 	if (done) {
 		level_now = level;
 	}
 	lck_mtx_unlock(&cmdbright_lock);
 	printf("cmdbright: level %d %s\n", level, done ? "sent" : "NOT acknowledged (50 ms)");
 	return done ? 0 : ETIMEDOUT;
+}
+
+/*
+ * For the battery: the display really off at disp_off_s seconds (default 110), and nothing touches DSI0 after. Only for a
+ * measurement: the screen does not come back until the next boot.
+ *   disp_off=1  the pingpongs' autorefresh off, then DCS 0x28 (display off) and 0x10 (enter sleep) to the panel
+ *   disp_off=2  and then the display clocks gated: MDP, rotator, LUT, vsync, pclk0, byte0, byte0_intf, esc0 (dispcc)
+ *   disp_off=3  and then the MDSS power domain collapsed (its GDSCR, SW_COLLAPSE)
+ */
+#define DISPCC_BASE     0x0AF00000UL
+#define GCC_DISP_AHB    0x0010B00CUL
+static uint32_t disp_off, disp_off_s = 110;
+static thread_call_t disp_off_call;
+
+static void
+disp_off_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	static const uint32_t gated[] = { 0x200c, 0x2024, 0x201c, 0x2014, 0x2004, 0x2028, 0x202c, 0x2038 };
+	volatile uint32_t *r = (volatile uint32_t *)dsi, *mdp, *cc, *gcc;
+	uint32_t words[1];
+	bool off, sleep;
+
+	if (r == 0 || (r[DSI_CTRL / 4] & 0x5u) != 0x5u) {
+		printf("disp_off: DSI0 is not on in command mode: nothing done\n");
+		return;
+	}
+	lck_mtx_lock(&cmdbright_lock);
+	mdp = (volatile uint32_t *)ml_io_map(0x0ae70000UL, 0x4000);  /* the pingpongs: MDP 0xae01000 + 0x70000 + 0x800 n */
+	for (unsigned pp = 0; mdp != NULL && pp < 4; pp++) {
+		mdp[(0x1000u + 0x800u * pp + 0x030u) / 4] = 0;
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+	delay(50000);   /* a frame in flight ends */
+	words[0] = 0x80050028u;         /* short write, DT 0x05, 0x28 */
+	off = dsi_kick(r, words, 1);
+	delay(20000);
+	words[0] = 0x80050010u;         /* 0x10 */
+	sleep = dsi_kick(r, words, 1);
+	delay(120000);
+	dsi = 0;        /* no more brightness: hakios_panel_brightness says ENODEV */
+	printf("disp_off: autorefresh off; display off %s, sleep %s\n", off ? "sent" : "NOT acknowledged",
+	    sleep ? "sent" : "NOT acknowledged");
+	if (disp_off >= 2) {
+		gcc = (volatile uint32_t *)ml_io_map(GCC_DISP_AHB & ~0x3fffUL, 0x4000);
+		cc = (volatile uint32_t *)ml_io_map(DISPCC_BASE, 0x10000);
+		if (gcc == NULL || cc == NULL || !(gcc[(GCC_DISP_AHB & 0x3fffUL) / 4] & 0x3u)) {
+			printf("disp_off: dispcc not reachable (gcc_disp_ahb %#x): no clock gated\n",
+			    gcc != NULL ? gcc[(GCC_DISP_AHB & 0x3fffUL) / 4] : 0);
+		} else {
+			for (unsigned i = 0; i < sizeof(gated) / sizeof(gated[0]); i++) {
+				uint32_t was = cc[gated[i] / 4];
+
+				cc[gated[i] / 4] = was & ~1u;
+				__asm__ volatile("dsb sy" ::: "memory");
+				delay(50);
+				printf("disp_off: dispcc %#x %#x -> %#x\n", gated[i], was, cc[gated[i] / 4]);
+			}
+			if (disp_off >= 3) {
+				uint32_t was = cc[0x3000 / 4];
+
+				cc[0x3000 / 4] = was | 1u;
+				__asm__ volatile("dsb sy" ::: "memory");
+				delay(1000);
+				printf("disp_off: MDSS GDSCR %#x -> %#x (bit 31: powered)\n", was, cc[0x3000 / 4]);
+			}
+		}
+	}
+	lck_mtx_unlock(&cmdbright_lock);
 }
 
 static int
@@ -132,6 +214,12 @@ cmdbright_init(void)
 
 	if (!PE_parse_boot_argn("panel_brightness", &first_level, sizeof(first_level)) || first_level <= 0) {
 		return;
+	}
+	if (PE_parse_boot_argn("disp_off", &disp_off, sizeof(disp_off)) && disp_off != 0) {
+		(void)PE_parse_boot_argn("disp_off_s", &disp_off_s, sizeof(disp_off_s));
+		disp_off_call = thread_call_allocate(disp_off_run, NULL);
+		clock_interval_to_deadline(disp_off_s, NSEC_PER_SEC, &deadline);
+		thread_call_enter_delayed(disp_off_call, deadline);
 	}
 	start_call = thread_call_allocate(start_run, NULL);
 	clock_interval_to_deadline(START_SECONDS, NSEC_PER_SEC, &deadline);
