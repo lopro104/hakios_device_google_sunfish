@@ -3,3 +3,7 @@
 driver TORCH_SUNFISH
 	file    bsd/dev/hakios.torch_sunfish.c
 	help    the flashlight: the flash LED module of the PM6150L, both rear channels (torch=N, as drivers/camera's TORCH)
+
+driver CAMERA_SUNFISH
+	file    bsd/dev/hakios.camera_sunfish.c
+	help    the Pixel 4a cameras, probe (cam=1 the SLG51000 PMIC, cam=2 + the rear IMX363 chip id)
