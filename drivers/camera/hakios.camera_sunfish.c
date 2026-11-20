@@ -294,6 +294,101 @@ pm6150l_gpio_high(unsigned gpio)
     }
 }
 
+
+/* ---- camcc (0xad00000), the titan power domain, and MCLK0, to clock the sensor ---- */
+#define CAMCC_PHYS          0x0ad00000UL
+#define TITAN_GDSCR_PHYS    0x0ad0c1c4UL
+#define MCLK0_CMD_RCGR      0x5004
+#define MCLK0_CFG_RCGR      0x5008
+#define MCLK0_CBCR          0x501c
+#define RCG_UPDATE          1u
+#define MCLK0_GPIO          13
+#define CAM_RESET_GPIO      43
+#define CCI0_SDA_GPIO       17
+#define CCI0_SCL_GPIO       18
+#define IMX_ADDR            0x1a            /* IMX363 7-bit slave */
+#define IMX_CHIP_ID_REG     0x0016
+static vm_offset_t camcc, titan;
+
+/* set an SLG51000 LDO to vsel (voltage code), then enable the chosen LDOs (mask of BIT(ldo-1) in reg 0x110d). */
+static void
+slg_ldo(struct i2c *b, unsigned ldo, uint8_t vsel)
+{
+    (void)i2c_write_reg16(b, SLG_ADDR, SLG_LDO_VSEL(ldo), vsel);
+}
+
+static void
+camcc_mclk0_on(void)
+{
+    volatile uint32_t *g;
+
+    /* titan top power domain on (clear SW_COLLAPSE bit0, wait bit31 powered) */
+    if (titan != 0) {
+        volatile uint32_t *t = (volatile uint32_t *)titan;
+        *t &= ~1u;
+        __asm__ volatile ("dsb sy" ::: "memory");
+        for (int i = 0; i < 100 && !(*t & 0x80000000u); i++) { delay(100); }
+    }
+    if (camcc == 0) {
+        return;
+    }
+    /* MCLK0 RCG: source XO (19.2 MHz), div 1 (no PLL), then UPDATE; branch on */
+    *(volatile uint32_t *)(camcc + MCLK0_CFG_RCGR) = (*(volatile uint32_t *)(camcc + MCLK0_CFG_RCGR) & ~0x371fu) | 0x01u;
+    *(volatile uint32_t *)(camcc + MCLK0_CMD_RCGR) |= RCG_UPDATE;
+    __asm__ volatile ("dsb sy" ::: "memory");
+    for (int i = 0; i < 100 && (*(volatile uint32_t *)(camcc + MCLK0_CMD_RCGR) & RCG_UPDATE); i++) { delay(100); }
+    *(volatile uint32_t *)(camcc + MCLK0_CBCR) |= 1u;
+    __asm__ volatile ("dsb sy" ::: "memory");
+    /* GPIO 13 to the cam_mclk function (index 1), 4 mA */
+    g = pin(MCLK0_GPIO);
+    if (g != NULL) {
+        g[TLMM_CFG / 4] = (1u << 2) | (1u << 6);     /* function 1, 4 mA, no pull */
+        __asm__ volatile ("dsb sy" ::: "memory");
+    }
+}
+
+static void
+rear_sensor_probe(struct i2c *slg)
+{
+    struct i2c cci = { CCI0_SDA_GPIO, CCI0_SCL_GPIO };
+    volatile uint32_t *rst;
+    uint8_t v[2] = { 0, 0 };
+    char line[112];
+    int r;
+
+    camcc = ml_io_map(CAMCC_PHYS, 0x10000);
+    titan = ml_io_map(TITAN_GDSCR_PHYS & ~0x3fffUL, 0x4000);
+    if (titan != 0) {
+        titan += (TITAN_GDSCR_PHYS & 0x3fffUL);
+    }
+    if (pin(CCI0_SDA_GPIO) == NULL || pin(CCI0_SCL_GPIO) == NULL || pin(CAM_RESET_GPIO) == NULL) {
+        camlog("camera: could not map the sensor GPIOs\n");
+        return;
+    }
+    /* rear rails: vdig LDO1 2.85V (0x82), vana LDO3 2.85V (0xa5), vio LDO7 1.8V (0x3c), custom1 LDO4 1.8V (0x3c) */
+    slg_ldo(slg, 1, 0x82);
+    slg_ldo(slg, 3, 0xa5);
+    slg_ldo(slg, 7, 0x3c);
+    slg_ldo(slg, 4, 0x3c);
+    (void)i2c_write_reg16(slg, SLG_ADDR, SLG_MATRIX_CONF_A, 0x4d);       /* enable LDO1,3,4,7 */
+    delay(5000);
+    camcc_mclk0_on();
+    delay(2000);
+    /* reset high */
+    rst = pin(CAM_RESET_GPIO);
+    rst[TLMM_IO / 4] = 2;                        /* output value 1 */
+    rst[TLMM_CFG / 4] = 1u << 9;                 /* output enable */
+    __asm__ volatile ("dsb sy" ::: "memory");
+    delay(10000);
+    sda_scl_init(CCI0_SDA_GPIO);
+    sda_scl_init(CCI0_SCL_GPIO);
+    delay(1000);
+    r = i2c_read_reg16(&cci, IMX_ADDR, IMX_CHIP_ID_REG, v, 2);
+    snprintf(line, sizeof(line), "camera: IMX363 chip id read %s: %02x%02x (want 0363) on CCI0 GPIO %u/%u\n",
+        r == 0 ? "ok" : "NO ACK", v[0], v[1], CCI0_SDA_GPIO, CCI0_SCL_GPIO);
+    camlog(line);
+}
+
 static void
 camera_probe(void)
 {
@@ -327,6 +422,9 @@ camera_probe(void)
     }
     camlog("camera: reading the SLG51000\n");
     r = i2c_read_reg16(&slg, SLG_ADDR, SLG_PATTERN_ID_B0, id, 3);
+    if (r == 0 && cam_level >= 2) {
+        rear_sensor_probe(&slg);
+    }
     if (r == 0) {
         char line[96];
         snprintf(line, sizeof(line), "camera: SLG51000 answered on GPIO %u/%u: pattern id %02x %02x %02x\n",
