@@ -20,6 +20,201 @@
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
 
+/* ---- inlined imx363_regs.h (build copies only the .c into bsd/dev) ---- */
+/* Generated from sm7150-mainline drivers/media/i2c/imx363.c (binned 2016x1512, 642 Mbps/lane, 24 MHz, 4-lane). */
+struct imx_reg { uint16_t addr; uint32_t val; uint8_t size; };
+static const struct imx_reg imx363_pll_642[] = {
+	{ 0x0136, 0x1800, 2 },
+	{ 0x0301, 0x5, 1 },
+	{ 0x0303, 0x2, 1 },
+	{ 0x0305, 0x4, 1 },
+	{ 0x0306, 0x6b, 2 },
+	{ 0x0309, 0xa, 1 },
+	{ 0x030b, 0x1, 1 },
+	{ 0x030d, 0x2, 1 },
+	{ 0x030e, 0xd8, 2 },
+	{ 0x0310, 0x0, 1 },
+	{ 0x0114, 0x3, 1 },
+	{ 0x0820, 0xa08, 2 },
+	{ 0x0822, 0x0, 2 },
+};
+static const struct imx_reg imx363_common[] = {
+	{ 0x31a3, 0x0, 1 },
+	{ 0x64d4, 0x1, 1 },
+	{ 0x64d5, 0xaa, 1 },
+	{ 0x64d6, 0x1, 1 },
+	{ 0x64d7, 0xa9, 1 },
+	{ 0x64d8, 0x1, 1 },
+	{ 0x64d9, 0xa5, 1 },
+	{ 0x64da, 0x1, 1 },
+	{ 0x64db, 0xa1, 1 },
+	{ 0x720a, 0x24, 1 },
+	{ 0x720b, 0x89, 1 },
+	{ 0x720c, 0x85, 1 },
+	{ 0x720d, 0xa1, 1 },
+	{ 0x720e, 0x6e, 1 },
+	{ 0x729c, 0x59, 1 },
+	{ 0x817c, 0xff, 1 },
+	{ 0x817d, 0x80, 1 },
+	{ 0x9348, 0x96, 1 },
+	{ 0x934b, 0x8c, 1 },
+	{ 0x934c, 0x82, 1 },
+	{ 0x9353, 0xaa, 1 },
+	{ 0x9354, 0xaa, 1 },
+	{ 0x30f4, 0x2, 1 },
+	{ 0x30f5, 0x80, 1 },
+	{ 0x31a5, 0x0, 1 },
+	{ 0x31a6, 0x0, 1 },
+	{ 0x560f, 0xbe, 1 },
+	{ 0x5856, 0x8, 1 },
+	{ 0x58d0, 0x10, 1 },
+	{ 0x734a, 0x1, 1 },
+	{ 0x734f, 0x2b, 1 },
+	{ 0x7441, 0x55, 1 },
+	{ 0x7914, 0x3, 1 },
+	{ 0x7928, 0x4, 1 },
+	{ 0x7929, 0x4, 1 },
+	{ 0x793f, 0x3, 1 },
+	{ 0x3038, 0x0, 1 },
+	{ 0x303a, 0x10, 2 },
+	{ 0x300d, 0x1, 1 },
+	{ 0x0350, 0x0, 1 },
+	{ 0x0204, 0x0, 2 },
+	{ 0x020e, 0x100, 2 },
+	{ 0x0210, 0x100, 2 },
+	{ 0x0212, 0x100, 2 },
+	{ 0x0214, 0x100, 2 },
+	{ 0x7bcd, 0x0, 1 },
+	{ 0x3030, 0x0, 1 },
+	{ 0x3032, 0x0, 1 },
+	{ 0x0220, 0x0, 1 },
+	{ 0x0112, 0xa0a, 2 },
+	{ 0x0342, 0x0, 2 },
+	{ 0x0136, 0x18, 1 },
+	{ 0x0137, 0x0, 1 },
+	{ 0x31a3, 0x0, 1 },
+	{ 0x64d4, 0x1, 1 },
+	{ 0x64d5, 0xaa, 1 },
+	{ 0x64d6, 0x1, 1 },
+	{ 0x64d7, 0xa9, 1 },
+	{ 0x64d8, 0x1, 1 },
+	{ 0x64d9, 0xa5, 1 },
+	{ 0x64da, 0x1, 1 },
+	{ 0x64db, 0xa1, 1 },
+	{ 0x720a, 0x24, 1 },
+	{ 0x720b, 0x89, 1 },
+	{ 0x720c, 0x85, 1 },
+	{ 0x720d, 0xa1, 1 },
+	{ 0x720e, 0x6e, 1 },
+	{ 0x729c, 0x59, 1 },
+	{ 0x817c, 0xff, 1 },
+	{ 0x817d, 0x80, 1 },
+	{ 0x9348, 0x96, 1 },
+	{ 0x934b, 0x8c, 1 },
+	{ 0x934c, 0x82, 1 },
+	{ 0x9353, 0xaa, 1 },
+	{ 0x9354, 0xaa, 1 },
+	{ 0x4073, 0x30, 1 },
+};
+static const struct imx_reg imx363_2016x1512[] = {
+	{ 0x0900, 0x0, 1 },
+	{ 0x0901, 0x11, 1 },
+	{ 0x0401, 0x1, 1 },
+	{ 0x0404, 0x40, 2 },
+	{ 0x0344, 0x0, 2 },
+	{ 0x0346, 0x0, 2 },
+	{ 0x0348, 0xfbf, 2 },
+	{ 0x034a, 0xbcf, 2 },
+	{ 0x0381, 0x1, 1 },
+	{ 0x0383, 0x1, 1 },
+	{ 0x0385, 0x1, 1 },
+	{ 0x0387, 0x1, 1 },
+	{ 0x0408, 0x0, 2 },
+	{ 0x040a, 0x0, 2 },
+	{ 0x040c, 0xfc0, 2 },
+	{ 0x040e, 0xbd0, 2 },
+	{ 0x034c, 0xfc0, 2 },
+	{ 0x034e, 0xbd0, 2 },
+	{ 0x0340, 0x0, 2 },
+	{ 0x0112, 0xa, 1 },
+	{ 0x0113, 0xa, 1 },
+	{ 0x0114, 0x3, 1 },
+	{ 0x0220, 0x0, 1 },
+	{ 0x0221, 0x11, 1 },
+	{ 0x0340, 0xc, 1 },
+	{ 0x0341, 0x62, 1 },
+	{ 0x0342, 0x22, 1 },
+	{ 0x0343, 0x80, 1 },
+	{ 0x0381, 0x1, 1 },
+	{ 0x0383, 0x1, 1 },
+	{ 0x0385, 0x1, 1 },
+	{ 0x0387, 0x1, 1 },
+	{ 0x0900, 0x1, 1 },
+	{ 0x0901, 0x22, 1 },
+	{ 0x30f4, 0x2, 1 },
+	{ 0x30f5, 0x58, 1 },
+	{ 0x30f6, 0x0, 1 },
+	{ 0x30f7, 0xc8, 1 },
+	{ 0x31a0, 0x0, 1 },
+	{ 0x31a5, 0x0, 1 },
+	{ 0x31a6, 0x0, 1 },
+	{ 0x560f, 0xff, 1 },
+	{ 0x5856, 0x8, 1 },
+	{ 0x58d0, 0x10, 1 },
+	{ 0x734a, 0x1, 1 },
+	{ 0x734f, 0x2b, 1 },
+	{ 0x7441, 0x55, 1 },
+	{ 0x7914, 0x3, 1 },
+	{ 0x7928, 0x4, 1 },
+	{ 0x7929, 0x4, 1 },
+	{ 0x793f, 0x3, 1 },
+	{ 0xbc7b, 0x18, 1 },
+	{ 0x0344, 0x0, 1 },
+	{ 0x0345, 0x0, 1 },
+	{ 0x0346, 0x0, 1 },
+	{ 0x0347, 0x0, 1 },
+	{ 0x0348, 0xf, 1 },
+	{ 0x0349, 0xbf, 1 },
+	{ 0x034a, 0xb, 1 },
+	{ 0x034b, 0xcf, 1 },
+	{ 0x034c, 0x7, 1 },
+	{ 0x034d, 0xe0, 1 },
+	{ 0x034e, 0x5, 1 },
+	{ 0x034f, 0xe8, 1 },
+	{ 0x0408, 0x0, 1 },
+	{ 0x0409, 0x0, 1 },
+	{ 0x040a, 0x0, 1 },
+	{ 0x040b, 0x0, 1 },
+	{ 0x040c, 0x7, 1 },
+	{ 0x040d, 0xe0, 1 },
+	{ 0x040e, 0x5, 1 },
+	{ 0x040f, 0xe8, 1 },
+	{ 0x0301, 0x3, 1 },
+	{ 0x0303, 0x2, 1 },
+	{ 0x0305, 0x4, 1 },
+	{ 0x0306, 0x0, 1 },
+	{ 0x0307, 0xd2, 1 },
+	{ 0x0309, 0xa, 1 },
+	{ 0x030b, 0x1, 1 },
+	{ 0x030d, 0x4, 1 },
+	{ 0x030e, 0x0, 1 },
+	{ 0x030f, 0xdf, 1 },
+	{ 0x0310, 0x1, 1 },
+	{ 0x0202, 0xc, 1 },
+	{ 0x0203, 0x52, 1 },
+	{ 0x0224, 0x6, 1 },
+	{ 0x0225, 0x29, 1 },
+	{ 0x0204, 0x0, 1 },
+	{ 0x0205, 0x0, 1 },
+	{ 0x0216, 0x0, 1 },
+	{ 0x0217, 0x0, 1 },
+	{ 0x020e, 0x1, 1 },
+	{ 0x020f, 0x0, 1 },
+	{ 0x0226, 0x1, 1 },
+	{ 0x0227, 0x0, 1 },
+};
+
+
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void delay(int usec);
 extern void loader_log_putc(char c);
@@ -317,6 +512,62 @@ slg_ldo(struct i2c *b, unsigned ldo, uint8_t vsel)
     (void)i2c_write_reg16(b, SLG_ADDR, SLG_LDO_VSEL(ldo), vsel);
 }
 
+#define MCLK0_M             0x500c
+#define MCLK0_N             0x5010
+#define MCLK0_D             0x5014
+#define RD(a)               (*(volatile uint32_t *)(a))
+#define WR(a,v)             (*(volatile uint32_t *)(a) = (v))
+/* camcc PLL2 (FABIA, offset 0x2000) to 1920 MHz; OUT_AUX (USER_CTL postdiv /4) = 480 MHz. sm7150 camcc-sm7150.c values. */
+#define PLL2                0x2000
+#define PLL2_MODE           0x00            /* [0] OUTCTRL, [2] RESET_N, [31] lock */
+#define PLL2_L_VAL          0x04
+#define PLL2_USER_CTL       0x0c
+#define PLL2_USER_CTL_U     0x10
+#define PLL2_CONFIG_CTL     0x14
+#define PLL2_CONFIG_CTL_U   0x18
+#define PLL2_STATUS         0x24
+#define PLL2_OPMODE         0x2c
+#define PLL2_FRAC           0x38
+
+static void
+camcc_pll2_up(void)
+{
+    vm_offset_t b = camcc + PLL2;
+
+    if (RD(b + PLL2_MODE) & 1u) {               /* already running (OUTCTRL) */
+        return;
+    }
+    /* clk_fabia_pll_configure: write_config skips zero values, so only the nonzero
+     * regs (L, CONFIG_CTL, CONFIG_CTL_U, USER_CTL) are written - NOT FRAC/USER_CTL_U. */
+    WR(b + PLL2_L_VAL, 0x64);
+    WR(b + PLL2_CONFIG_CTL, 0x20000954);
+    WR(b + PLL2_CONFIG_CTL_U, 0x400003d6);
+    WR(b + PLL2_USER_CTL, 0x0000030b);          /* bits[9:8]=3 -> aux postdiv /4 */
+    WR(b + PLL2_MODE, RD(b + PLL2_MODE) | 0x800000u); /* PLL_UPDATE_BYPASS (BIT23): required by configure */
+    WR(b + PLL2_MODE, RD(b + PLL2_MODE) | 4u);        /* RESET_N (set in configure) */
+    __asm__ volatile ("dsb sy" ::: "memory");
+    WR(b + PLL2_MODE, RD(b + PLL2_MODE) & ~1u); /* OUTCTRL off */
+    WR(b + PLL2_OPMODE, 0);                      /* STANDBY */
+    WR(b + PLL2_MODE, RD(b + PLL2_MODE) | 4u);   /* RESET_N */
+    __asm__ volatile ("dsb sy" ::: "memory");
+    delay(10);
+    WR(b + PLL2_OPMODE, 1);                       /* RUN */
+    __asm__ volatile ("dsb sy" ::: "memory");
+    {
+        int locked = 0;
+        char line[96];
+        for (int i = 0; i < 500; i++) {
+            if (RD(b + PLL2_MODE) & 0x80000000u) { locked = 1; break; }
+            delay(10);
+        }
+        WR(b + PLL2_USER_CTL, RD(b + PLL2_USER_CTL) | 0x7u);   /* enable outputs */
+        WR(b + PLL2_MODE, RD(b + PLL2_MODE) | 1u);             /* OUTCTRL */
+        __asm__ volatile ("dsb sy" ::: "memory");
+        snprintf(line, sizeof(line), "camera: PLL2 %s (mode %#x)\n", locked ? "LOCKED" : "did NOT lock", RD(b + PLL2_MODE));
+        camlog(line);
+    }
+}
+
 static void
 camcc_mclk0_on(void)
 {
@@ -332,19 +583,61 @@ camcc_mclk0_on(void)
     if (camcc == 0) {
         return;
     }
-    /* MCLK0 RCG: source XO (19.2 MHz), div 1 (no PLL), then UPDATE; branch on */
-    *(volatile uint32_t *)(camcc + MCLK0_CFG_RCGR) = (*(volatile uint32_t *)(camcc + MCLK0_CFG_RCGR) & ~0x371fu) | 0x01u;
-    *(volatile uint32_t *)(camcc + MCLK0_CMD_RCGR) |= RCG_UPDATE;
+    camcc_pll2_up();            /* 24 MHz MCLK needs PLL2 (the IMX363 PLL tables assume 24 MHz) */
+    /* MCLK0 RCG: source PLL2_OUT_AUX (480 MHz), M/N 1/20, div 1 -> 24 MHz; then UPDATE; branch on */
+    WR(camcc + MCLK0_M, 1);
+    WR(camcc + MCLK0_N, (uint32_t)(~(20u - 1)) & 0xff);        /* N stored as ~(N-1) */
+    WR(camcc + MCLK0_D, (uint32_t)(~(2u * 20u)) & 0xff);       /* 2*N */
+    WR(camcc + MCLK0_CFG_RCGR, (RD(camcc + MCLK0_CFG_RCGR) & ~0x371fu) | (5u << 8) | (2u << 12) | 0x00u); /* src 5 (AUX), M/N mode, div 1 */
+    WR(camcc + MCLK0_CMD_RCGR, RD(camcc + MCLK0_CMD_RCGR) | RCG_UPDATE);
     __asm__ volatile ("dsb sy" ::: "memory");
-    for (int i = 0; i < 100 && (*(volatile uint32_t *)(camcc + MCLK0_CMD_RCGR) & RCG_UPDATE); i++) { delay(100); }
-    *(volatile uint32_t *)(camcc + MCLK0_CBCR) |= 1u;
+    for (int i = 0; i < 100 && (RD(camcc + MCLK0_CMD_RCGR) & RCG_UPDATE); i++) { delay(100); }
+    WR(camcc + MCLK0_CBCR, RD(camcc + MCLK0_CBCR) | 1u);
     __asm__ volatile ("dsb sy" ::: "memory");
+    {
+        char line[112];
+        snprintf(line, sizeof(line), "camera: MCLK0 CBCR %#x (bit31=off), RCG cfg %#x\n", RD(camcc + MCLK0_CBCR), RD(camcc + MCLK0_CFG_RCGR));
+        camlog(line);
+    }
     /* GPIO 13 to the cam_mclk function (index 1), 4 mA */
     g = pin(MCLK0_GPIO);
     if (g != NULL) {
         g[TLMM_CFG / 4] = (1u << 2) | (1u << 6);     /* function 1, 4 mA, no pull */
         __asm__ volatile ("dsb sy" ::: "memory");
     }
+}
+
+static void
+imx_write_seq(struct i2c *cci, const struct imx_reg *regs, unsigned n)
+{
+    for (unsigned i = 0; i < n; i++) {
+        uint8_t sz = regs[i].size ? regs[i].size : 1;
+        /* IMX "N-byte" registers are consecutive 8-bit regs, MSB at addr, LSB last */
+        for (uint8_t b = 0; b < sz; b++) {
+            uint8_t byte = (uint8_t)((regs[i].val >> (8 * (sz - 1 - b))) & 0xff);
+            (void)i2c_write_reg16(cci, IMX_ADDR, (uint16_t)(regs[i].addr + b), byte);
+        }
+    }
+}
+
+static void
+rear_sensor_stream(struct i2c *cci)
+{
+    uint8_t s = 0xff;
+    char line[120];
+
+    /* imx363_start_streaming: sw reset, 12 ms, PLL table, common regs, continuous clock, mode regs, stream on */
+    (void)i2c_write_reg16(cci, IMX_ADDR, 0x0103, 0x01);
+    delay(12000);
+    imx_write_seq(cci, imx363_pll_642,    sizeof(imx363_pll_642)    / sizeof(imx363_pll_642[0]));
+    imx_write_seq(cci, imx363_common,     sizeof(imx363_common)     / sizeof(imx363_common[0]));
+    (void)i2c_write_reg16(cci, IMX_ADDR, 0x4040, 0x00);   /* CLK_BLANK_STOP=0: continuous clock */
+    imx_write_seq(cci, imx363_2016x1512,  sizeof(imx363_2016x1512)  / sizeof(imx363_2016x1512[0]));
+    (void)i2c_write_reg16(cci, IMX_ADDR, 0x0100, 0x01);   /* STREAM ON */
+    delay(5000);
+    (void)i2c_read_reg16(cci, IMX_ADDR, 0x0100, &s, 1);
+    snprintf(line, sizeof(line), "camera: IMX363 STREAM ON (2016x1512, 642 Mbps/lane); mode_select readback=%02x (want 01)\n", s);
+    camlog(line);
 }
 
 static void
@@ -387,6 +680,9 @@ rear_sensor_probe(struct i2c *slg)
     snprintf(line, sizeof(line), "camera: IMX363 chip id read %s: %02x%02x (want 0363) on CCI0 GPIO %u/%u\n",
         r == 0 ? "ok" : "NO ACK", v[0], v[1], CCI0_SDA_GPIO, CCI0_SCL_GPIO);
     camlog(line);
+    if (r == 0 && cam_level >= 3) {
+        rear_sensor_stream(&cci);
+    }
 }
 
 static void
