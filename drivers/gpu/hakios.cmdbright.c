@@ -161,6 +161,24 @@ dcs1(volatile uint32_t *r, uint8_t command)
 	return dsi_kick(r, words, 2);
 }
 
+/* The panel to sleep when the kernel hands back to the loader (loader_return.c), so the last iOS frame does not burn
+ * into the OLED while the phone sits at the loader. Best-effort; DSI must be on in command mode. */
+void
+hakios_panel_blank(void)
+{
+	volatile uint32_t *r = (volatile uint32_t *)dsi;
+
+	if (r == NULL || (r[DSI_CTRL / 4] & 0x5u) != 0x5u || panel_asleep) {
+		return;
+	}
+	lck_mtx_lock(&cmdbright_lock);
+	(void)dcs1(r, 0x28);            /* display off */
+	delay(20000);
+	(void)dcs1(r, 0x10);            /* enter sleep */
+	panel_asleep = true;
+	lck_mtx_unlock(&cmdbright_lock);
+}
+
 static int
 panel_power(uint64_t state)
 {
