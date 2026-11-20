@@ -161,6 +161,18 @@ i2c_read_byte(struct i2c *b, int ack)
 }
 
 /* read `count' bytes from a 16-bit register of a 7-bit-addressed device; 0 ok, -1 no ACK */
+/* bare address probe: START, write-address, note ACK, STOP. 1 = device present. */
+static int
+i2c_ping(struct i2c *b, uint8_t addr)
+{
+    int ack;
+
+    i2c_start(b);
+    ack = i2c_write_byte(b, (uint8_t)(addr << 1));
+    i2c_stop(b);
+    return ack;
+}
+
 static int
 i2c_read_reg16(struct i2c *b, uint8_t addr, uint16_t reg, uint8_t *out, unsigned count)
 {
@@ -194,6 +206,94 @@ i2c_write_reg16(struct i2c *b, uint8_t addr, uint16_t reg, uint8_t value)
     return ok ? 0 : -1;
 }
 
+
+/* ---- the SPMI arbiter (v5), to drive the PM6150L GPIOs that enable the SLG51000 (as the torch driver does) ---- */
+#define ARB_CORE_PHYS       0x0c440000UL
+#define ARB_CNFG_PHYS       0x0c40a000UL
+#define ARB_CHNLS_PHYS      0x0c600000UL
+#define ARB_CHANNEL(n)      (0x900 + 4 * (n))   /* [19:8] slave<<8|peripheral */
+#define ARB_OWNER(n)        (0x700 + 4 * (n))   /* [2:0] owner; 0 = us */
+#define ARB_FEATURES        0x004
+#define CH_COMMAND          0x00
+#define CH_STATUS           0x08
+#define CH_WDATA0           0x10
+#define CMD_WRITE_LONG      (0u << 27)          /* [11:4] reg, [2:0] bytes-1 */
+extern void hakios_spmi_lock(void);
+extern void hakios_spmi_unlock(void);
+static vm_offset_t arb_core, arb_cnfg;
+
+/* write one byte to (slave, peripheral<<8|reg) of a PMIC through the arbiter; 0 ok */
+static int
+spmi_write8(unsigned slave, unsigned periph, unsigned reg, uint8_t value)
+{
+    uint32_t id = (slave << 8) | periph, channels, n, found = ~0u;
+    vm_offset_t ch;
+    int ok = 0;
+
+    if (arb_core == 0) {
+        arb_core = ml_io_map(ARB_CORE_PHYS, 0x1100);
+        arb_cnfg = ml_io_map(ARB_CNFG_PHYS, 0x1000);
+    }
+    if (arb_core == 0 || arb_cnfg == 0) {
+        return -1;
+    }
+    channels = *(volatile uint32_t *)(arb_core + ARB_FEATURES) & 0x7ff;
+    for (n = 0; n < channels; n++) {
+        uint32_t map = *(volatile uint32_t *)(arb_core + ARB_CHANNEL(n));
+
+        if (((map >> 8) & 0xfff) == id) {
+            if ((*(volatile uint32_t *)(arb_cnfg + ARB_OWNER(n)) & 7) == 0) {
+                found = n;
+                break;
+            }
+            if (found == ~0u) {
+                found = n;
+            }
+        }
+    }
+    if (found == ~0u) {
+        return -2;
+    }
+    ch = ml_io_map(ARB_CHNLS_PHYS + 0x10000UL * found, 0x1000);
+    if (ch == 0) {
+        return -1;
+    }
+    hakios_spmi_lock();
+    *(volatile uint32_t *)(ch + CH_WDATA0) = value;
+    *(volatile uint32_t *)(ch + CH_COMMAND) = CMD_WRITE_LONG | (uint32_t)reg << 4;   /* 1 byte */
+    __asm__ volatile ("dsb sy" ::: "memory");
+    for (int t = 0; t < 50; t++) {
+        uint32_t st = *(volatile uint32_t *)(ch + CH_STATUS);
+        if (st & 1u) { ok = 1; break; }         /* DONE */
+        if (st & 0xeu) { break; }               /* FAILURE/DENIED/DROPPED */
+        delay(40);
+    }
+    hakios_spmi_unlock();
+    return ok ? 0 : -3;
+}
+
+/* a PM6150L GPIO (slave 4, GPIOn peripheral 0xc000 + (n-1)*0x100) to constant output-high, LV/MV, push-pull, no pull
+ * (the bytes pinctrl-spmi-gpio.c writes: MODE_CTL 0x40=1 output, OUT_SOURCE 0x44=0x80 value-high, DIG_OUT 0x45 push-pull,
+ * PULL 0x42=5 none, VIN 0x41=0, EN_CTL 0x46=0x80). */
+static void
+pm6150l_gpio_high(unsigned gpio)
+{
+    unsigned periph = 0xc0 + (gpio - 1);        /* 0xc000 + (n-1)*0x100 -> peripheral byte */
+    int a, b, c, d, e, f;
+
+    b = spmi_write8(4, periph, 0x41, 0x00);     /* DIG_VIN_CTL: VIN0 */
+    c = spmi_write8(4, periph, 0x42, 0x05);     /* DIG_PULL_CTL: no pull */
+    a = spmi_write8(4, periph, 0x44, 0x80);     /* LV_MV_DIG_OUT_SOURCE_CTL: output value high */
+    d = spmi_write8(4, periph, 0x45, 0x01);     /* DIG_OUT_CTL: push-pull (CMOS), low drive */
+    e = spmi_write8(4, periph, 0x40, 0x01);     /* MODE_CTL: digital output */
+    f = spmi_write8(4, periph, 0x46, 0x80);     /* EN_CTL: master enable */
+    {
+        char line[96];
+        snprintf(line, sizeof(line), "camera: PM6150L GPIO%u high: writes %d %d %d %d %d %d (0 ok)\n", gpio, b, c, a, d, e, f);
+        camlog(line);
+    }
+}
+
 static void
 camera_probe(void)
 {
@@ -212,7 +312,20 @@ camera_probe(void)
 
     /* the camera PMIC's pattern id (0x1105..0x1107): if it ACKs, the SLG51000 is powered (ABL left its chip-enable on)
      * and its I2C bus is ours; if not, PM6150L GPIO4 (its chip-enable) has to be driven, next milestone. */
-    camlog("camera: pins mapped, reading the SLG51000\n");
+    camlog("camera: enabling the SLG51000 (PM6150L GPIO 1,5 enable; 4,6 cs)\n");
+    pm6150l_gpio_high(1);       /* dlg,enable-gpios */
+    pm6150l_gpio_high(5);
+    pm6150l_gpio_high(4);       /* dlg,cs-gpios */
+    pm6150l_gpio_high(6);
+    delay(5000);
+    {
+        char line[96];
+        int drv = i2c_ping(&slg, 0x5a);     /* the DRV2624 haptic, known present on this bus */
+        int slgp = i2c_ping(&slg, SLG_ADDR);
+        snprintf(line, sizeof(line), "camera: bus check - DRV2624(0x5a) ACK %d, SLG51000(0x75) ACK %d\n", drv, slgp);
+        camlog(line);
+    }
+    camlog("camera: reading the SLG51000\n");
     r = i2c_read_reg16(&slg, SLG_ADDR, SLG_PATTERN_ID_B0, id, 3);
     if (r == 0) {
         char line[96];
