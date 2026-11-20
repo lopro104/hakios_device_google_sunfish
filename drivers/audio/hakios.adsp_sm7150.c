@@ -1296,6 +1296,130 @@ qr_make_node(void)
 	    devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "hakios-qrtr") != NULL ? "made" : "CANNOT BE MADE");
 }
 
+/*
+ * sns=2: /dev/hakios-motion, between the sensor client (hakios-sensors --hakios-orient, Yofuness/ios-sunfish's sns_run.c,
+ * which writes to its motion device) and backboardd's libhakios (which reads, and sends the samples from HID services
+ * locationd takes for CoreMotion). Yofuness's motion.h: a write is a struct motion_sample (32 bytes) or a device-motion
+ * report (104); a read gives one, waiting up to a second (0666: backboardd runs as mobile); MOTION_GET_WANT is what iOS asked of each service, which
+ * backboardd's side says with MOTION_SET_WANT (ours). Any number may open it; one reader.
+ */
+struct hk_motion_want {
+	uint32_t version, present, clients[8], interval_us[8], interval_set[8];
+};
+#define HK_MOTION_GET_WANT      _IOR('m', 1, struct hk_motion_want)
+#define HK_MOTION_SET_WANT      _IOW('m', 2, struct hk_motion_want)
+#define HK_MOTION_MAX           104
+#define HK_MOTION_QUEUE         128
+static struct { uint32_t len; uint8_t b[HK_MOTION_MAX]; } mo_ring[HK_MOTION_QUEUE];
+static uint32_t mo_head, mo_tail, mo_dropped;
+static struct hk_motion_want mo_want = { .version = 1 };
+static LCK_MTX_DECLARE(mo_lock, &rpc_group);
+
+static int
+mo_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	return 0;
+}
+
+static int
+mo_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	return 0;
+}
+
+static int
+mo_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	uint8_t b[HK_MOTION_MAX];
+	uint32_t len = (uint32_t)uio_resid(uio);
+	int error;
+
+	if (len < 32 || len > HK_MOTION_MAX) {
+		return EINVAL;
+	}
+	if ((error = uiomove((caddr_t)b, (int)len, uio)) != 0) {
+		return error;
+	}
+	lck_mtx_lock(&mo_lock);
+	if (mo_head - mo_tail >= HK_MOTION_QUEUE) {
+		mo_tail++;                      /* the oldest goes: a reader that fell behind wants the newest */
+		mo_dropped++;
+	}
+	mo_ring[mo_head % HK_MOTION_QUEUE].len = len;
+	memcpy(mo_ring[mo_head % HK_MOTION_QUEUE].b, b, len);
+	mo_head++;
+	wakeup(&mo_head);
+	lck_mtx_unlock(&mo_lock);
+	return 0;
+}
+
+static int
+mo_read(__unused dev_t dev, struct uio *uio, int ioflag)
+{
+	struct timespec second = { 1, 0 };
+	uint8_t b[HK_MOTION_MAX];
+	uint32_t len = 0;
+	int error = 0;
+
+	lck_mtx_lock(&mo_lock);
+	while (mo_tail == mo_head && error == 0) {
+		if (ioflag & IO_NDELAY) {
+			error = EAGAIN;
+			break;
+		}
+		error = msleep(&mo_head, (lck_mtx_t *)&mo_lock, PCATCH, "motion", &second);
+		if (error == EWOULDBLOCK) {
+			error = EAGAIN;
+		}
+	}
+	if (error == 0) {
+		len = mo_ring[mo_tail % HK_MOTION_QUEUE].len;
+		memcpy(b, mo_ring[mo_tail % HK_MOTION_QUEUE].b, len);
+		mo_tail++;
+	}
+	lck_mtx_unlock(&mo_lock);
+	return error != 0 ? error : uiomove((caddr_t)b, (int)MIN(len, (uint32_t)uio_resid(uio)), uio);
+}
+
+static int
+mo_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
+{
+	int error = 0;
+
+	lck_mtx_lock(&mo_lock);
+	if (cmd == HK_MOTION_GET_WANT) {
+		*(struct hk_motion_want *)data = mo_want;
+	} else if (cmd == HK_MOTION_SET_WANT) {
+		mo_want = *(struct hk_motion_want *)data;
+		mo_want.version = 1;
+	} else {
+		error = ENOTTY;
+	}
+	lck_mtx_unlock(&mo_lock);
+	return error;
+}
+
+static const struct cdevsw mo_cdevsw = {
+	.d_open = mo_open, .d_close = mo_close, .d_read = mo_read, .d_write = mo_write,
+	.d_ioctl = mo_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
+	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+};
+
+static void
+mo_make_node(void)
+{
+	static bool made;
+	int major;
+
+	if (made || sns_level < 2) {
+		return;
+	}
+	made = true;
+	major = cdevsw_add(-1, &mo_cdevsw);
+	say("adsp: /dev/hakios-motion %s\n", major >= 0 &&
+	    devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "hakios-motion") != NULL ? "made" : "CANNOT BE MADE");
+}
+
 static void qrtr_received(const uint8_t *p, uint32_t len);
 
 static void
@@ -1505,6 +1629,7 @@ glink_poll(void)
 	glink_poll_once();
 	rpc_make_node();
 	qr_make_node();
+	mo_make_node();
 	rpc_step();
 }
 
