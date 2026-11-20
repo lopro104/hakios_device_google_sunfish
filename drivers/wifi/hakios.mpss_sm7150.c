@@ -7048,6 +7048,95 @@ sweet_wlfw_pump(void)
 	}
 }
 
+/*
+ * The modem's cellular side to low-power mode (boot-arg modem_lpm, default 1; 0: left online): with no SIM it otherwise
+ * searches for any network to camp on for emergency calls, and the modem stays busy (~110 mA idle in the 2026-11-19
+ * measurements, its largest single part). QMI DMS (service 2) SET_OPERATING_MODE (0x002E), TLV 0x01 = 1 (LPM), what
+ * airplane mode does to the cellular radio. Wi-Fi runs on the WCN3990, not on this radio.
+ */
+#define DMS_SERVICE             2
+#define DMS_CLIENT_PORT         102
+#define DMS_SET_OPERATING_MODE  0x002e
+#define DMS_GET_OPERATING_MODE  0x002d
+static uint32_t g_modem_lpm = 1, g_dms_sent, g_dms_node, g_dms_port;
+static bool g_dms_known;
+
+/* (noted when the modem announces it; asked at 90 s of the modem's life, by the 1 Hz loop, where the log keeps it) */
+static void
+sweet_dms_server(uint32_t node, uint32_t port)
+{
+	g_dms_node = node;
+	g_dms_port = port;
+	g_dms_known = true;
+	printf("mpss: DMS (service 2) at %u:%u\n", node, port);
+}
+
+static void
+sweet_dms_send(void)
+{
+	uint8_t q[16];
+	uint8_t lpm = 1;
+	uint32_t at, node = g_dms_node, port = g_dms_port;
+
+	if (!g_modem_lpm || g_dms_sent) {
+		return;
+	}
+	if (!g_dms_known) {
+		printf("mpss: no DMS service announced by 90 s: the cellular radio left as it is\n");
+		g_dms_sent = 2;
+		return;
+	}
+	(void)lpm;
+	qmi_put_header(q, 1, DMS_GET_OPERATING_MODE);       /* first what it is in; SET follows only from online (0) */
+	at = 7;
+	q[5] = (uint8_t)(at - 7);
+	q[6] = (uint8_t)((at - 7) >> 8);
+	g_dms_sent = tftp_send_to(node, port, DMS_CLIENT_PORT, q, at) ? 1 : 0;
+	printf("mpss: DMS at %u:%u: its operating mode asked: %s\n", node, port, g_dms_sent ? "sent" : "NOT sent");
+}
+
+/* QMI operating modes: 0 online, 1 low power, 2 factory test, 3 offline, 4 resetting, 5 shutting down, 6 persistent LPM, 7 mode-only LPM */
+static void
+sweet_dms_handle(const uint8_t *p, uint32_t len)
+{
+	uint16_t msg = len >= 7 ? (uint16_t)(p[3] | p[4] << 8) : 0;
+	unsigned result = 0xffff, error = 0, mode = 0xff;
+
+	for (uint32_t at = 7; at + 3 <= len;) {
+		uint8_t type = p[at];
+		uint16_t n = (uint16_t)(p[at + 1] | p[at + 2] << 8);
+
+		if (at + 3 + n > len) {
+			break;
+		}
+		if (type == 0x02 && n >= 4) {
+			result = p[at + 3] | p[at + 4] << 8;
+			error = p[at + 5] | p[at + 6] << 8;
+		} else if (type == 0x01 && n >= 1) {
+			mode = p[at + 3];
+		}
+		at += 3 + n;
+	}
+	if (msg == DMS_GET_OPERATING_MODE) {
+		printf("mpss: DMS: the cellular radio's operating mode is %u (0 online, 1 low power, 3 offline, 6 persistent low power), result %u error %u\n",
+		    mode, result, error);
+		if (result == 0 && mode == 0 && g_dms_known) {
+			uint8_t q[16], lpm = 1;
+			uint32_t at;
+
+			qmi_put_header(q, 2, DMS_SET_OPERATING_MODE);
+			at = qmi_put_tlv(q, 7, 0x01, &lpm, 1);
+			q[5] = (uint8_t)(at - 7);
+			q[6] = (uint8_t)((at - 7) >> 8);
+			printf("mpss: DMS: to low-power mode: %s\n", tftp_send_to(g_dms_node, g_dms_port, DMS_CLIENT_PORT, q, at) ? "asked" : "NOT sent");
+		}
+	} else if (msg == DMS_SET_OPERATING_MODE) {
+		printf("mpss: DMS: low-power mode %s (result %u, error %u)\n", result == 0 ? "SET" : "REFUSED", result, error);
+	} else {
+		printf("mpss: DMS: message %#x, %u bytes back\n", msg, len);
+	}
+}
+
 static void
 sweet_glink_poll(void)
 {
@@ -7283,6 +7372,9 @@ sweet_glink_poll(void)
 					if (cp->server.service == WLFW_SERVICE) {
 						sweet_wlfw_server(ch, cp->server.node, cp->server.port);
 					}
+					if (cp->server.service == DMS_SERVICE) {
+						sweet_dms_server(cp->server.node, cp->server.port);
+					}
 				} else if (qtype == QRTR_TYPE_DATA) {
 					if (qhdr->confirm_rx) {
 						sweet_qrtr_resume_tx(ch, qhdr);
@@ -7291,6 +7383,8 @@ sweet_glink_poll(void)
 						sweet_rmtfs_handle_qmi(ch, qhdr, payload + sizeof(*qhdr), tdata.chunk_size - (uint32_t)sizeof(*qhdr));
 					} else if (qhdr->dst_port_id == WLFW_CLIENT_PORT) {
 						sweet_wlfw_handle(ch, qhdr, payload + sizeof(*qhdr), tdata.chunk_size - (uint32_t)sizeof(*qhdr));
+					} else if (qhdr->dst_port_id == DMS_CLIENT_PORT) {
+						sweet_dms_handle(payload + sizeof(*qhdr), tdata.chunk_size - (uint32_t)sizeof(*qhdr));
 					} else if (qhdr->dst_port_id == SERVREG_LOC_PORT) {
 						sweet_servreg_loc_handle(ch, qhdr, payload + sizeof(*qhdr), tdata.chunk_size - (uint32_t)sizeof(*qhdr));
 					} else if (qhdr->dst_port_id >= TFTP_PORT && qhdr->dst_port_id <= TFTP_PORT + TFTP_XFERS) {
@@ -7489,6 +7583,9 @@ mpss_run(void)
 					if (sec <= 30 || sec % 10 == 0) {
 						printf("mpss: alive %d s: %s\n", sec, report);
 					}
+					if (sec == 90) {
+						sweet_dms_send();
+					}
 					/* boot-arg mpss_dump=N: every N seconds of the modem's life, the event ring one event a line (the
 					 * alive line above is cut after about 2 KB and the middle of a long run's log is dropped) */
 					if (g_ev_dump != 0 && sec % (int)g_ev_dump == 0) {
@@ -7642,6 +7739,7 @@ hakios_mpss_sm7150_start(void)
 	PE_parse_boot_argn("wlanprobe", &g_wlan_probe, sizeof(g_wlan_probe));
 	PE_parse_boot_argn("mpss_log", &g_ev_log, sizeof(g_ev_log));
 	PE_parse_boot_argn("wifi_ps", &g_wifi_ps, sizeof(g_wifi_ps));
+	PE_parse_boot_argn("modem_lpm", &g_modem_lpm, sizeof(g_modem_lpm));
 	PE_parse_boot_argn("wlan_kdhcp", &g_kdhcp, sizeof(g_kdhcp));
 	PE_parse_boot_argn("mpss_dump", &g_ev_dump, sizeof(g_ev_dump));
 	PE_parse_boot_argn("wlannoht", &swu_no_ht, sizeof(swu_no_ht));
