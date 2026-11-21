@@ -2715,7 +2715,7 @@ hakios_sm7150_smmu_pages(uint32_t sid, uint64_t iova, uint64_t pa, uint32_t page
 /*
  * For the camera driver (hakios.camera_sunfish.c): like hakios_sm7150_smmu_pages, but for a device that writes on
  * several stream IDs it does not tell us exactly (the IFE: downstream msm_cam_smmu_ife lists masked groups). One
- * translating bank with `pages' 4 KiB pages of `pa' at a 32-bit `iova' (one 2 MiB stretch), and one MASKED SMR per
+ * translating bank with `pages' 4 KiB pages of `pa' at a 32-bit `iova' (up to two 2 MiB stretches), and one MASKED SMR per
  * (sid, mask) pair, all pointing at that bank. A group that overlaps a valid SMR someone else owns is skipped (a
  * double match would be a stream-match conflict fault). Returns the bank, or -1. hakios_sm7150_smmu_status() reads
  * that bank's fault state and the global fault syndrome back.
@@ -2734,7 +2734,7 @@ hakios_sm7150_smmu_pages_masked(const uint32_t *sids, const uint32_t *masks, uns
 	int cb = -1;
 	unsigned tries = 0, mapped = 0;
 
-	if (n == 0 || n > 8 || pages == 0 || pages > 512 - ((iova >> 12) & 511) || ((iova | pa) & 0xfff) != 0 || iova >= (1ull << 32)) {
+	if (n == 0 || n > 8 || pages == 0 || pages > 1024 - ((iova >> 12) & 511) || ((iova | pa) & 0xfff) != 0 || iova >= (1ull << 32)) {
 		return -1;
 	}
 	if (g_smmu == NULL) {
@@ -2787,18 +2787,19 @@ hakios_sm7150_smmu_pages_masked(const uint32_t *sids, const uint32_t *masks, uns
 			ev("SMMU cam: no free SMR for %#x/%#x", id, mk);
 		}
 	}
-	if (kmem_alloc_contig(kernel_map, &pt, 0x4000, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+	if (kmem_alloc_contig(kernel_map, &pt, 0x8000, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 		return -1;
 	}
 	t = (volatile uint64_t *)pt;
 	pt_pa = kvtophys(pt);
 	t[(iova >> 39) & 511] = (pt_pa + 0x1000) | 3;                           /* L0 -> L1 */
 	t[0x1000 / 8 + ((iova >> 30) & 511)] = (pt_pa + 0x2000) | 3;            /* L1 -> L2 */
-	t[0x2000 / 8 + ((iova >> 21) & 511)] = (pt_pa + 0x3000) | 3;            /* L2 -> L3 */
+	t[0x2000 / 8 + ((iova >> 21) & 511)] = (pt_pa + 0x3000) | 3;            /* L2 -> L3 (first 2 MiB) */
+	t[0x2000 / 8 + ((iova >> 21) & 511) + 1] = (pt_pa + 0x4000) | 3;        /* L2 -> L3 (second 2 MiB; tables contiguous) */
 	for (uint32_t i = 0; i < pages; i++) {
 		t[0x3000 / 8 + ((iova >> 12) & 511) + i] = (pa + ((uint64_t)i << 12)) | (1u << 10) | (2u << 8) | (1u << 6) | 3u;
 	}
-	for (int o = 0; o < 0x4000; o += 64) {
+	for (int o = 0; o < 0x8000; o += 64) {
 		__asm__ volatile ("dc civac, %0" : : "r" ((uint8_t *)pt + o) : "memory");
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");

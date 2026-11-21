@@ -20,6 +20,12 @@
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
+#include <sys/vnode.h>
+#include <sys/fcntl.h>
+#include <sys/uio.h>
+#include <sys/kauth.h>
+#include <sys/mount.h>
+#include <sys/vnode_if.h>
 #include <machine/machine_routines.h>
 
 /* ---- inlined imx363_regs.h (build copies only the .c into bsd/dev) ---- */
@@ -1068,8 +1074,9 @@ extern void hakios_sm7150_smmu_status(uint32_t *fsr, uint64_t *far, uint32_t *gf
 extern uint64_t kvtophys(vm_offset_t va);
 
 #define CAM_IOVA        0x10000000ULL
-#define CAM_BUF_SIZE    0x200000u               /* 2 MiB: one SMMU L3 stretch */
-#define CAM_LINE_BYTES  2520u                   /* 2016 px of MIPI-packed RAW10 */
+#define CAM_BUF_SIZE    0x400000u               /* 4 MiB: two SMMU L3 stretches; a 2016x1512 RAW10 frame is 3810240 B */
+#define CAM_FRAME_BYTES 3822336u                /* 1512 lines x 2528 B: the WM pads each 2520 B RAW10 line to 16 B */
+#define CAM_LINE_BYTES  2528u                   /* 2016 px of MIPI-packed RAW10 = 2520 B, padded to 16 B */
 static vm_offset_t vfe0;
 static vm_offset_t cam_buf;
 static uint64_t cam_buf_pa;
@@ -1108,8 +1115,8 @@ vfe0_init(void)
     VFE_WR(0x064, 1u << 31);
     VFE_WR(0x058, 1u);
 
-    /* DMA buffer: 2 MiB, physically contiguous and 2 MiB aligned, filled with 0xa5 so the written part shows */
-    if (kmem_alloc_contig(kernel_map, &cam_buf, CAM_BUF_SIZE, PAGE_MASK, 0, (CAM_BUF_SIZE >> PAGE_SHIFT) - 1,
+    /* DMA buffer: 4 MiB physically contiguous, filled with 0xa5 so the written part shows */
+    if (kmem_alloc_contig(kernel_map, &cam_buf, CAM_BUF_SIZE, PAGE_MASK, 0, 0,
         KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
         camlog("camera: no DMA buffer\n");
         return;
@@ -1199,6 +1206,23 @@ vfe0_report(void)
             "camera: FRAME BUFFER - bytes @%#x: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x; mean of 4 KiB %u\n",
             o0, p[o0], p[o0 + 1], p[o0 + 2], p[o0 + 3], p[o0 + 4], p[o0 + 5], p[o0 + 6], p[o0 + 7],
             p[o0 + 8], p[o0 + 9], p[o0 + 10], p[o0 + 11], p[o0 + 12], p[o0 + 13], p[o0 + 14], p[o0 + 15], sum / 4096);
+        camlog(line);
+    }
+    /* keep the frame: /private/var is the persistent HFS+ data volume, so it can be fetched from a normal boot */
+    if (written) {
+        vfs_context_t ctx = vfs_context_kernel();
+        vnode_t vp = NULLVP;
+        int resid = 0, err;
+
+        err = vnode_open("/private/var/root/cam-frame.raw", O_CREAT | O_TRUNC | FWRITE, 0644, 0, &vp, ctx);
+        if (err == 0) {
+            err = vn_rdwr(UIO_WRITE, vp, (caddr_t)cam_buf, CAM_FRAME_BYTES, 0, UIO_SYSSPACE, IO_SYNC | IO_NOAUTH,
+                vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+            (void)VNOP_FSYNC(vp, MNT_WAIT, ctx);
+            vnode_close(vp, FWRITE, ctx);
+        }
+        snprintf(line, sizeof(line), "camera: saved /private/var/root/cam-frame.raw (%u B RAW10 2016x1512, stride 2528): err %d resid %d\n",
+            CAM_FRAME_BYTES, err, resid);
         camlog(line);
     }
 }
@@ -1292,6 +1316,17 @@ rear_sensor_stream(struct i2c *cci)
     imx_write_seq(cci, imx363_common,     sizeof(imx363_common)     / sizeof(imx363_common[0]));
     (void)i2c_write_reg16(cci, IMX_ADDR, 0x4040, 0x00);   /* CLK_BLANK_STOP=0: continuous clock */
     imx_write_seq(cci, imx363_2016x1512,  sizeof(imx363_2016x1512)  / sizeof(imx363_2016x1512[0]));
+    {
+        uint32_t gain = 0, exp = 0;                    /* cam_gain: analog gain code 0..480 (0 = 1x); cam_exp: lines */
+        if (PE_parse_boot_argn("cam_gain", &gain, sizeof(gain)) && gain <= 480) {
+            (void)i2c_write_reg16(cci, IMX_ADDR, 0x0204, (uint8_t)(gain >> 8));
+            (void)i2c_write_reg16(cci, IMX_ADDR, 0x0205, (uint8_t)gain);
+        }
+        if (PE_parse_boot_argn("cam_exp", &exp, sizeof(exp)) && exp >= 4 && exp <= 0x0c58) {
+            (void)i2c_write_reg16(cci, IMX_ADDR, 0x0202, (uint8_t)(exp >> 8));
+            (void)i2c_write_reg16(cci, IMX_ADDR, 0x0203, (uint8_t)exp);
+        }
+    }
     (void)i2c_write_reg16(cci, IMX_ADDR, 0x0100, 0x01);   /* STREAM ON */
     delay(5000);
     (void)i2c_read_reg16(cci, IMX_ADDR, 0x0100, &s, 1);
