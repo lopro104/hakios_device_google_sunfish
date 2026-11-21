@@ -676,10 +676,38 @@ camcc_rcg_set(uint32_t cmd_off, uint32_t src_sel, uint32_t div_field)
 
 /* CSIPHY0 data clocks: cphy_rx (300 MHz) and csi0phytimer (300 MHz), both PLL0_OUT_EVEN/2.
  * titan_top GDSC is already on (camcc_mclk0_on). */
+/* camss "top": the register/AXI fabric every camss block sits behind (camss.c powers these with VFE0).
+ * Without cpas_ahb (from slow_ahb) the CSIPHY/CSID/VFE registers read 0 and writes are dropped. */
+static void
+camss_top_on(void)
+{
+    vm_offset_t gcc_cam = ml_io_map(0x10b000UL, 0x1000);    /* GCC camera branches */
+
+    if (gcc_cam != 0) {
+        WR(gcc_cam + 0x020, RD(gcc_cam + 0x020) | 1u);     /* gcc_camera_hf_axi_clk */
+        WR(gcc_cam + 0x06c, RD(gcc_cam + 0x06c) | 1u);     /* gcc_camera_sf_axi_clk */
+        __asm__ volatile ("dsb sy" ::: "memory");
+    }
+    camcc_rcg_set(0x7058, 0, 1);        /* slow_ahb_src: XO 19.2 MHz (src 0, /1) */
+    WR(camcc + 0xc124, RD(camcc + 0xc124) | 1u);           /* cpas_ahb_clk */
+    camcc_rcg_set(0xc12c, 2, 7);        /* camnoc_axi_src: PLL0_OUT_EVEN /4 = 150 MHz (field 2*4-1) */
+    WR(camcc + 0xc148, RD(camcc + 0xc148) | 1u);           /* camnoc_axi_clk */
+    __asm__ volatile ("dsb sy" ::: "memory");
+    delay(1000);
+    {
+        char line[160];
+        snprintf(line, sizeof(line), "camera: camss top - gcc hf_axi %#x sf_axi %#x, cpas_ahb %#x, camnoc_axi %#x (bit31=off)\n",
+            gcc_cam ? RD(gcc_cam + 0x020) : 0xdead, gcc_cam ? RD(gcc_cam + 0x06c) : 0xdead,
+            RD(camcc + 0xc124), RD(camcc + 0xc148));
+        camlog(line);
+    }
+}
+
 static void
 camss_csiphy_clocks_on(void)
 {
-    camcc_pll0_up();
+    camcc_pll0_up();                    /* PLL0 first: camnoc_axi_src and the CSIPHY clocks use OUT_EVEN */
+    camss_top_on();
     camcc_rcg_set(0x6004, 2, 3);        /* csi0phytimer_src: src 2 (OUT_EVEN), /2 (field 2*2-1=3) */
     camcc_rcg_set(0xa064, 2, 3);        /* cphy_rx_src: src 2 (OUT_EVEN), /2 */
     WR(camcc + 0x601c, RD(camcc + 0x601c) | 1u);   /* csi0phytimer_clk branch */
@@ -692,6 +720,200 @@ camss_csiphy_clocks_on(void)
             RD(camcc + 0x601c), RD(camcc + 0x6020), RD(camcc + 0xa068));
         camlog(line);
     }
+}
+
+/* Generated from sm7150-mainline camss-csiphy-3ph-1-0.c lane_regs_sm7150[]. */
+/* param: 0=write data; 2=settle_cnt&0xff; 3=settle high byte; 4,7=skip. base=0xace0000, common offset 0x800. */
+struct csiphy_reg { uint16_t addr; uint8_t data; uint8_t delay_us; uint8_t param; };
+static const struct csiphy_reg csiphy0_lane_regs[] = {
+	{ 0x0030, 0x00, 0, 0 },
+	{ 0x0904, 0x00, 0, 0 },
+	{ 0x0910, 0x00, 0, 0 },
+	{ 0x0900, 0x0f, 0, 0 },
+	{ 0x0908, 0x06, 0, 0 },
+	{ 0x0904, 0x07, 0, 0 },
+	{ 0x002c, 0x01, 0, 0 },
+	{ 0x0034, 0x0f, 0, 0 },
+	{ 0x0010, 0x50, 0, 0 },
+	{ 0x001c, 0x0a, 0, 0 },
+	{ 0x0014, 0x60, 0, 0 },
+	{ 0x0028, 0x00, 0, 0 },
+	{ 0x003c, 0xb8, 0, 0 },
+	{ 0x0000, 0x91, 0, 0 },
+	{ 0x0004, 0x0c, 0, 0 },
+	{ 0x0020, 0x00, 0, 0 },
+	{ 0x0008, 0x10, 0, 2 },
+	{ 0x0010, 0x52, 0, 0 },
+	{ 0x0038, 0xfe, 0, 0 },
+	{ 0x005c, 0xc0, 0, 0 },
+	{ 0x0060, 0x0d, 0, 0 },
+	{ 0x0800, 0x02, 0, 0 },
+	{ 0x0000, 0x00, 0, 4 },
+	{ 0x0730, 0x00, 0, 0 },
+	{ 0x0c84, 0x00, 0, 0 },
+	{ 0x0c90, 0x00, 0, 0 },
+	{ 0x0c80, 0x0f, 0, 0 },
+	{ 0x0c88, 0x06, 0, 0 },
+	{ 0x0c84, 0x07, 0, 0 },
+	{ 0x072c, 0x01, 0, 0 },
+	{ 0x0734, 0x0f, 0, 0 },
+	{ 0x0710, 0x50, 0, 0 },
+	{ 0x071c, 0x0a, 0, 0 },
+	{ 0x0714, 0x60, 0, 0 },
+	{ 0x0728, 0x04, 0, 0 },
+	{ 0x073c, 0xb8, 0, 0 },
+	{ 0x0700, 0x80, 0, 0 },
+	{ 0x0704, 0x0c, 0, 0 },
+	{ 0x0720, 0x00, 0, 0 },
+	{ 0x0708, 0x04, 0, 2 },
+	{ 0x070c, 0xff, 0, 0 },
+	{ 0x0710, 0x52, 0, 0 },
+	{ 0x0738, 0x1f, 0, 0 },
+	{ 0x0800, 0x02, 0, 0 },
+	{ 0x0000, 0x00, 0, 4 },
+	{ 0x0000, 0x00, 0, 4 },
+	{ 0x0230, 0x00, 0, 0 },
+	{ 0x0a04, 0x00, 0, 0 },
+	{ 0x0a10, 0x00, 0, 0 },
+	{ 0x0a00, 0x0f, 0, 0 },
+	{ 0x0a08, 0x06, 0, 0 },
+	{ 0x0a04, 0x07, 0, 0 },
+	{ 0x022c, 0x01, 0, 0 },
+	{ 0x0234, 0x0f, 0, 0 },
+	{ 0x0210, 0x50, 0, 0 },
+	{ 0x021c, 0x0a, 0, 0 },
+	{ 0x0214, 0x60, 0, 0 },
+	{ 0x0228, 0x00, 0, 0 },
+	{ 0x023c, 0xb8, 0, 0 },
+	{ 0x0200, 0x91, 0, 0 },
+	{ 0x0204, 0x0c, 0, 0 },
+	{ 0x0220, 0x00, 0, 0 },
+	{ 0x0208, 0x04, 0, 2 },
+	{ 0x0210, 0x52, 0, 0 },
+	{ 0x0238, 0xfe, 0, 0 },
+	{ 0x025c, 0xc0, 0, 0 },
+	{ 0x0260, 0x0d, 0, 0 },
+	{ 0x0800, 0x02, 0, 0 },
+	{ 0x0000, 0x00, 0, 4 },
+	{ 0x0430, 0x00, 0, 0 },
+	{ 0x0b04, 0x00, 0, 0 },
+	{ 0x0b10, 0x00, 0, 0 },
+	{ 0x0b00, 0x0f, 0, 0 },
+	{ 0x0b08, 0x06, 0, 0 },
+	{ 0x0b04, 0x07, 0, 0 },
+	{ 0x042c, 0x01, 0, 0 },
+	{ 0x0434, 0x0f, 0, 0 },
+	{ 0x0410, 0x50, 0, 0 },
+	{ 0x041c, 0x0a, 0, 0 },
+	{ 0x0414, 0x60, 0, 0 },
+	{ 0x0428, 0x00, 0, 0 },
+	{ 0x043c, 0xb8, 0, 0 },
+	{ 0x0400, 0x91, 0, 0 },
+	{ 0x0404, 0x0c, 0, 0 },
+	{ 0x0420, 0x00, 0, 0 },
+	{ 0x0408, 0x04, 0, 2 },
+	{ 0x0410, 0x52, 0, 0 },
+	{ 0x0438, 0xfe, 0, 0 },
+	{ 0x045c, 0xc0, 0, 0 },
+	{ 0x0460, 0x0d, 0, 0 },
+	{ 0x0800, 0x02, 0, 0 },
+	{ 0x0000, 0x00, 0, 4 },
+	{ 0x0630, 0x00, 0, 0 },
+	{ 0x0c04, 0x00, 0, 0 },
+	{ 0x0c10, 0x00, 0, 0 },
+	{ 0x0c00, 0x0f, 0, 0 },
+	{ 0x0c08, 0x06, 0, 0 },
+	{ 0x0c04, 0x07, 0, 0 },
+	{ 0x062c, 0x01, 0, 0 },
+	{ 0x0634, 0x0f, 0, 0 },
+	{ 0x0610, 0x50, 0, 0 },
+	{ 0x061c, 0x0a, 0, 0 },
+	{ 0x0614, 0x60, 0, 0 },
+	{ 0x0628, 0x00, 0, 0 },
+	{ 0x063c, 0xb8, 0, 0 },
+	{ 0x0600, 0x91, 0, 0 },
+	{ 0x0604, 0x0c, 0, 0 },
+	{ 0x0620, 0x00, 0, 0 },
+	{ 0x0608, 0x04, 0, 2 },
+	{ 0x0610, 0x52, 0, 0 },
+	{ 0x0638, 0xfe, 0, 0 },
+	{ 0x065c, 0xc0, 0, 0 },
+	{ 0x0660, 0x0d, 0, 0 },
+	{ 0x0800, 0x02, 0, 0 },
+	{ 0x0000, 0x00, 0, 4 },
+};
+
+/* CSIPHY0 bring-up (camss-csiphy-3ph-1-0.c, CAMSS_7150). base 0xace0000, common ctrl offset 0x800,
+ * status offset 0xb0, 300 MHz timer. Needs CSIPHY clocks on (camss_csiphy_clocks_on). */
+static vm_offset_t csiphy0;
+#define CSP_CTRL(n)    (csiphy0 + 0x800 + 4u * (n))
+#define CSP_STAT(n)    (csiphy0 + 0x800 + 0xb0 + 4u * (n))
+
+static void
+csiphy0_init(void)
+{
+    uint32_t hw_version;
+    int settle;
+    char line[160];
+
+    csiphy0 = ml_io_map(0xace0000UL, 0x4000);     /* 16 KB: covers lane regs + common block */
+    if (csiphy0 == 0) {
+        camlog("camera: CSIPHY0 map failed\n");
+        return;
+    }
+    /* HW version (sanity: block alive + clocked): CTRL6 = SHOW_REV_ID(bit1), read status 12..15 */
+    WR(CSP_CTRL(6), 0x2u);
+    __asm__ volatile ("dsb sy" ::: "memory");
+    hw_version  = (RD(CSP_STAT(12)) & 0xff);
+    hw_version |= (RD(CSP_STAT(13)) & 0xff) << 8;
+    hw_version |= (RD(CSP_STAT(14)) & 0xff) << 16;
+    hw_version |= (RD(CSP_STAT(15)) & 0xff) << 24;
+
+    /* settle count: link_freq = 321 MHz * mclk/24000 (DDR half of the 642 Mbps link); timer 300 MHz */
+    {
+        uint64_t link = 321000000ULL * (uint64_t)cam_mclk_khz / 24000ULL;
+        uint64_t ui   = (1000000000000ULL / link) / 2ULL;      /* ps */
+        uint64_t ths  = 85000ULL + 6ULL * ui;
+        uint64_t tper = 1000000000000ULL / 300000000ULL;       /* 3333 ps */
+        settle = (int)(ths / tper) - 6;
+        if (settle < 0) settle = 0;
+        if (settle > 0xff) settle = 0xff;
+    }
+
+    /* reset */
+    WR(CSP_CTRL(0), 0x1u);
+    __asm__ volatile ("dsb sy" ::: "memory");
+    delay(5000);
+    WR(CSP_CTRL(0), 0x0u);
+    __asm__ volatile ("dsb sy" ::: "memory");
+
+    /* common control: lane_mask (CLK_ENABLE bit7 | data lanes 0-3 = 0x8f), pwrdn_b, ctrl7=2, ctrl0=0 */
+    WR(CSP_CTRL(5), 0x8fu);
+    WR(CSP_CTRL(6), 0x1u);
+    WR(CSP_CTRL(7), 0x02u);
+    WR(CSP_CTRL(0), 0x00u);
+    __asm__ volatile ("dsb sy" ::: "memory");
+
+    /* apply the lane table (settle byte substituted where param==2) */
+    for (unsigned i = 0; i < sizeof(csiphy0_lane_regs) / sizeof(csiphy0_lane_regs[0]); i++) {
+        const struct csiphy_reg *r = &csiphy0_lane_regs[i];
+        uint32_t val;
+        if (r->param == 4 || r->param == 7) { continue; }      /* DNP / SKEW: skip */
+        else if (r->param == 2) { val = (uint32_t)(settle & 0xff); }
+        else if (r->param == 3) { val = (uint32_t)((settle >> 8) & 0xff); }
+        else { val = r->data; }
+        WR(csiphy0 + r->addr, val);
+        if (r->delay_us) { delay(r->delay_us); }
+    }
+    __asm__ volatile ("dsb sy" ::: "memory");
+
+    /* clear common ctrl 11..21 (interrupt masks) */
+    for (unsigned n = 11; n <= 21; n++) { WR(CSP_CTRL(n), 0); }
+    __asm__ volatile ("dsb sy" ::: "memory");
+
+    snprintf(line, sizeof(line), "camera: CSIPHY0 init - hw_version %#x, settle_cnt %d (0x%x), link@%u kHz MCLK; CTRL5 readback %#x\n",
+        hw_version, settle, settle, cam_mclk_khz, RD(CSP_CTRL(5)));
+    camlog(line);
 }
 
 static void
@@ -818,6 +1040,9 @@ rear_sensor_probe(struct i2c *slg)
     camcc_mclk0_on();
     if (cam_level >= 4) {
         camss_csiphy_clocks_on();       /* M2b: PLL0 + CSIPHY0/phytimer 300 MHz data clocks */
+    }
+    if (cam_level >= 5) {
+        csiphy0_init();                 /* M2b: CSIPHY0 reset + lane config + settle (arm receive path) */
     }
     delay(2000);
     /* reset high */
