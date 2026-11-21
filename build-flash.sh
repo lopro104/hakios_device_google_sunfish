@@ -8,6 +8,11 @@ export PATH="$HOME/hakios/xnu-deps/host/bin:$HOME/theos/toolchain/linux/iphone/b
 # METAL=1: CoreAnimation's window server on Metal (hakios-metal for the Adreno 618, make ios CHIP=618 MESA=1 in hakios-metal/) instead of OpenGL ES;
 # run it with  FLASH=1 METAL=1 devices/sunfish/run.sh  (boot arguments metal=1 and ca_metallib=)
 [ -n "$METAL" ] && export METAL_PLUGIN=ca EXTRA_SHARE="$HOME/ca-share" CHIP=618 HAKIOS_METAL="$PWD/hakios-metal"
+# the audio DSP's and Bluetooth's firmware (adsp.mdt, crbtfw21.tlv, ...) from the EvolutionX build, unless FW_ADSP says otherwise:
+# an image without it has no sound and no Bluetooth ("bt: the firmware files are not in the image"). FW_ADSP= for none.
+[ -z "${FW_ADSP+x}" ] && [ -f "$HOME/evox17/out/target/product/sunfish/vendor/firmware/adsp.mdt" ] && \
+	export FW_ADSP="$HOME/evox17/out/target/product/sunfish/vendor/firmware"
+[ -n "$FW_ADSP" ] || echo "build-flash.sh: NO FW_ADSP: this image has no sound and no Bluetooth"
 # our own applications for the home screen (devices/sunfish/apps/): built here, shown by init
 mkdir -p build/apps && for app in devices/sunfish/apps/*/; do
 	[ -x "$app/build.sh" ] && "$app/build.sh" >/dev/null 2>&1 && rm -rf "build/apps/$(basename "$app").app" && cp -R "$app/build/$(basename "$app").app" build/apps/
