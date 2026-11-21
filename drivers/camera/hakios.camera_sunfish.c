@@ -621,6 +621,79 @@ camcc_pll2_up(void)
     }
 }
 
+/* camcc PLL0 (FABIA, offset 0x0) -> 1200 MHz; OUT_EVEN = 600 MHz, source for the CSIPHY/phytimer 300 MHz.
+ * PLL0 uses clk_alpha_pll_fabia_ops: the FABIA OPMODE enable (STANDBY/RUN), unlike PLL2 (agera/classic). */
+#define PLL0                0x0
+#define PLL_TEST_CTL        0x1c
+static void
+camcc_pll0_up(void)
+{
+    vm_offset_t b = camcc + PLL0;
+
+    if (RD(b + PLL2_MODE) & 1u) {               /* already running (OUTCTRL) */
+        return;
+    }
+    /* configure (write_config skips zeros): L, FRAC(alpha), TEST_CTL, USER_CTL postdiv */
+    WR(b + PLL2_L_VAL, 0x3e);
+    WR(b + PLL2_FRAC, 0x8000);                  /* alpha (fractional 0.5) */
+    WR(b + PLL_TEST_CTL, 0x40000000);
+    WR(b + PLL2_USER_CTL, (RD(b + PLL2_USER_CTL) & ~0xff00u) | 0x3100u);  /* post_div bits[15:8]=0x31 */
+    WR(b + PLL2_MODE, RD(b + PLL2_MODE) | 0x800000u);   /* UPDATE_BYPASS */
+    WR(b + PLL2_MODE, RD(b + PLL2_MODE) | 4u);          /* RESET_N (configure) */
+    __asm__ volatile ("dsb sy" ::: "memory");
+    /* fabia enable: OUTCTRL off, OPMODE STANDBY, RESET_N, OPMODE RUN, wait lock, OUT_MASK, OUTCTRL */
+    WR(b + PLL2_MODE, RD(b + PLL2_MODE) & ~1u);
+    WR(b + PLL2_OPMODE, 0);
+    WR(b + PLL2_MODE, RD(b + PLL2_MODE) | 4u);
+    __asm__ volatile ("dsb sy" ::: "memory");
+    delay(10);
+    WR(b + PLL2_OPMODE, 1);
+    __asm__ volatile ("dsb sy" ::: "memory");
+    {
+        int locked = 0;
+        char line[96];
+        for (int i = 0; i < 500; i++) {
+            if (RD(b + PLL2_MODE) & 0x80000000u) { locked = 1; break; }
+            delay(10);
+        }
+        WR(b + PLL2_USER_CTL, RD(b + PLL2_USER_CTL) | 0x7u);   /* PLL_OUT_MASK (fabia enables outputs) */
+        WR(b + PLL2_MODE, RD(b + PLL2_MODE) | 1u);             /* OUTCTRL */
+        __asm__ volatile ("dsb sy" ::: "memory");
+        snprintf(line, sizeof(line), "camera: PLL0 %s (mode %#x)\n", locked ? "LOCKED" : "did NOT lock", RD(b + PLL2_MODE));
+        camlog(line);
+    }
+}
+
+/* program a camcc root clock (RCG): write CFG (src_sel<<8 | src_div field), pulse UPDATE */
+static void
+camcc_rcg_set(uint32_t cmd_off, uint32_t src_sel, uint32_t div_field)
+{
+    WR(camcc + cmd_off + 4, (RD(camcc + cmd_off + 4) & ~0x37ffu) | (src_sel << 8) | div_field);
+    WR(camcc + cmd_off, RD(camcc + cmd_off) | RCG_UPDATE);
+    __asm__ volatile ("dsb sy" ::: "memory");
+    for (int i = 0; i < 100 && (RD(camcc + cmd_off) & RCG_UPDATE); i++) { delay(100); }
+}
+
+/* CSIPHY0 data clocks: cphy_rx (300 MHz) and csi0phytimer (300 MHz), both PLL0_OUT_EVEN/2.
+ * titan_top GDSC is already on (camcc_mclk0_on). */
+static void
+camss_csiphy_clocks_on(void)
+{
+    camcc_pll0_up();
+    camcc_rcg_set(0x6004, 2, 3);        /* csi0phytimer_src: src 2 (OUT_EVEN), /2 (field 2*2-1=3) */
+    camcc_rcg_set(0xa064, 2, 3);        /* cphy_rx_src: src 2 (OUT_EVEN), /2 */
+    WR(camcc + 0x601c, RD(camcc + 0x601c) | 1u);   /* csi0phytimer_clk branch */
+    WR(camcc + 0x6020, RD(camcc + 0x6020) | 1u);   /* csiphy0_clk branch */
+    __asm__ volatile ("dsb sy" ::: "memory");
+    delay(1000);
+    {
+        char line[128];
+        snprintf(line, sizeof(line), "camera: CSIPHY clocks - phytimer CBCR %#x, csiphy0 CBCR %#x, cphy_rx cfg %#x (bit31=off)\n",
+            RD(camcc + 0x601c), RD(camcc + 0x6020), RD(camcc + 0xa068));
+        camlog(line);
+    }
+}
+
 static void
 camcc_mclk0_on(void)
 {
@@ -743,6 +816,9 @@ rear_sensor_probe(struct i2c *slg)
     (void)i2c_write_reg16(slg, SLG_ADDR, SLG_MATRIX_CONF_A, 0x4d);       /* enable LDO1,3,4,7 */
     delay(5000);
     camcc_mclk0_on();
+    if (cam_level >= 4) {
+        camss_csiphy_clocks_on();       /* M2b: PLL0 + CSIPHY0/phytimer 300 MHz data clocks */
+    }
     delay(2000);
     /* reset high */
     rst = pin(CAM_RESET_GPIO);
