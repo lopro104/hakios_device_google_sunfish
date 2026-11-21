@@ -5,8 +5,11 @@
  * ios-sunfish research/camera/sunfish-camera-hw.md). Nothing here streams yet: it brings the power up step by step and
  * reads a chip's ID, so the chain is proven before the ISP is wired.
  *
- *   cam=1   the camera PMIC (SLG51000) read: is it powered and on its I2C bus?
- *   cam=2   ... and the rear sensor's full power-up + IMX363 chip ID (0x0363) over CCI0
+ *   cam=5   the camera for Darwin: the whole chain up, the IMX363 streaming 2016x1512 RAW10 into a ring of four
+ *           buffers, served as /dev/hakios-camera (sys/hakios.camera.h, the same device the POCO's driver makes, so
+ *           mediaserverd's libhakios.media takes it unchanged); with it the loader gives Darwin the camera's ISP node
+ *   cam_stage=N  bring-up steps instead: 1 SLG51000 read, 2 + rear power/MCLK/chip id, 3 + stream, 4 + PLL0/CSIPHY
+ *           clocks, 5 + CSIPHY0, 6 + CSID0, 7 + VFE0 DMA of one frame saved to /private/var/root/cam-frame.raw
  *
  * Buses are bit-banged on the TLMM pins Android muxes to the hardware I2C (the pins taken as GPIO for each transaction
  * and left as they were), the way drivers/camera/hakios.camera.c does it. Writes to no PMIC's SPMI here except the one
@@ -27,6 +30,12 @@
 #include <sys/mount.h>
 #include <sys/vnode_if.h>
 #include <machine/machine_routines.h>
+#include <kern/locks.h>
+#include <kern/thread.h>
+#include <sys/conf.h>
+#include <sys/errno.h>
+#include <miscfs/devfs/devfs.h>
+#include <sys/hakios.camera.h>
 
 /* ---- inlined imx363_regs.h (build copies only the .c into bsd/dev) ---- */
 /* Generated from sm7150-mainline drivers/media/i2c/imx363.c (binned 2016x1512, 642 Mbps/lane, 24 MHz, 4-lane). */
@@ -987,10 +996,6 @@ csid0_init(void)
     CSID_WR(0x328, 1); CSID_WR(0x324, 0);             /* pixel drop */
     CSID_WR(0x330, 1); CSID_WR(0x32c, 0);             /* line drop */
     CSID_WR(0x308, 0);
-    if (cam_level >= 7) {                            /* vertical crop lines 0..767: a frame of 768 x 2520 B fits 2 MiB */
-        CSID_WR(0x320, (767u << 16) | 0u);
-        CSID_WR(0x300, CSID_RD(0x300) | (1u << 6));
-    }
     CSID_WR(0x300, CSID_RD(0x300) | (1u << 31));     /* RDI0 enable */
     /* CSI2 RX: 4 lanes (3), lane assign 0x3210, PHY 0, D-PHY; ECC correction + MISR */
     CSID_WR(0x100, 3u | (0x3210u << 4) | (0u << 20));
@@ -1083,6 +1088,24 @@ static uint64_t cam_buf_pa;
 static int cam_smmu_bank = -1;
 #define VFE_RD(o)       RD(vfe0 + (o))
 #define VFE_WR(o, v)    WR(vfe0 + (o), (v))
+#define CAM_SERVE       8                       /* cam_level of cam=5: the ring and /dev/hakios-camera */
+extern int hakios_sm7150_smmu_chunks_masked(const uint32_t *sids, const uint32_t *masks, unsigned n, uint64_t iova,
+    const uint64_t *pas, unsigned nchunks, uint32_t chunk_pages);
+
+/*
+ * The ring (cam=5): four 4 MiB buffers at IOVA CAM_IOVA + i * 4 MiB. The write master keeps a FIFO of image
+ * addresses (Linux camss-vfe gen2: two given at start, one more at every buffer done): each "WM0 buffer done" is the
+ * oldest address given. A buffer is FREE, HW (given, in the FIFO), READY (a whole frame, the newest) or READING (a
+ * read() copying it out). Two HW + one READY + one READING = four, so there is always one to give.
+ */
+#define CAM_NBUF        4
+enum { SLOT_FREE, SLOT_HW, SLOT_READY, SLOT_READING };
+static struct cam_slot {
+    vm_offset_t va;
+    uint64_t    pa, seq, time, given;
+    uint32_t    state, exposure, gain, frame_lines;
+} slot[CAM_NBUF];
+static void ring_fill(void);
 
 static void
 vfe0_init(void)
@@ -1115,6 +1138,24 @@ vfe0_init(void)
     VFE_WR(0x064, 1u << 31);
     VFE_WR(0x058, 1u);
 
+    if (cam_level >= CAM_SERVE) {
+        uint64_t pas[CAM_NBUF];
+        static const uint32_t sids[3]  = { 0x900, 0x880, 0x820 };
+        static const uint32_t masks[3] = { 0x460, 0x460, 0x440 };
+
+        for (i = 0; i < CAM_NBUF; i++) {
+            if (kmem_alloc_contig(kernel_map, &slot[i].va, CAM_BUF_SIZE, PAGE_MASK, 0, 0,
+                KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+                camlog("camera: no memory for the frame ring\n");
+                return;
+            }
+            slot[i].pa = pas[i] = kvtophys(slot[i].va);
+            slot[i].state = SLOT_FREE;
+        }
+        cam_buf = slot[0].va;
+        cam_buf_pa = slot[0].pa;
+        cam_smmu_bank = hakios_sm7150_smmu_chunks_masked(sids, masks, 3, CAM_IOVA, pas, CAM_NBUF, CAM_BUF_SIZE >> 12);
+    } else {
     /* DMA buffer: 4 MiB physically contiguous, filled with 0xa5 so the written part shows */
     if (kmem_alloc_contig(kernel_map, &cam_buf, CAM_BUF_SIZE, PAGE_MASK, 0, 0,
         KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
@@ -1133,6 +1174,7 @@ vfe0_init(void)
         static const uint32_t masks[3] = { 0x460, 0x460, 0x440 };
         cam_smmu_bank = hakios_sm7150_smmu_pages_masked(sids, masks, 3, CAM_IOVA, cam_buf_pa, CAM_BUF_SIZE >> 12);
     }
+    }
 
     /* bus write master 0 (RDI0), as vfe_wm_start: frame-based (width/stride 0xff01), MIPI raw */
     VFE_WR(0x226c, (1u << 1) | (1u << 7));      /* WM debug status cfg */
@@ -1147,8 +1189,10 @@ vfe0_init(void)
     VFE_WR(0x2228, 0xff01u);                    /* stride: frame-based */
     VFE_WR(0x2248, 0); VFE_WR(0x224c, 1);       /* irq subsample: every frame */
     VFE_WR(0x2250, 0); VFE_WR(0x2254, 1);       /* frame drop: keep every frame */
-    VFE_WR(0x2214, (uint32_t)CAM_IOVA);         /* image address */
     VFE_WR(0x2258, 0);                          /* frame increment 0: frames overwrite the one buffer, never walk past it */
+    if (cam_level < CAM_SERVE) {
+        VFE_WR(0x2214, (uint32_t)CAM_IOVA);     /* image address (the ring's two first are given by ring_fill) */
+    }
     /* status latching (no interrupt line is enabled at the GIC) */
     VFE_WR(0x05c, ~0u); VFE_WR(0x060, ~0u);
     VFE_WR(0x2044, ~0u); VFE_WR(0x2048, ~0u); VFE_WR(0x204c, ~0u);
@@ -1156,6 +1200,9 @@ vfe0_init(void)
     __asm__ volatile ("dsb sy" ::: "memory");
     VFE_WR(0x4ac, 1u << 1);                     /* reg update: RDI0 */
     __asm__ volatile ("dsb sy" ::: "memory");
+    if (cam_level >= CAM_SERVE) {
+        ring_fill();
+    }
     snprintf(line, sizeof(line),
         "camera: VFE0 init - ife clk cfg %#x cbcr %#x, reset %s (st0 %#x), buf pa %#llx, smmu bank %d, WM0 cfg %#x addr %#x\n",
         RD(camcc + 0xa014), RD(camcc + 0xa028), (st & (1u << 31)) ? "ack" : "TIMEOUT", st, cam_buf_pa, cam_smmu_bank,
@@ -1303,6 +1350,368 @@ imx_write_seq(struct i2c *cci, const struct imx_reg *regs, unsigned n)
     }
 }
 
+/* ---- cam=5: the frame ring and /dev/hakios-camera ----
+ * No interrupt line is wired: a kernel thread looks at the bus's "WM0 buffer done" every millisecond (a frame is ~33 ms),
+ * takes the oldest given buffer as the new frame, gives the write master another, and applies what AE asked for. */
+#define IMX_FRAME_LINES     3170u               /* the 2016x1512 mode's frame_length_lines (0x0340 = 0x0c62) */
+#define IMX_FRAME_LINES_MAX (4u * IMX_FRAME_LINES)  /* the longest frame AE may ask for: 7.5 frames a second */
+#define IMX_MARGIN          16u                 /* coarse integration at most frame_length - 16 (the mode's own 0x0c52) */
+#define IMX_GAIN_UNITY      256u                /* gain as the header gives it: linear, 256 = 1x ... */
+#define IMX_GAIN_MAX        (16u * IMX_GAIN_UNITY)  /* ... to 16x: analog code 512 - 512 / x, 480 at 16x */
+
+static LCK_GRP_DECLARE(cam_lck_grp, "hakios-camera");
+static LCK_MTX_DECLARE(cam_mtx, &cam_lck_grp);
+static struct i2c cam_cci = { CCI0_SDA_GPIO, CCI0_SCL_GPIO };
+static uint64_t ring_seq, ring_given, ring_read_seq, ring_last_done, ring_misses;
+static uint32_t ring_hw;                        /* buffers in the write master's FIFO */
+static bool ring_on, cam_fault;
+static uint32_t line_ns = 10515;                /* measured from the frames' spacing; ~30 frames a second at first */
+/* the exposure now in the sensor (as written: frames from ring_eff_seq on carry it) and the one before */
+static uint32_t cur_lines = 0x0c52, cur_gain = IMX_GAIN_UNITY, cur_flines = IMX_FRAME_LINES;
+static uint32_t old_lines = 0x0c52, old_gain = IMX_GAIN_UNITY, old_flines = IMX_FRAME_LINES;
+static uint64_t ring_eff_seq;
+static struct { bool pending; uint32_t lines, gain, flines; } cam_ask;
+
+#define CANARY_AT   (CAM_FRAME_BYTES - 64)      /* the frame's last 64 bytes: 0xa5 until the write master gets there */
+
+static void
+cache_flush(vm_offset_t va, uint32_t bytes)
+{
+    for (vm_offset_t a = va & ~63ul; a < va + bytes; a += 64) {
+        __asm__ volatile ("dc civac, %0" : : "r" (a) : "memory");
+    }
+    __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/* give the write master buffers until two are in its FIFO (cam_mtx held, or before the thread runs) */
+static void
+ring_fill(void)
+{
+    while (ring_hw < 2) {
+        int pick = -1;
+
+        for (int i = 0; i < CAM_NBUF; i++) {
+            if (slot[i].state == SLOT_FREE) {
+                pick = i;
+                break;
+            }
+        }
+        if (pick < 0) {
+            return;
+        }
+        memset((void *)(slot[pick].va + CANARY_AT), 0xa5, 64);
+        cache_flush(slot[pick].va + CANARY_AT, 64);
+        slot[pick].state = SLOT_HW;
+        slot[pick].given = ++ring_given;
+        ring_hw++;
+        VFE_WR(0x2214, (uint32_t)(CAM_IOVA + (uint64_t)pick * CAM_BUF_SIZE));
+        __asm__ volatile ("dsb sy" ::: "memory");
+        VFE_WR(0x4ac, 1u << 1);                 /* reg update RDI0: the address goes into the FIFO */
+        __asm__ volatile ("dsb sy" ::: "memory");
+    }
+}
+
+/* WM0 finished a buffer: the oldest one given (cam_mtx held) */
+static void
+ring_done(void)
+{
+    uint64_t now = mach_absolute_time();
+    int done = -1;
+    bool canary_ok;
+
+    for (int i = 0; i < CAM_NBUF; i++) {
+        if (slot[i].state == SLOT_HW && (done < 0 || slot[i].given < slot[done].given)) {
+            done = i;
+        }
+    }
+    if (done < 0) {
+        ring_misses++;
+        return;
+    }
+    cache_flush(slot[done].va + CANARY_AT, 64);
+    canary_ok = false;
+    for (int k = 0; k < 64; k++) {
+        if (((volatile uint8_t *)(slot[done].va + CANARY_AT))[k] != 0xa5) {
+            canary_ok = true;
+            break;
+        }
+    }
+    if (!canary_ok) {
+        ring_misses++;                          /* (the FIFO not as thought, or a short frame): counted, said below */
+    }
+    for (int i = 0; i < CAM_NBUF; i++) {
+        if (slot[i].state == SLOT_READY) {
+            slot[i].state = SLOT_FREE;          /* only the newest frame is kept */
+        }
+    }
+    ring_hw--;
+    slot[done].state = SLOT_READY;
+    slot[done].seq = ++ring_seq;
+    slot[done].time = now;
+    if (ring_seq >= ring_eff_seq) {
+        slot[done].exposure = cur_lines;
+        slot[done].gain = cur_gain;
+        slot[done].frame_lines = cur_flines;
+    } else {
+        slot[done].exposure = old_lines;
+        slot[done].gain = old_gain;
+        slot[done].frame_lines = old_flines;
+    }
+    if (ring_last_done != 0) {
+        uint64_t ns;
+
+        absolutetime_to_nanoseconds(now - ring_last_done, &ns);
+        if (ns > 20000000ull && ns < 2000000000ull) {
+            uint32_t l = (uint32_t)(ns / slot[done].frame_lines);
+            line_ns = (line_ns * 7 + l) / 8;    /* (a missed poll makes one spacing long, a little) */
+        }
+    }
+    ring_last_done = now;
+    ring_fill();
+}
+
+/* the sensor's exposure, in one group (IMX grouped parameter hold, 0x0104) */
+static void
+imx_exposure(uint32_t lines, uint32_t gain, uint32_t flines)
+{
+    uint32_t code = 512u - (512u * IMX_GAIN_UNITY + gain / 2) / gain;
+
+    code = code > 480u ? 480u : code;
+    (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0104, 0x01);
+    (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0340, (uint8_t)(flines >> 8));
+    (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0341, (uint8_t)flines);
+    (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0202, (uint8_t)(lines >> 8));
+    (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0203, (uint8_t)lines);
+    (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0204, (uint8_t)(code >> 8));
+    (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0205, (uint8_t)code);
+    (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0104, 0x00);
+}
+
+static void
+ring_thread(__unused void *parameter, __unused wait_result_t result)
+{
+    uint64_t said = 0;
+    char line[200];
+
+    lck_mtx_lock(&cam_mtx);
+    for (;;) {
+        struct timespec ts = { 0, 1000000 };
+        uint32_t st0 = VFE_RD(0x205c), st1 = VFE_RD(0x2060);
+
+        if (st0 | st1) {
+            VFE_WR(0x2050, st0);
+            VFE_WR(0x2054, st1);
+            VFE_WR(0x2068, 1u);                 /* bus irq global clear */
+            __asm__ volatile ("dsb sy" ::: "memory");
+            if (st1 & 1u) {
+                ring_done();
+                wakeup(&ring_seq);
+            }
+            if (st0 & ((1u << 13) | (1u << 14))) {
+                snprintf(line, sizeof(line), "camera: WM bus status %#x (overflow/violation) at frame %llu\n", st0, ring_seq);
+                camlog(line);
+            }
+        }
+        if (cam_ask.pending) {
+            uint32_t l = cam_ask.lines, g = cam_ask.gain, fl = cam_ask.flines;
+
+            cam_ask.pending = false;
+            g = g < IMX_GAIN_UNITY ? IMX_GAIN_UNITY : g > IMX_GAIN_MAX ? IMX_GAIN_MAX : g;
+            l = l < 4 ? 4 : l;
+            if (fl == 0) {
+                fl = l + IMX_MARGIN < IMX_FRAME_LINES ? IMX_FRAME_LINES : l + IMX_MARGIN;
+            }
+            fl = fl < IMX_FRAME_LINES ? IMX_FRAME_LINES : fl > IMX_FRAME_LINES_MAX ? IMX_FRAME_LINES_MAX : fl;
+            l = l > fl - IMX_MARGIN ? fl - IMX_MARGIN : l;
+            lck_mtx_unlock(&cam_mtx);
+            imx_exposure(l, g, fl);             /* (the bus is slow: not under the lock) */
+            lck_mtx_lock(&cam_mtx);
+            old_lines = cur_lines; old_gain = cur_gain; old_flines = cur_flines;
+            cur_lines = l; cur_gain = g; cur_flines = fl;
+            ring_eff_seq = ring_seq + 2;        /* the frame after the one now coming */
+        }
+        if (ring_seq >= said + (said < 300 ? 30 : 900)) {
+            uint32_t fsr, gfsr, gfsynr1;
+            uint64_t far;
+
+            said = ring_seq;
+            hakios_sm7150_smmu_status(&fsr, &far, &gfsr, &gfsynr1);
+            snprintf(line, sizeof(line),
+                "camera: frame %llu, line %u ns (%u.%u fps), exposure %u lines gain %u/256, misses %llu, smmu fsr %#x\n",
+                ring_seq, line_ns, 1000000000u / (line_ns * cur_flines), (10000000000ull / ((uint64_t)line_ns * cur_flines)) % 10,
+                cur_lines, cur_gain, ring_misses, fsr);
+            camlog(line);
+        }
+        (void)msleep(&ring_on, &cam_mtx, PZERO, "hakios-camera-wm", &ts);
+    }
+}
+
+/* /dev/hakios-camera (sys/hakios.camera.h) */
+static int
+camdev_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
+{
+    return 0;
+}
+
+static int
+camdev_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
+{
+    return 0;
+}
+
+static int
+camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+    struct hakios_camera_frame f;
+    int b = -1, error = 0;
+    bool whole;
+
+    lck_mtx_lock(&cam_mtx);
+    for (;;) {
+        struct timespec ts = { 1, 0 };
+
+        if (cam_fault) {
+            lck_mtx_unlock(&cam_mtx);
+            return EIO;
+        }
+        for (int i = 0; i < CAM_NBUF; i++) {
+            if ((slot[i].state == SLOT_READY || slot[i].state == SLOT_READING) && slot[i].seq > ring_read_seq &&
+                (b < 0 || slot[i].seq > slot[b].seq)) {
+                b = i;
+            }
+        }
+        if (b >= 0 && slot[b].state == SLOT_READY) {
+            break;
+        }
+        b = -1;
+        error = msleep(&ring_seq, &cam_mtx, PZERO | PCATCH, "hakios-camera", &ts);
+        if (error != 0) {
+            lck_mtx_unlock(&cam_mtx);
+            return error == EWOULDBLOCK ? EAGAIN : error;
+        }
+    }
+    bzero(&f, sizeof(f));
+    memcpy(f.magic, HAKIOS_CAMERA_MAGIC, sizeof(f.magic));
+    f.header_bytes = sizeof(f);
+    f.width = 2016;
+    f.height = 1512;
+    f.stride = CAM_LINE_BYTES;
+    f.format = 1;
+    f.bayer = 0;                                /* RGGB (the first picture's colours) */
+    f.black = 64;
+    f.sequence = slot[b].seq;
+    f.time = slot[b].time;
+    f.exposure_lines = slot[b].exposure;
+    f.line_ns = line_ns;
+    f.gain = slot[b].gain;
+    f.gain_unity = IMX_GAIN_UNITY;
+    f.gain_max = IMX_GAIN_MAX;
+    f.frame_lines = slot[b].frame_lines;
+    f.frame_lines_min = IMX_FRAME_LINES;
+    f.frame_lines_max = IMX_FRAME_LINES_MAX;
+    f.margin = IMX_MARGIN;
+    f.sensor = 1;                               /* the wide (back) camera, as camera_device.c's cameras[0] */
+    f.focus = HAKIOS_CAMERA_NO_FOCUS;
+    whole = uio_resid(uio) > (user_ssize_t)sizeof(f);
+    if (whole) {
+        slot[b].state = SLOT_READING;           /* the frame is this reader's: not given back to the write master */
+        ring_read_seq = slot[b].seq;
+    }
+    lck_mtx_unlock(&cam_mtx);
+
+    error = uiomove((caddr_t)&f, (int)MIN(sizeof(f), (size_t)uio_resid(uio)), uio);
+    if (!whole) {
+        return error;                           /* the header alone: the frame stays the next one to read */
+    }
+    if (error == 0 && uio_resid(uio) > 0) {
+        uint32_t n = (uint32_t)MIN((uint64_t)CAM_FRAME_BYTES, (uint64_t)uio_resid(uio));
+
+        cache_flush(slot[b].va, n);             /* (what the write master wrote went past the caches) */
+        error = uiomove((caddr_t)slot[b].va, (int)n, uio);
+    }
+    lck_mtx_lock(&cam_mtx);
+    if (slot[b].state == SLOT_READING) {
+        bool newer = false;
+
+        for (int i = 0; i < CAM_NBUF; i++) {
+            newer |= slot[i].state == SLOT_READY && slot[i].seq > slot[b].seq;
+        }
+        slot[b].state = newer ? SLOT_FREE : SLOT_READY;
+        if (vfe0 != 0) {
+            ring_fill();                        /* (should the FIFO have run short while this one was read) */
+        }
+    }
+    lck_mtx_unlock(&cam_mtx);
+    return error;
+}
+
+static int
+camdev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+    struct hakios_camera_command c;
+
+    if (uio_resid(uio) < (user_ssize_t)sizeof(c) || uiomove((caddr_t)&c, sizeof(c), uio) != 0) {
+        return EINVAL;
+    }
+    switch (c.command) {
+    case HAKIOS_CAMERA_EXPOSURE:
+        lck_mtx_lock(&cam_mtx);
+        cam_ask.lines = c.a;
+        cam_ask.gain = c.b;
+        cam_ask.flines = c.c;
+        cam_ask.pending = true;
+        lck_mtx_unlock(&cam_mtx);
+        return 0;
+    case HAKIOS_CAMERA_SENSOR:
+        return c.a == 1 ? 0 : EINVAL;           /* only the back camera so far */
+    case HAKIOS_CAMERA_FOCUS:
+        return 0;                               /* (no lens motor driven yet) */
+    case HAKIOS_CAMERA_KEEP:
+        return ENOSPC;
+    default:
+        return EINVAL;
+    }
+}
+
+static const struct cdevsw camdev_cdevsw = {
+    .d_open = camdev_open, .d_close = camdev_close, .d_read = camdev_read, .d_write = camdev_write,
+    .d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
+    .d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+};
+
+static void
+camdev_make(void)
+{
+    int major = cdevsw_add(-1, &camdev_cdevsw);
+    bool made = major >= 0 && devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "hakios-camera") != NULL;
+
+    camlog(made ? "camera: /dev/hakios-camera made (frames from the probe on)\n" : "camera: /dev/hakios-camera NOT made\n");
+}
+
+/* after stream-on: the frames start coming into the ring, and the thread that looks after it */
+static void
+ring_start(void)
+{
+    thread_t thread;
+    char line[160];
+
+    if (vfe0 == 0 || cam_smmu_bank < 0 || ring_hw == 0) {
+        camlog("camera: the frame ring is not there (VFE/SMMU/buffers): no frames\n");
+        lck_mtx_lock(&cam_mtx);
+        cam_fault = true;
+        lck_mtx_unlock(&cam_mtx);
+        wakeup(&ring_seq);
+        return;
+    }
+    ring_on = true;
+    if (kernel_thread_start(ring_thread, NULL, &thread) == KERN_SUCCESS) {
+        thread_deallocate(thread);
+    }
+    snprintf(line, sizeof(line), "camera: frame ring on - %u buffers of %u B, %u given, smmu bank %d\n",
+        CAM_NBUF, CAM_FRAME_BYTES, ring_hw, cam_smmu_bank);
+    camlog(line);
+}
+
 static void
 rear_sensor_stream(struct i2c *cci)
 {
@@ -1332,6 +1741,12 @@ rear_sensor_stream(struct i2c *cci)
     (void)i2c_read_reg16(cci, IMX_ADDR, 0x0100, &s, 1);
     snprintf(line, sizeof(line), "camera: IMX363 STREAM ON (2016x1512, 642 Mbps/lane); mode_select readback=%02x (want 01)\n", s);
     camlog(line);
+    if (cam_level >= CAM_SERVE) {
+        delay(200000);
+        csid0_report("+205ms");
+        ring_start();
+        return;
+    }
     csid0_report("+5ms");
     delay(200000);
     csid0_report("+205ms");
@@ -1477,6 +1892,44 @@ static void
 camera_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
     camera_probe();
+    if (cam_level >= CAM_SERVE && !ring_on) {
+        lck_mtx_lock(&cam_mtx);
+        cam_fault = true;                       /* (the probe stopped short: readers are told, not left waiting) */
+        lck_mtx_unlock(&cam_mtx);
+        wakeup(&ring_seq);
+    }
+}
+
+/*
+ * From bsd_init (hakios_audio_init), once devfs is there and before launchd: the node, so mediaserverd -- which looks
+ * for cameras once, as it starts -- finds it. Reads say EAGAIN until the frames come (the probe, at 90 s).
+ */
+void hakios_camera_init(void);
+void
+hakios_camera_init(void)
+{
+    if (cam_level >= CAM_SERVE) {
+        camdev_make();
+    }
+}
+
+/*
+ * The run's end (loader_return, maybe in a panic: no locks, no sleeping): the write master stopped, so nothing writes
+ * into memory the loader takes back, and the sensor to standby.
+ */
+void hakios_camera_quiesce(void);
+void
+hakios_camera_quiesce(void)
+{
+    if (vfe0 != 0) {
+        VFE_WR(0x2208, 0);                      /* WM0 off */
+        __asm__ volatile ("dsb sy" ::: "memory");
+        VFE_WR(0x4ac, 1u << 1);
+        __asm__ volatile ("dsb sy" ::: "memory");
+    }
+    if (cam_level >= 3 && camcc != 0) {
+        (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0100, 0x00);    /* stream off */
+    }
 }
 
 __startup_func
@@ -1485,9 +1938,19 @@ camera_init(void)
 {
     uint64_t deadline;
 
+    uint32_t stage = 0;
+
     if (!PE_parse_boot_argn("cam", &cam_level, sizeof(cam_level)) || cam_level == 0) {
         return;
     }
+    cam_level = cam_level == 5 ? CAM_SERVE : 0;
+    if (PE_parse_boot_argn("cam_stage", &stage, sizeof(stage)) && stage >= 1 && stage <= 7) {
+        cam_level = stage;
+    }
+    if (cam_level == 0) {
+        return;
+    }
+
     /* at 90 s, so the result reaches the run log (early kernel messages are lost); the camera is idle until then */
     camlog("camera: cam set; probe in 90 s\n");
     cam_call = thread_call_allocate(camera_run, NULL);

@@ -2715,15 +2715,16 @@ hakios_sm7150_smmu_pages(uint32_t sid, uint64_t iova, uint64_t pa, uint32_t page
 /*
  * For the camera driver (hakios.camera_sunfish.c): like hakios_sm7150_smmu_pages, but for a device that writes on
  * several stream IDs it does not tell us exactly (the IFE: downstream msm_cam_smmu_ife lists masked groups). One
- * translating bank with `pages' 4 KiB pages of `pa' at a 32-bit `iova' (up to two 2 MiB stretches), and one MASKED SMR per
+ * translating bank with `pages' 4 KiB pages of `pa' at a 32-bit `iova' (up to eight 2 MiB stretches), and one MASKED SMR per
  * (sid, mask) pair, all pointing at that bank. A group that overlaps a valid SMR someone else owns is skipped (a
  * double match would be a stream-match conflict fault). Returns the bank, or -1. hakios_sm7150_smmu_status() reads
  * that bank's fault state and the global fault syndrome back.
  */
 static uint32_t g_cam_cbo;
-int hakios_sm7150_smmu_pages_masked(const uint32_t *sids, const uint32_t *masks, unsigned n, uint64_t iova, uint64_t pa, uint32_t pages);
-int
-hakios_sm7150_smmu_pages_masked(const uint32_t *sids, const uint32_t *masks, unsigned n, uint64_t iova, uint64_t pa, uint32_t pages)
+#define CAM_SMMU_L3_MAX 8                       /* L3 tables: 8 x 2 MiB = 16 MiB of IOVA */
+static int
+smmu_cam_map(const uint32_t *sids, const uint32_t *masks, unsigned n, uint64_t iova, const uint64_t *pas, unsigned nchunks,
+    uint32_t chunk_pages)
 {
 	uint32_t idr0, idr1, idr2, nsmr, ncb, page, cb_base, pasize;
 	uint32_t smr_for[8];
@@ -2734,8 +2735,16 @@ hakios_sm7150_smmu_pages_masked(const uint32_t *sids, const uint32_t *masks, uns
 	int cb = -1;
 	unsigned tries = 0, mapped = 0;
 
-	if (n == 0 || n > 8 || pages == 0 || pages > 1024 - ((iova >> 12) & 511) || ((iova | pa) & 0xfff) != 0 || iova >= (1ull << 32)) {
+	uint32_t pages = nchunks * chunk_pages, l3n = (uint32_t)((((iova >> 12) & 511) + pages + 511) / 512);
+
+	if (n == 0 || n > 8 || nchunks == 0 || chunk_pages == 0 || l3n > CAM_SMMU_L3_MAX || (iova & 0xfff) != 0 ||
+	    iova >= (1ull << 32) || ((iova >> 21) & 511) + l3n > 512) {
 		return -1;
+	}
+	for (unsigned c = 0; c < nchunks; c++) {
+		if (pas[c] & 0xfff) {
+			return -1;
+		}
 	}
 	if (g_smmu == NULL) {
 		g_smmu = (volatile uint32_t *)ml_io_map_unmappable(APPS_SMMU, 0x100000, WIMG_IO);
@@ -2787,19 +2796,22 @@ hakios_sm7150_smmu_pages_masked(const uint32_t *sids, const uint32_t *masks, uns
 			ev("SMMU cam: no free SMR for %#x/%#x", id, mk);
 		}
 	}
-	if (kmem_alloc_contig(kernel_map, &pt, 0x8000, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+	/* L0, L1, L2, then the L3 tables back to back (16 KiB pages: 0xc000 holds 3 + 8 tables of 4 KiB) */
+	if (kmem_alloc_contig(kernel_map, &pt, 0xc000, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 		return -1;
 	}
 	t = (volatile uint64_t *)pt;
 	pt_pa = kvtophys(pt);
 	t[(iova >> 39) & 511] = (pt_pa + 0x1000) | 3;                           /* L0 -> L1 */
 	t[0x1000 / 8 + ((iova >> 30) & 511)] = (pt_pa + 0x2000) | 3;            /* L1 -> L2 */
-	t[0x2000 / 8 + ((iova >> 21) & 511)] = (pt_pa + 0x3000) | 3;            /* L2 -> L3 (first 2 MiB) */
-	t[0x2000 / 8 + ((iova >> 21) & 511) + 1] = (pt_pa + 0x4000) | 3;        /* L2 -> L3 (second 2 MiB; tables contiguous) */
-	for (uint32_t i = 0; i < pages; i++) {
-		t[0x3000 / 8 + ((iova >> 12) & 511) + i] = (pa + ((uint64_t)i << 12)) | (1u << 10) | (2u << 8) | (1u << 6) | 3u;
+	for (uint32_t l = 0; l < l3n; l++) {
+		t[0x2000 / 8 + ((iova >> 21) & 511) + l] = (pt_pa + 0x3000 + 0x1000 * l) | 3;   /* L2 -> L3 (tables contiguous) */
 	}
-	for (int o = 0; o < 0x8000; o += 64) {
+	for (uint32_t i = 0; i < pages; i++) {
+		uint64_t pa = pas[i / chunk_pages] + ((uint64_t)(i % chunk_pages) << 12);
+		t[0x3000 / 8 + ((iova >> 12) & 511) + i] = pa | (1u << 10) | (2u << 8) | (1u << 6) | 3u;
+	}
+	for (int o = 0; o < 0xc000; o += 64) {
 		__asm__ volatile ("dc civac, %0" : : "r" ((uint8_t *)pt + o) : "memory");
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
@@ -2833,8 +2845,25 @@ hakios_sm7150_smmu_pages_masked(const uint32_t *sids, const uint32_t *masks, uns
 			mapped++;
 		}
 	}
-	ev("SMMU cam: bank %d, %u of %u stream groups mapped, %u pages iova %#llx -> pa %#llx", cb, mapped, n, pages, iova, pa);
+	ev("SMMU cam: bank %d, %u of %u stream groups mapped, %u pages iova %#llx in %u chunks", cb, mapped, n, pages, iova, nchunks);
 	return mapped ? cb : -1;
+}
+
+int hakios_sm7150_smmu_pages_masked(const uint32_t *sids, const uint32_t *masks, unsigned n, uint64_t iova, uint64_t pa, uint32_t pages);
+int
+hakios_sm7150_smmu_pages_masked(const uint32_t *sids, const uint32_t *masks, unsigned n, uint64_t iova, uint64_t pa, uint32_t pages)
+{
+	return smmu_cam_map(sids, masks, n, iova, &pa, 1, pages);
+}
+
+/* the same with `nchunks' physically separate pieces of `chunk_pages' each, back to back from `iova' (at most 16 MiB) */
+int hakios_sm7150_smmu_chunks_masked(const uint32_t *sids, const uint32_t *masks, unsigned n, uint64_t iova, const uint64_t *pas,
+    unsigned nchunks, uint32_t chunk_pages);
+int
+hakios_sm7150_smmu_chunks_masked(const uint32_t *sids, const uint32_t *masks, unsigned n, uint64_t iova, const uint64_t *pas,
+    unsigned nchunks, uint32_t chunk_pages)
+{
+	return smmu_cam_map(sids, masks, n, iova, pas, nchunks, chunk_pages);
 }
 
 /* the camera bank's fault status (FSR, FAR) and the global fault status + syndrome (GFSYNR1 low half = the stream) */
