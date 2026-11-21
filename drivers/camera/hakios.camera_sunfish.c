@@ -636,31 +636,39 @@ camcc_mclk0_on(void)
     if (camcc == 0) {
         return;
     }
-    camcc_pll2_up();            /* PLL2 for a 24 MHz MCLK (the IMX363 PLL tables assume 24 MHz) */
-    /* Try MCLK0 from PLL2_OUT_AUX (480 MHz), MND 1/20, /1 -> 24 MHz. */
-    WR(camcc + MCLK0_M, 1);
-    WR(camcc + MCLK0_N, (uint32_t)(~(20u - 1)) & 0xff);        /* ~(n-m) */
-    WR(camcc + MCLK0_D, (uint32_t)(~(2u * 19u)) & 0xff);       /* ~(2*d), d=clamp(n,m,n-m)=19 */
-    WR(camcc + MCLK0_CFG_RCGR, (RD(camcc + MCLK0_CFG_RCGR) & ~0x37ffu) | (5u << 8) | (2u << 12) | 0x01u); /* src 5 (AUX), MND, /1 */
-    WR(camcc + MCLK0_CMD_RCGR, RD(camcc + MCLK0_CMD_RCGR) | RCG_UPDATE);
-    __asm__ volatile ("dsb sy" ::: "memory");
-    for (int i = 0; i < 100 && (RD(camcc + MCLK0_CMD_RCGR) & RCG_UPDATE); i++) { delay(100); }
-    WR(camcc + MCLK0_CBCR, RD(camcc + MCLK0_CBCR) | 1u);
-    __asm__ volatile ("dsb sy" ::: "memory");
-    delay(1000);
-    /* If the branch did not start on AUX, fall back to the proven XO path (19.2 MHz, M1).
-     * The sensor tolerates 6-27 MHz; at 19.2 the MIPI link runs at 0.8x (settle count adjusts). */
-    if (RD(camcc + MCLK0_CBCR) & 0x80000000u) {
-        WR(camcc + MCLK0_CFG_RCGR, (RD(camcc + MCLK0_CFG_RCGR) & ~0x37ffu) | (0u << 8) | (0u << 12) | 0x01u); /* src 0 (TCXO), no MND, /1 */
-        WR(camcc + MCLK0_CMD_RCGR, RD(camcc + MCLK0_CMD_RCGR) | RCG_UPDATE);
-        __asm__ volatile ("dsb sy" ::: "memory");
-        for (int i = 0; i < 100 && (RD(camcc + MCLK0_CMD_RCGR) & RCG_UPDATE); i++) { delay(100); }
-        WR(camcc + MCLK0_CBCR, RD(camcc + MCLK0_CBCR) | 1u);
-        __asm__ volatile ("dsb sy" ::: "memory");
-        delay(1000);
-        cam_mclk_khz = 19200;
-    } else {
-        cam_mclk_khz = 24000;
+    camcc_pll2_up();            /* bring PLL2 up (locked); used for 24 MHz only when mclk24=1 */
+    {
+        uint32_t want24 = 0;
+        int on24 = 0;
+        (void)PE_parse_boot_argn("mclk24", &want24, sizeof(want24));
+        if (want24) {
+            /* MCLK0 from PLL2_OUT_AUX (480 MHz), MND 1/20, /1 -> 24 MHz */
+            WR(camcc + MCLK0_M, 1);
+            WR(camcc + MCLK0_N, (uint32_t)(~(20u - 1)) & 0xff);    /* ~(n-m) */
+            WR(camcc + MCLK0_D, (uint32_t)(~(2u * 19u)) & 0xff);   /* ~(2*d), d=clamp(n,m,n-m)=19 */
+            WR(camcc + MCLK0_CFG_RCGR, (RD(camcc + MCLK0_CFG_RCGR) & ~0x37ffu) | (5u << 8) | (2u << 12) | 0x01u);
+            WR(camcc + MCLK0_CMD_RCGR, RD(camcc + MCLK0_CMD_RCGR) | RCG_UPDATE);
+            __asm__ volatile ("dsb sy" ::: "memory");
+            for (int i = 0; i < 100 && (RD(camcc + MCLK0_CMD_RCGR) & RCG_UPDATE); i++) { delay(100); }
+            WR(camcc + MCLK0_CBCR, RD(camcc + MCLK0_CBCR) | 1u);
+            __asm__ volatile ("dsb sy" ::: "memory");
+            delay(1000);
+            on24 = !(RD(camcc + MCLK0_CBCR) & 0x80000000u);
+        }
+        if (on24) {
+            cam_mclk_khz = 24000;
+        } else {
+            /* XO 19.2 MHz: proven clean clock (M1 read the chip id on it). src 0 (TCXO), no MND, /1.
+             * At 19.2 the sensor's MIPI link runs 0.8x; the CSIPHY settle count adjusts for it. */
+            WR(camcc + MCLK0_CFG_RCGR, (RD(camcc + MCLK0_CFG_RCGR) & ~0x37ffu) | (0u << 8) | (0u << 12) | 0x01u);
+            WR(camcc + MCLK0_CMD_RCGR, RD(camcc + MCLK0_CMD_RCGR) | RCG_UPDATE);
+            __asm__ volatile ("dsb sy" ::: "memory");
+            for (int i = 0; i < 100 && (RD(camcc + MCLK0_CMD_RCGR) & RCG_UPDATE); i++) { delay(100); }
+            WR(camcc + MCLK0_CBCR, RD(camcc + MCLK0_CBCR) | 1u);
+            __asm__ volatile ("dsb sy" ::: "memory");
+            delay(1000);
+            cam_mclk_khz = 19200;
+        }
     }
     {
         char line[128];
