@@ -8,6 +8,7 @@
  *   cam=5   the camera for Darwin: the whole chain up, the IMX363 streaming 2016x1512 RAW10 into a ring of four
  *           buffers, served as /dev/hakios-camera (sys/hakios.camera.h, the same device the POCO's driver makes, so
  *           mediaserverd's libhakios.media takes it unchanged); with it the loader gives Darwin the camera's ISP node
+ *   cam_sensor=front  the front IMX355 (1640x1232, CSIPHY2) instead of the back IMX363
  *   cam_stage=N  bring-up steps instead: 1 SLG51000 read, 2 + rear power/MCLK/chip id, 3 + stream, 4 + PLL0/CSIPHY
  *           clocks, 5 + CSIPHY0, 6 + CSID0, 7 + VFE0 DMA of one frame saved to /private/var/root/cam-frame.raw
  *
@@ -232,6 +233,111 @@ static const struct imx_reg imx363_2016x1512[] = {
 };
 
 
+/* IMX355 (front camera) register tables, from mainline Linux drivers/media/i2c/imx355.c (19.2 MHz external clock,
+ * 4 lanes at 360 MHz): the global set, then the 1640x1232 binned mode. Generated; one byte each. */
+static const struct imx_reg imx355_global[] = {
+	{ 0x0136, 0x13, 1 },
+	{ 0x0137, 0x33, 1 },
+	{ 0x304e, 0x03, 1 },
+	{ 0x4348, 0x16, 1 },
+	{ 0x4350, 0x19, 1 },
+	{ 0x4408, 0x0a, 1 },
+	{ 0x440c, 0x0b, 1 },
+	{ 0x4411, 0x5f, 1 },
+	{ 0x4412, 0x2c, 1 },
+	{ 0x4623, 0x00, 1 },
+	{ 0x462c, 0x0f, 1 },
+	{ 0x462d, 0x00, 1 },
+	{ 0x462e, 0x00, 1 },
+	{ 0x4684, 0x54, 1 },
+	{ 0x480a, 0x07, 1 },
+	{ 0x4908, 0x07, 1 },
+	{ 0x4909, 0x07, 1 },
+	{ 0x490d, 0x0a, 1 },
+	{ 0x491e, 0x0f, 1 },
+	{ 0x4921, 0x06, 1 },
+	{ 0x4923, 0x28, 1 },
+	{ 0x4924, 0x28, 1 },
+	{ 0x4925, 0x29, 1 },
+	{ 0x4926, 0x29, 1 },
+	{ 0x4927, 0x1f, 1 },
+	{ 0x4928, 0x20, 1 },
+	{ 0x4929, 0x20, 1 },
+	{ 0x492a, 0x20, 1 },
+	{ 0x492c, 0x05, 1 },
+	{ 0x492d, 0x06, 1 },
+	{ 0x492e, 0x06, 1 },
+	{ 0x492f, 0x06, 1 },
+	{ 0x4930, 0x03, 1 },
+	{ 0x4931, 0x04, 1 },
+	{ 0x4932, 0x04, 1 },
+	{ 0x4933, 0x05, 1 },
+	{ 0x595e, 0x01, 1 },
+	{ 0x5963, 0x01, 1 },
+	{ 0x3030, 0x01, 1 },
+	{ 0x3031, 0x01, 1 },
+	{ 0x3045, 0x01, 1 },
+	{ 0x4010, 0x00, 1 },
+	{ 0x4011, 0x00, 1 },
+	{ 0x4012, 0x00, 1 },
+	{ 0x4013, 0x01, 1 },
+	{ 0x68a8, 0xfe, 1 },
+	{ 0x68a9, 0xff, 1 },
+	{ 0x6888, 0x00, 1 },
+	{ 0x6889, 0x00, 1 },
+	{ 0x68b0, 0x00, 1 },
+	{ 0x3058, 0x00, 1 },
+	{ 0x305a, 0x00, 1 },
+};
+static const struct imx_reg imx355_1640x1232[] = {
+	{ 0x0112, 0x0a, 1 },
+	{ 0x0113, 0x0a, 1 },
+	{ 0x0114, 0x03, 1 },
+	{ 0x0342, 0x07, 1 },
+	{ 0x0343, 0x2c, 1 },
+	{ 0x0340, 0x05, 1 },
+	{ 0x0341, 0x1a, 1 },
+	{ 0x0344, 0x00, 1 },
+	{ 0x0345, 0x00, 1 },
+	{ 0x0346, 0x00, 1 },
+	{ 0x0347, 0x00, 1 },
+	{ 0x0348, 0x0c, 1 },
+	{ 0x0349, 0xcf, 1 },
+	{ 0x034a, 0x09, 1 },
+	{ 0x034b, 0x9f, 1 },
+	{ 0x0220, 0x00, 1 },
+	{ 0x0222, 0x01, 1 },
+	{ 0x0900, 0x01, 1 },
+	{ 0x0901, 0x22, 1 },
+	{ 0x0902, 0x00, 1 },
+	{ 0x034c, 0x06, 1 },
+	{ 0x034d, 0x68, 1 },
+	{ 0x034e, 0x04, 1 },
+	{ 0x034f, 0xd0, 1 },
+	{ 0x0301, 0x05, 1 },
+	{ 0x0303, 0x01, 1 },
+	{ 0x0305, 0x02, 1 },
+	{ 0x0306, 0x00, 1 },
+	{ 0x0307, 0x78, 1 },
+	{ 0x030b, 0x01, 1 },
+	{ 0x030d, 0x02, 1 },
+	{ 0x030e, 0x00, 1 },
+	{ 0x030f, 0x4b, 1 },
+	{ 0x0310, 0x00, 1 },
+	{ 0x0700, 0x00, 1 },
+	{ 0x0701, 0x10, 1 },
+	{ 0x0820, 0x0b, 1 },
+	{ 0x0821, 0x40, 1 },
+	{ 0x3088, 0x04, 1 },
+	{ 0x6813, 0x02, 1 },
+	{ 0x6835, 0x07, 1 },
+	{ 0x6836, 0x01, 1 },
+	{ 0x6837, 0x04, 1 },
+	{ 0x684d, 0x07, 1 },
+	{ 0x684e, 0x01, 1 },
+	{ 0x684f, 0x04, 1 },
+};
+
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void delay(int usec);
 extern void loader_log_putc(char c);
@@ -264,7 +370,7 @@ static unsigned pin_mapped;
 static volatile uint32_t *
 pin(unsigned gpio)
 {
-    vm_offset_t tile = (gpio == SLG_SDA_GPIO || gpio == SLG_SCL_GPIO || gpio == 43) ? TLMM_NORTH : TLMM_SOUTH;
+    vm_offset_t tile = (gpio == SLG_SDA_GPIO || gpio == SLG_SCL_GPIO || gpio == 43 || gpio == 68) ? TLMM_NORTH : TLMM_SOUTH;
     vm_offset_t page = tile + 0x1000UL * gpio, base = page & ~0x3fffUL;
 
     for (unsigned i = 0; i < pin_mapped; i++) {
@@ -587,16 +693,48 @@ pm6150l_gpio_low(unsigned gpio)
 /* ---- camcc (0xad00000), the titan power domain, and MCLK0, to clock the sensor ---- */
 #define CAMCC_PHYS          0x0ad00000UL
 #define TITAN_GDSCR_PHYS    0x0ad0c1c4UL
-#define MCLK0_CMD_RCGR      0x5004
-#define MCLK0_CFG_RCGR      0x5008
-#define MCLK0_CBCR          0x501c
 #define RCG_UPDATE          1u
-#define MCLK0_GPIO          13
-#define CAM_RESET_GPIO      43
-#define CCI0_SDA_GPIO       17
-#define CCI0_SCL_GPIO       18
-#define IMX_ADDR            0x1a            /* IMX363 7-bit slave */
+#define IMX_ADDR            0x1a            /* both sensors' 7-bit slave (each on its own CCI0 master's pins) */
 #define IMX_CHIP_ID_REG     0x0016
+
+/*
+ * The two cameras (google/sm7150-sunfish-camera-sensor.dtsi cam-sensor@0 and @1; research/camera/sunfish-camera-hw.md):
+ * what differs between them, from the pins to the frame. One is brought up at a time (boot-arg cam_sensor=front).
+ */
+struct cam_hw {
+    const char  *name;
+    uint32_t    header_sensor;                  /* the frames' header: 1 the wide (back), 2 the front camera */
+    unsigned    sda, scl, reset, mclk_gpio;     /* TLMM: CCI0 master's pins, reset, MCLK pin */
+    uint32_t    mclk_rcg, mclk_cbcr;            /* camcc MCLKn RCG (CMD; CFG +4, M +8, N +0xc, D +0x10) and branch */
+    uint16_t    chip_id;
+    uint32_t    phy_pa, phytimer_rcg, phytimer_cbcr, csiphy_cbcr, phy_sel;  /* CSIPHYn and its clocks; CSID's PHY select */
+    uint32_t    link_hz, link_ref_khz;          /* the MIPI link (DDR) clock at an MCLK of link_ref_khz */
+    uint32_t    width, height, stride;          /* the mode; stride = RAW10 line padded to 16 bytes by the write master */
+    uint32_t    frame_lines, margin, default_lines;
+    uint32_t    gain_full;                      /* analog gain = full / (full - code): 512 (IMX363), 1024 (IMX355) */
+    struct { uint8_t ldo, vsel; } rails[4];     /* SLG51000 LDO, VSEL (raw: base + vsel * step, slg51000-regulator.c) */
+    uint8_t     nrails, ldo_mask;               /* the LDOs to enable (MATRIX_CONF_A bits) */
+};
+static const struct cam_hw cam_back = {
+    "IMX363 (back)", 1, 17, 18, 43, 13, 0x5004, 0x501c, 0x0363,
+    0xace0000, 0x6004, 0x601c, 0x6020, 0, 321000000u, 24000,
+    2016, 1512, 2528, 3170, 16, 0x0c52, 512,
+    { { 1, 0x82 }, { 3, 0xa5 }, { 7, 0x3c }, { 4, 0x3c } }, 4, 0x4d,      /* vdig 2.85, vana 2.85, vio 1.8, custom1 1.8 V */
+};
+static const struct cam_hw cam_front = {
+    "IMX355 (front)", 2, 19, 20, 68, 15, 0x5044, 0x505c, 0x0355,
+    0xace4000, 0x604c, 0x6064, 0x6068, 2, 360000000u, 19200,
+    1640, 1232, 2064, 1306, 10, 1296, 1024,                               /* (mainline imx355.c: fll 1306, 19.2 MHz) */
+    { { 2, 0x78 }, { 5, 0xa0 }, { 7, 0x3c } }, 3, 0x52,                   /* vana 2.8, vdig 1.2, vio 1.8 V */
+};
+static const struct cam_hw *hw = &cam_back;
+#define MCLK0_CMD_RCGR      (hw->mclk_rcg)
+#define MCLK0_CFG_RCGR      (hw->mclk_rcg + 4)
+#define MCLK0_CBCR          (hw->mclk_cbcr)
+#define MCLK0_GPIO          (hw->mclk_gpio)
+#define CAM_RESET_GPIO      (hw->reset)
+#define CCI0_SDA_GPIO       (hw->sda)
+#define CCI0_SCL_GPIO       (hw->scl)
 static vm_offset_t camcc, titan;
 
 /* set an SLG51000 LDO to vsel (voltage code), then enable the chosen LDOs (mask of BIT(ldo-1) in reg 0x110d). */
@@ -606,9 +744,9 @@ slg_ldo(struct i2c *b, unsigned ldo, uint8_t vsel)
     (void)i2c_write_reg16(b, SLG_ADDR, SLG_LDO_VSEL(ldo), vsel);
 }
 
-#define MCLK0_M             0x500c
-#define MCLK0_N             0x5010
-#define MCLK0_D             0x5014
+#define MCLK0_M             (hw->mclk_rcg + 8)
+#define MCLK0_N             (hw->mclk_rcg + 0xc)
+#define MCLK0_D             (hw->mclk_rcg + 0x10)
 #define RD(a)               (*(volatile uint32_t *)(a))
 #define WR(a,v)             (*(volatile uint32_t *)(a) = (v))
 /* camcc PLL2 (FABIA, offset 0x2000) to 1920 MHz; OUT_AUX (USER_CTL postdiv /4) = 480 MHz. sm7150 camcc-sm7150.c values. */
@@ -748,16 +886,19 @@ camss_csiphy_clocks_on(void)
 {
     camcc_pll0_up();                    /* PLL0 first: camnoc_axi_src and the CSIPHY clocks use OUT_EVEN */
     camss_top_on();
-    camcc_rcg_set(0x6004, 2, 3);        /* csi0phytimer_src: src 2 (OUT_EVEN), /2 (field 2*2-1=3) */
+    camcc_rcg_set(hw->phytimer_rcg, 2, 3);  /* csiNphytimer_src: src 2 (OUT_EVEN), /2 (field 2*2-1=3) */
     camcc_rcg_set(0xa064, 2, 3);        /* cphy_rx_src: src 2 (OUT_EVEN), /2 */
-    WR(camcc + 0x601c, RD(camcc + 0x601c) | 1u);   /* csi0phytimer_clk branch */
-    WR(camcc + 0x6020, RD(camcc + 0x6020) | 1u);   /* csiphy0_clk branch */
+    WR(camcc + hw->phytimer_cbcr, RD(camcc + hw->phytimer_cbcr) | 1u);   /* csiNphytimer_clk branch */
+    WR(camcc + hw->csiphy_cbcr, RD(camcc + hw->csiphy_cbcr) | 1u);       /* csiphyN_clk branch */
+    /* CSIPHY0's clock runs for every PHY (as downstream): without it CSIPHY2 never hands the CSID anything -- the
+     * front sensor streamed and the CSID saw no packet at all (found in the ACK sunfish tree, camss 4c3da62d) */
+    WR(camcc + 0x6020, RD(camcc + 0x6020) | 1u);
     __asm__ volatile ("dsb sy" ::: "memory");
     delay(1000);
     {
         char line[128];
         snprintf(line, sizeof(line), "camera: CSIPHY clocks - phytimer CBCR %#x, csiphy0 CBCR %#x, cphy_rx cfg %#x (bit31=off)\n",
-            RD(camcc + 0x601c), RD(camcc + 0x6020), RD(camcc + 0xa068));
+            RD(camcc + hw->phytimer_cbcr), RD(camcc + hw->csiphy_cbcr), RD(camcc + 0xa068));
         camlog(line);
     }
 }
@@ -896,7 +1037,7 @@ csiphy0_init(void)
     int settle;
     char line[160];
 
-    csiphy0 = ml_io_map(0xace0000UL, 0x4000);     /* 16 KB: covers lane regs + common block */
+    csiphy0 = ml_io_map(hw->phy_pa, 0x4000);      /* 16 KB: covers lane regs + common block (CSIPHY0 or 2) */
     if (csiphy0 == 0) {
         camlog("camera: CSIPHY0 map failed\n");
         return;
@@ -911,7 +1052,7 @@ csiphy0_init(void)
 
     /* settle count: link_freq = 321 MHz * mclk/24000 (DDR half of the 642 Mbps link); timer 300 MHz */
     {
-        uint64_t link = 321000000ULL * (uint64_t)cam_mclk_khz / 24000ULL;
+        uint64_t link = (uint64_t)hw->link_hz * (uint64_t)cam_mclk_khz / hw->link_ref_khz;
         uint64_t ui   = (1000000000000ULL / link) / 2ULL;      /* ps */
         uint64_t ths  = 85000ULL + 6ULL * ui;
         uint64_t tper = 1000000000000ULL / 300000000ULL;       /* 3333 ps */
@@ -949,8 +1090,9 @@ csiphy0_init(void)
     }
     __asm__ volatile ("dsb sy" ::: "memory");
 
-    /* clear common ctrl 11..21 (interrupt masks) */
-    for (unsigned n = 11; n <= 21; n++) { WR(CSP_CTRL(n), 0); }
+    /* common ctrl 11..21: the interrupt masks -- all on, so the status registers latch what the lanes see
+     * (nothing is wired to the GIC; csiphy_report reads them) */
+    for (unsigned n = 11; n <= 21; n++) { WR(CSP_CTRL(n), 0xff); }
     __asm__ volatile ("dsb sy" ::: "memory");
 
     snprintf(line, sizeof(line), "camera: CSIPHY0 init - hw_version %#x, settle_cnt %d (0x%x), link@%u kHz MCLK; CTRL5 readback %#x\n",
@@ -1021,7 +1163,7 @@ csid0_init(void)
     CSID_WR(0x308, 0);
     CSID_WR(0x300, CSID_RD(0x300) | (1u << 31));     /* RDI0 enable */
     /* CSI2 RX: 4 lanes (3), lane assign 0x3210, PHY 0, D-PHY; ECC correction + MISR */
-    CSID_WR(0x100, 3u | (0x3210u << 4) | (0u << 20));
+    CSID_WR(0x100, 3u | (0x3210u << 4) | (hw->phy_sel << 20));   /* 4 lanes from CSIPHY0 (back) or 2 (front) */
     CSID_WR(0x104, (1u << 0) | (1u << 6));
     /* capture the first long + short packet headers for VC0 (debug) */
     CSID_WR(0x108, (1u << 0) | (1u << 1));
@@ -1032,6 +1174,22 @@ csid0_init(void)
     __asm__ volatile ("dsb sy" ::: "memory");
     snprintf(line, sizeof(line), "camera: CSID0 init - hw_version %#x, reset %s (top irq %#x), RDI0 cfg0 %#x, RX cfg0 %#x\n",
         hwv, (st & 1u) ? "done" : "TIMEOUT", st, CSID_RD(0x300), CSID_RD(0x100));
+    camlog(line);
+}
+
+/* the CSIPHY's common status 0..11 (latched interrupt bits per lane: SOT, errors), as hex */
+static void
+csiphy_report(const char *when)
+{
+    char line[200];
+
+    if (csiphy0 == 0) {
+        return;
+    }
+    snprintf(line, sizeof(line), "camera: CSIPHY [%s] status %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n", when,
+        RD(CSP_STAT(0)) & 0xff, RD(CSP_STAT(1)) & 0xff, RD(CSP_STAT(2)) & 0xff, RD(CSP_STAT(3)) & 0xff, RD(CSP_STAT(4)) & 0xff,
+        RD(CSP_STAT(5)) & 0xff, RD(CSP_STAT(6)) & 0xff, RD(CSP_STAT(7)) & 0xff, RD(CSP_STAT(8)) & 0xff, RD(CSP_STAT(9)) & 0xff,
+        RD(CSP_STAT(10)) & 0xff, RD(CSP_STAT(11)) & 0xff);
     camlog(line);
 }
 
@@ -1103,8 +1261,8 @@ extern uint64_t kvtophys(vm_offset_t va);
 
 #define CAM_IOVA        0x10000000ULL
 #define CAM_BUF_SIZE    0x400000u               /* 4 MiB: two SMMU L3 stretches; a 2016x1512 RAW10 frame is 3810240 B */
-#define CAM_FRAME_BYTES 3822336u                /* 1512 lines x 2528 B: the WM pads each 2520 B RAW10 line to 16 B */
-#define CAM_LINE_BYTES  2528u                   /* 2016 px of MIPI-packed RAW10 = 2520 B, padded to 16 B */
+#define CAM_FRAME_BYTES (hw->stride * hw->height)  /* back: 1512 lines x 2528 B (2520 B of RAW10 padded to 16 B) */
+#define CAM_LINE_BYTES  (hw->stride)
 static vm_offset_t vfe0;
 static vm_offset_t cam_buf;
 static uint64_t cam_buf_pa;
@@ -1376,22 +1534,22 @@ imx_write_seq(struct i2c *cci, const struct imx_reg *regs, unsigned n)
 /* ---- cam=5: the frame ring and /dev/hakios-camera ----
  * No interrupt line is wired: a kernel thread looks at the bus's "WM0 buffer done" every millisecond (a frame is ~33 ms),
  * takes the oldest given buffer as the new frame, gives the write master another, and applies what AE asked for. */
-#define IMX_FRAME_LINES     3170u               /* the 2016x1512 mode's frame_length_lines (0x0340 = 0x0c62) */
+#define IMX_FRAME_LINES     (hw->frame_lines)   /* the mode's frame_length_lines (back 2016x1512: 0x0c62) */
 #define IMX_FRAME_LINES_MAX (4u * IMX_FRAME_LINES)  /* the longest frame AE may ask for: 7.5 frames a second */
-#define IMX_MARGIN          16u                 /* coarse integration at most frame_length - 16 (the mode's own 0x0c52) */
+#define IMX_MARGIN          (hw->margin)        /* coarse integration at most frame_length - margin */
 #define IMX_GAIN_UNITY      256u                /* gain as the header gives it: linear, 256 = 1x ... */
-#define IMX_GAIN_MAX        (16u * IMX_GAIN_UNITY)  /* ... to 16x: analog code 512 - 512 / x, 480 at 16x */
+#define IMX_GAIN_MAX        (16u * IMX_GAIN_UNITY)  /* ... to 16x: analog code full - full / x (15/16 of full at 16x) */
 
 static LCK_GRP_DECLARE(cam_lck_grp, "hakios-camera");
 static LCK_MTX_DECLARE(cam_mtx, &cam_lck_grp);
-static struct i2c cam_cci = { CCI0_SDA_GPIO, CCI0_SCL_GPIO };
+static struct i2c cam_cci = { 17, 18 };        /* (the chosen camera's pins: set by rear_sensor_probe) */
 static uint64_t ring_seq, ring_given, ring_read_seq, ring_last_done, ring_misses;
 static uint32_t ring_hw;                        /* buffers in the write master's FIFO */
 static bool ring_on, cam_fault;
 static uint32_t line_ns = 10515;                /* measured from the frames' spacing; ~30 frames a second at first */
 /* the exposure now in the sensor (as written: frames from ring_eff_seq on carry it) and the one before */
-static uint32_t cur_lines = 0x0c52, cur_gain = IMX_GAIN_UNITY, cur_flines = IMX_FRAME_LINES;
-static uint32_t old_lines = 0x0c52, old_gain = IMX_GAIN_UNITY, old_flines = IMX_FRAME_LINES;
+static uint32_t cur_lines = 0x0c52, cur_gain = IMX_GAIN_UNITY, cur_flines = 3170;    /* (set from hw at stream-on) */
+static uint32_t old_lines = 0x0c52, old_gain = IMX_GAIN_UNITY, old_flines = 3170;
 static uint64_t ring_eff_seq;
 static struct { bool pending; uint32_t lines, gain, flines; } cam_ask;
 
@@ -1484,7 +1642,7 @@ ring_done(void)
         uint64_t ns;
 
         absolutetime_to_nanoseconds(now - ring_last_done, &ns);
-        if (ns > 20000000ull && ns < 2000000000ull) {
+        if (ns > 4000000ull && ns < 2000000000ull) {
             uint32_t l = (uint32_t)(ns / slot[done].frame_lines);
             line_ns = (line_ns * 7 + l) / 8;    /* (a missed poll makes one spacing long, a little) */
         }
@@ -1497,9 +1655,9 @@ ring_done(void)
 static void
 imx_exposure(uint32_t lines, uint32_t gain, uint32_t flines)
 {
-    uint32_t code = 512u - (512u * IMX_GAIN_UNITY + gain / 2) / gain;
+    uint32_t code = hw->gain_full - (hw->gain_full * IMX_GAIN_UNITY + gain / 2) / gain;
 
-    code = code > 480u ? 480u : code;
+    code = code > hw->gain_full / 16u * 15u ? hw->gain_full / 16u * 15u : code;
     (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0104, 0x01);
     (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0340, (uint8_t)(flines >> 8));
     (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0341, (uint8_t)flines);
@@ -1616,8 +1774,8 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
     bzero(&f, sizeof(f));
     memcpy(f.magic, HAKIOS_CAMERA_MAGIC, sizeof(f.magic));
     f.header_bytes = sizeof(f);
-    f.width = 2016;
-    f.height = 1512;
+    f.width = hw->width;
+    f.height = hw->height;
     f.stride = CAM_LINE_BYTES;
     f.format = 1;
     f.bayer = 0;                                /* RGGB (the first picture's colours) */
@@ -1633,7 +1791,7 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
     f.frame_lines_min = IMX_FRAME_LINES;
     f.frame_lines_max = IMX_FRAME_LINES_MAX;
     f.margin = IMX_MARGIN;
-    f.sensor = 1;                               /* the wide (back) camera, as camera_device.c's cameras[0] */
+    f.sensor = hw->header_sensor;               /* 1 the wide (back), 2 the front camera, as camera_device.c's cameras[] */
     f.focus = HAKIOS_CAMERA_NO_FOCUS;
     whole = uio_resid(uio) > (user_ssize_t)sizeof(f);
     if (whole) {
@@ -1668,6 +1826,36 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
     return error;
 }
 
+/*
+ * HAKIOS_CAMERA_KEEP (camera_test's picture for the host): this phone's loader takes nothing back, so the picture goes
+ * to /private/var/root/cam-keep-WxH-F.bin (F: 1 the frame's RAW10, 2 NV12, 3 BGRA; the bytes as given), for scp/ssh.
+ */
+static int
+camdev_keep(const struct hakios_camera_command *c, struct uio *uio)
+{
+    vfs_context_t ctx = vfs_context_kernel();
+    vnode_t vp = NULLVP;
+    char path[96], line[160];
+    int error;
+
+    if (c->bytes == 0 || c->d < 1 || c->d > 3 || c->a == 0 || c->b == 0 || (user_ssize_t)c->bytes > uio_resid(uio)) {
+        return EINVAL;
+    }
+    snprintf(path, sizeof(path), "/private/var/root/cam-keep-%ux%u-%u.bin", c->a, c->b, c->d);
+    error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, 0644, 0, &vp, ctx);
+    if (error == 0) {
+        uio_setresid(uio, c->bytes);
+        uio_setoffset(uio, 0);                  /* (the device's own offset is every frame read so far: ~380 MB in) */
+        error = VNOP_WRITE(vp, uio, IO_SYNC, ctx);
+        (void)VNOP_FSYNC(vp, MNT_WAIT, ctx);
+        vnode_close(vp, FWRITE, ctx);
+    }
+    snprintf(line, sizeof(line), "camera: a picture kept for the host: %s (%u bytes, stride %u): error %d\n", path, c->bytes, c->c,
+        error);
+    camlog(line);
+    return error;
+}
+
 static int
 camdev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 {
@@ -1686,11 +1874,11 @@ camdev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
         lck_mtx_unlock(&cam_mtx);
         return 0;
     case HAKIOS_CAMERA_SENSOR:
-        return c.a == 1 ? 0 : EINVAL;           /* only the back camera so far */
+        return c.a == hw->header_sensor ? 0 : EINVAL;  /* the camera chosen at boot only, so far (cam_sensor) */
     case HAKIOS_CAMERA_FOCUS:
         return 0;                               /* (no lens motor driven yet) */
     case HAKIOS_CAMERA_KEEP:
-        return ENOSPC;
+        return camdev_keep(&c, uio);
     default:
         return EINVAL;
     }
@@ -1741,6 +1929,11 @@ rear_sensor_stream(struct i2c *cci)
     uint8_t s = 0xff;
     char line[120];
 
+    if (hw == &cam_front) {
+        /* imx355_start_streaming: the global set, the mode, (no flip), stream on */
+        imx_write_seq(cci, imx355_global,     sizeof(imx355_global)     / sizeof(imx355_global[0]));
+        imx_write_seq(cci, imx355_1640x1232,  sizeof(imx355_1640x1232)  / sizeof(imx355_1640x1232[0]));
+    } else {
     /* imx363_start_streaming: sw reset, 12 ms, PLL table, common regs, continuous clock, mode regs, stream on */
     (void)i2c_write_reg16(cci, IMX_ADDR, 0x0103, 0x01);
     delay(12000);
@@ -1748,6 +1941,9 @@ rear_sensor_stream(struct i2c *cci)
     imx_write_seq(cci, imx363_common,     sizeof(imx363_common)     / sizeof(imx363_common[0]));
     (void)i2c_write_reg16(cci, IMX_ADDR, 0x4040, 0x00);   /* CLK_BLANK_STOP=0: continuous clock */
     imx_write_seq(cci, imx363_2016x1512,  sizeof(imx363_2016x1512)  / sizeof(imx363_2016x1512[0]));
+    }
+    cur_lines = old_lines = hw->default_lines;
+    cur_flines = old_flines = hw->frame_lines;
     {
         uint32_t gain = 0, exp = 0;                    /* cam_gain: analog gain code 0..480 (0 = 1x); cam_exp: lines */
         if (PE_parse_boot_argn("cam_gain", &gain, sizeof(gain)) && gain <= 480) {
@@ -1762,11 +1958,13 @@ rear_sensor_stream(struct i2c *cci)
     (void)i2c_write_reg16(cci, IMX_ADDR, 0x0100, 0x01);   /* STREAM ON */
     delay(5000);
     (void)i2c_read_reg16(cci, IMX_ADDR, 0x0100, &s, 1);
-    snprintf(line, sizeof(line), "camera: IMX363 STREAM ON (2016x1512, 642 Mbps/lane); mode_select readback=%02x (want 01)\n", s);
+    snprintf(line, sizeof(line), "camera: %s STREAM ON (%ux%u); mode_select readback=%02x (want 01)\n", hw->name, hw->width,
+        hw->height, s);
     camlog(line);
     if (cam_level >= CAM_SERVE) {
         delay(200000);
         csid0_report("+205ms");
+        csiphy_report("+205ms");
         ring_start();
         return;
     }
@@ -1796,12 +1994,11 @@ rear_sensor_probe(struct i2c *slg)
         camlog("camera: could not map the sensor GPIOs\n");
         return;
     }
-    /* rear rails: vdig LDO1 2.85V (0x82), vana LDO3 2.85V (0xa5), vio LDO7 1.8V (0x3c), custom1 LDO4 1.8V (0x3c) */
-    slg_ldo(slg, 1, 0x82);
-    slg_ldo(slg, 3, 0xa5);
-    slg_ldo(slg, 7, 0x3c);
-    slg_ldo(slg, 4, 0x3c);
-    (void)i2c_write_reg16(slg, SLG_ADDR, SLG_MATRIX_CONF_A, 0x4d);       /* enable LDO1,3,4,7 */
+    /* the camera's rails (cam_hw: back LDO1/3/7/4, front LDO2/5/7) */
+    for (unsigned i = 0; i < hw->nrails; i++) {
+        slg_ldo(slg, hw->rails[i].ldo, hw->rails[i].vsel);
+    }
+    (void)i2c_write_reg16(slg, SLG_ADDR, SLG_MATRIX_CONF_A, hw->ldo_mask);
     delay(5000);
     camcc_mclk0_on();
     if (cam_level >= 4) {
@@ -1826,9 +2023,10 @@ rear_sensor_probe(struct i2c *slg)
     sda_scl_init(CCI0_SDA_GPIO);
     sda_scl_init(CCI0_SCL_GPIO);
     delay(1000);
+    cam_cci = cci;
     r = i2c_read_reg16(&cci, IMX_ADDR, IMX_CHIP_ID_REG, v, 2);
-    snprintf(line, sizeof(line), "camera: IMX363 chip id read %s: %02x%02x (want 0363) on CCI0 GPIO %u/%u\n",
-        r == 0 ? "ok" : "NO ACK", v[0], v[1], CCI0_SDA_GPIO, CCI0_SCL_GPIO);
+    snprintf(line, sizeof(line), "camera: %s chip id read %s: %02x%02x (want %04x) on CCI0 GPIO %u/%u\n",
+        hw->name, r == 0 ? "ok" : "NO ACK", v[0], v[1], hw->chip_id, CCI0_SDA_GPIO, CCI0_SCL_GPIO);
     camlog(line);
     if (r == 0 && cam_level >= 3) {
         rear_sensor_stream(&cci);
@@ -1972,6 +2170,13 @@ camera_init(void)
     }
     if (cam_level == 0) {
         return;
+    }
+    {
+        char which[16] = "";
+
+        if (PE_parse_boot_arg_str("cam_sensor", which, sizeof(which)) && strcmp(which, "front") == 0) {
+            hw = &cam_front;
+        }
     }
 
     /* at 90 s, so the result reaches the run log (early kernel messages are lost); the camera is idle until then */
