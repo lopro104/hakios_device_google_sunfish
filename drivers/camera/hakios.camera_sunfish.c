@@ -887,8 +887,10 @@ csiphy0_init(void)
     WR(CSP_CTRL(0), 0x0u);
     __asm__ volatile ("dsb sy" ::: "memory");
 
-    /* common control: lane_mask (CLK_ENABLE bit7 | data lanes 0-3 = 0x8f), pwrdn_b, ctrl7=2, ctrl0=0 */
-    WR(CSP_CTRL(5), 0x8fu);
+    /* common control: lane mask = CLK_ENABLE bit7 | BIT(pos*2) per data lane: the 3-phase combo PHY puts
+     * the D-PHY data lanes on even PHY lanes (blocks 0x000/0x200/0x400/0x600), so DL0-3 = bits 0,2,4,6 -> 0xd5.
+     * (0x8f enabled only DL0+DL1: CSID saw lane 0/1 FIFO overflow and no packets.) */
+    WR(CSP_CTRL(5), 0xd5u);
     WR(CSP_CTRL(6), 0x1u);
     WR(CSP_CTRL(7), 0x02u);
     WR(CSP_CTRL(0), 0x00u);
@@ -913,6 +915,103 @@ csiphy0_init(void)
 
     snprintf(line, sizeof(line), "camera: CSIPHY0 init - hw_version %#x, settle_cnt %d (0x%x), link@%u kHz MCLK; CTRL5 readback %#x\n",
         hw_version, settle, settle, cam_mclk_khz, RD(CSP_CTRL(5)));
+    camlog(line);
+}
+
+
+/* ---- CSID0 (Titan 170 gen2 CSID, 0xacb3000, in the IFE0 power domain) ----
+ * camss-csid-gen2.c + downstream cam_ife_csid170.h. RDI0 takes VC0/DT 0x2b (RAW10) from CSIPHY0. */
+static vm_offset_t csid0;
+#define CSID_RD(o)      RD(csid0 + (o))
+#define CSID_WR(o, v)   WR(csid0 + (o), (v))
+
+static void
+csid0_init(void)
+{
+    char line[160];
+    uint32_t hwv, st = 0;
+    int i;
+
+    /* IFE0 GDSC (0xa004, POLL_CFG_GDSCR: power-up-complete is CFG_GDSCR bit16) */
+    WR(camcc + 0xa004, RD(camcc + 0xa004) & ~1u);
+    __asm__ volatile ("dsb sy" ::: "memory");
+    for (i = 0; i < 200; i++) {
+        if ((RD(camcc + 0xa004) & 0x80000000u) || (RD(camcc + 0xa008) & (1u << 16))) { break; }
+        delay(50);
+    }
+    /* CSID + IFE0 clocks */
+    camcc_rcg_set(0xa03c, 2, 3);                     /* ife_0_csid_src: PLL0_OUT_EVEN /2 = 300 MHz */
+    camcc_rcg_set(0xa010, 0, 1);                     /* ife_0_clk_src: XO for now (PLL3 later, for the VFE) */
+    WR(camcc + 0xa054, RD(camcc + 0xa054) | 1u);     /* ife_0_csid_clk */
+    WR(camcc + 0xa07c, RD(camcc + 0xa07c) | 1u);     /* ife_0_cphy_rx_clk */
+    WR(camcc + 0xa028, RD(camcc + 0xa028) | 1u);     /* ife_0_clk */
+    WR(camcc + 0xa080, RD(camcc + 0xa080) | 1u);     /* ife_0_axi_clk */
+    __asm__ volatile ("dsb sy" ::: "memory");
+    delay(1000);
+    snprintf(line, sizeof(line), "camera: IFE0 gdsc %#x cfg %#x | csid %#x cphy_rx %#x ife %#x axi %#x (bit31=off)\n",
+        RD(camcc + 0xa004), RD(camcc + 0xa008), RD(camcc + 0xa054), RD(camcc + 0xa07c), RD(camcc + 0xa028), RD(camcc + 0xa080));
+    camlog(line);
+
+    csid0 = ml_io_map(0xacb3000UL, 0x1000);
+    if (csid0 == 0) {
+        camlog("camera: CSID0 map failed\n");
+        return;
+    }
+    hwv = CSID_RD(0x0);
+    /* reset (csid_reset): unmask + clear the top irq, strobe the resets (0x1e keeps registers), poll RESET_DONE */
+    CSID_WR(0x78, 1); CSID_WR(0x80, 1);
+    CSID_WR(0x74, 1); CSID_WR(0x80, 1);
+    CSID_WR(0x10, 0x1e);
+    __asm__ volatile ("dsb sy" ::: "memory");
+    for (i = 0; i < 200; i++) {
+        st = CSID_RD(0x70);
+        if (st & 1u) { break; }
+        delay(50);
+    }
+    CSID_WR(0x78, 1); CSID_WR(0x80, 1);
+
+    /* RDI0 (csid gen2 __csid_configure_rdi_stream): byte counter, format measure, timestamps,
+     * payload-only decode (0xf), DT 0x2b (RAW10), VC 0, DT_ID 0 */
+    CSID_WR(0x300, (1u << 0) | (1u << 1) | (1u << 2) | (0xfu << 12) | (0x2bu << 16));
+    CSID_WR(0x304, 2u);                               /* timestamp strobe post-irq */
+    CSID_WR(0x310, 1); CSID_WR(0x30c, 0);             /* frame drop period/pattern */
+    CSID_WR(0x318, 1); CSID_WR(0x314, 0);             /* irq subsample */
+    CSID_WR(0x328, 1); CSID_WR(0x324, 0);             /* pixel drop */
+    CSID_WR(0x330, 1); CSID_WR(0x32c, 0);             /* line drop */
+    CSID_WR(0x308, 0);
+    CSID_WR(0x300, CSID_RD(0x300) | (1u << 31));     /* RDI0 enable */
+    /* CSI2 RX: 4 lanes (3), lane assign 0x3210, PHY 0, D-PHY; ECC correction + MISR */
+    CSID_WR(0x100, 3u | (0x3210u << 4) | (0u << 20));
+    CSID_WR(0x104, (1u << 0) | (1u << 6));
+    /* capture the first long + short packet headers for VC0 (debug) */
+    CSID_WR(0x108, (1u << 0) | (1u << 1));
+    /* irq masks so the status registers latch (no interrupt line is enabled at the GIC) */
+    CSID_WR(0x24, 0x0fffffffu);
+    CSID_WR(0x44, 0xffffffffu);
+    CSID_WR(0x308, 1u);                               /* RDI0 resume at frame boundary */
+    __asm__ volatile ("dsb sy" ::: "memory");
+    snprintf(line, sizeof(line), "camera: CSID0 init - hw_version %#x, reset %s (top irq %#x), RDI0 cfg0 %#x, RX cfg0 %#x\n",
+        hwv, (st & 1u) ? "done" : "TIMEOUT", st, CSID_RD(0x300), CSID_RD(0x100));
+    camlog(line);
+}
+
+/* after the sensor streams: packet counters, error stats, captured headers, measured frame */
+static void
+csid0_report(const char *when)
+{
+    char line[200];
+
+    if (csid0 == 0) {
+        return;
+    }
+    snprintf(line, sizeof(line),
+        "camera: CSID0 [%s] RX pkts %u ecc %#x crc_err %u | rx_irq %#x rdi0_irq %#x rdi0_st %#x\n",
+        when, CSID_RD(0x160), CSID_RD(0x164), CSID_RD(0x168), CSID_RD(0x20), CSID_RD(0x40), CSID_RD(0x350));
+    camlog(line);
+    snprintf(line, sizeof(line),
+        "camera: CSID0 [%s] short pkt %#x/%#x long pkt %#x/%#x | measure %#x %#x %#x | bytes %u/%u | sof_ts %#x\n",
+        when, CSID_RD(0x128), CSID_RD(0x12c), CSID_RD(0x130), CSID_RD(0x134),
+        CSID_RD(0x378), CSID_RD(0x37c), CSID_RD(0x380), CSID_RD(0x3e0), CSID_RD(0x3e4), CSID_RD(0x390));
     camlog(line);
 }
 
@@ -1010,6 +1109,11 @@ rear_sensor_stream(struct i2c *cci)
     (void)i2c_read_reg16(cci, IMX_ADDR, 0x0100, &s, 1);
     snprintf(line, sizeof(line), "camera: IMX363 STREAM ON (2016x1512, 642 Mbps/lane); mode_select readback=%02x (want 01)\n", s);
     camlog(line);
+    csid0_report("+5ms");
+    delay(200000);
+    csid0_report("+205ms");
+    delay(500000);
+    csid0_report("+705ms");
 }
 
 static void
@@ -1043,6 +1147,9 @@ rear_sensor_probe(struct i2c *slg)
     }
     if (cam_level >= 5) {
         csiphy0_init();                 /* M2b: CSIPHY0 reset + lane config + settle (arm receive path) */
+    }
+    if (cam_level >= 6) {
+        csid0_init();                   /* M2b: CSID0 RDI0 <- VC0/RAW10, armed before stream-on */
     }
     delay(2000);
     /* reset high */
