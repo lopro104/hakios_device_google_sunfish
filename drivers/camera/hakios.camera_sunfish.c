@@ -1727,9 +1727,11 @@ imx_exposure(uint32_t lines, uint32_t gain, uint32_t flines)
     uint32_t code = hw->gain_full - (hw->gain_full * IMX_GAIN_UNITY + gain / 2) / gain;
 
     code = code > hw->gain_full / 16u * 15u ? hw->gain_full / 16u * 15u : code;
-    (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0104, 0x01);
+    /* the frame length OUTSIDE the group hold (as mainline imx355.c's VBLANK: a plain write) -- inside it, the IMX355
+     * kept its 60 fps though 0x0340 read back the new value; the exposure and gain stay grouped */
     (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0340, (uint8_t)(flines >> 8));
     (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0341, (uint8_t)flines);
+    (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0104, 0x01);
     (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0202, (uint8_t)(lines >> 8));
     (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0203, (uint8_t)lines);
     (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0204, (uint8_t)(code >> 8));
@@ -1737,7 +1739,7 @@ imx_exposure(uint32_t lines, uint32_t gain, uint32_t flines)
     (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0104, 0x00);
     {
         static unsigned said;
-        uint8_t b[4] = { 0, 0, 0, 0 }, g[2] = { 0, 0 };
+        uint8_t b[4] = { 0, 0, 0, 0 }, g[2] = { 0, 0 }, fc = 0;
         char line[160];
 
         if (said < 6) {
@@ -1745,8 +1747,9 @@ imx_exposure(uint32_t lines, uint32_t gain, uint32_t flines)
             (void)i2c_read_reg16(&cam_cci, IMX_ADDR, 0x0340, b, 2);
             (void)i2c_read_reg16(&cam_cci, IMX_ADDR, 0x0202, b + 2, 2);
             (void)i2c_read_reg16(&cam_cci, IMX_ADDR, 0x0204, g, 2);
-            snprintf(line, sizeof(line), "camera: exposure written: frame %u lines %u code %u -> read back frame %u lines %u code %u\n",
-                flines, lines, code, (b[0] << 8) | b[1], (b[2] << 8) | b[3], (g[0] << 8) | g[1]);
+            (void)i2c_read_reg16(&cam_cci, IMX_ADDR, 0x0350, &fc, 1);
+            snprintf(line, sizeof(line), "camera: exposure written: frame %u lines %u code %u -> read back frame %u lines %u code %u, 0x0350 %02x\n",
+                flines, lines, code, (b[0] << 8) | b[1], (b[2] << 8) | b[3], (g[0] << 8) | g[1], fc);
             camlog(line);
         }
     }
@@ -1911,6 +1914,9 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
     f.margin = slot[b].shw->margin;
     f.sensor = slot[b].shw->header_sensor;      /* 1 the wide (back), 2 the front camera, as camera_device.c's cameras[] */
     f.focus = HAKIOS_CAMERA_NO_FOCUS;
+    f.reserved[0] = 1u;                         /* the turn is said here: neither camera's picture is turned half round
+                                                 * (the back one's was right as it came; the front one was upside down
+                                                 * with camera_device.c's POCO-front half turn) */
     whole = uio_resid(uio) > (user_ssize_t)sizeof(f);
     if (whole) {
         slot[b].state = SLOT_READING;           /* the frame is this reader's: not given back to the write master */

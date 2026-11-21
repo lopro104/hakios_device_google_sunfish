@@ -2430,9 +2430,11 @@ mic_down(void)
 	uint16_t disable[2] = { AFE_GROUP_TERT_TDM_TX, 0 }, start[2] = { AFE_PORT_TERT_TDM_TX, 0 };
 	uint32_t clock_off[5] = { 1, AFE_CLK_TER_TDM_IBIT, 12288000, 1, 0 };
 
-	if (mic.running) {
-		(void)basic_ok("the stream paused", APR_SVC_ASM, MIC_PORT, ASM_PAUSE, NULL, 0);
-	}
+	/*
+	 * No ASM_PAUSE first: closing the stream stops it. The pause's answer was missed half the time (it came under
+	 * another token while a playback stream paused too), so mic_down waited 3 s -- and a recording's stop in
+	 * mediaserverd timed out on the audio node and broke (-[BWGraph stop:] graph stop timeout, brk).
+	 */
 	if (mic.stream_open) {
 		(void)basic_ok("the stream closed", APR_SVC_ASM, MIC_PORT, ASM_CLOSE, NULL, 0);
 	}
