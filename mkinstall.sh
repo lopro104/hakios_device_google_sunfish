@@ -14,9 +14,10 @@ mkdir -p build
 for f in hakios-kernel userland/root.apfs userland/flashboot.apfs xnuloader/loader.efi u-boot/build-sunfish_storage/u-boot.bin; do
 	[ -f "$f" ] || { echo "mkinstall.sh: no $f"; exit 1; }
 done
+# INSTALL_ARGS: extra boot args of the flashed image (default cam=5: the camera; INSTALL_ARGS= for none)
 # (debug and rd are what the loader and xl give a run; no epoch: the clock is set by the network, no loader_return_after: it runs until it is stopped)
 python3 -I xnuloader/mkpayload.py -o build/ios-payload.bin kernel=hakios-kernel ramdisk=userland/root.apfs resident=userland/flashboot.apfs \
-	--cmdline "debug=0x8 rd=md0 sb_delay=8 $BOOT_ARGS_BASE $FLASH_ARGS" >/dev/null || exit 1
+	--cmdline "debug=0x8 rd=md0 sb_delay=8 $BOOT_ARGS_BASE $FLASH_ARGS ${INSTALL_ARGS-cam=5}" >/dev/null || exit 1
 python3 -I tools/mkubootimg.py -d sunfish -u u-boot/build-sunfish_storage/u-boot.bin -l xnuloader/loader.efi -p build/ios-payload.bin \
 	--header-version 2 --pagesize 4096 -o "$OUT" || exit 1
 avbtool add_hash_footer --image "$OUT" --partition_size 67108864 --partition_name boot --algorithm NONE >/dev/null 2>&1 || { echo "mkinstall.sh: avbtool failed"; exit 1; }
