@@ -239,6 +239,7 @@ static void camlog(const char *msg) { printf("%s", msg); for (const char *c = ms
 #define SLG_MATRIX_CONF_A       0x110d          /* enable: BIT(ldo - 1) */
 
 static uint32_t cam_level;
+static uint32_t cam_mclk_khz = 24000;   /* effective MCLK0 rate (24000 via PLL2, or 19200 XO fallback) */
 static struct { unsigned gpio; vm_offset_t va; } pin_map[8];
 static unsigned pin_mapped;
 
@@ -467,6 +468,52 @@ spmi_write8(unsigned slave, unsigned periph, unsigned reg, uint8_t value)
     return ok ? 0 : -3;
 }
 
+#define CH_RDATA0           0x18
+#define CMD_READ_LONG       (1u << 27)          /* EXT_READL opcode */
+
+/* read one byte from (slave, peripheral<<8|reg); returns 0..255, or negative on error */
+static int
+spmi_read8(unsigned slave, unsigned periph, unsigned reg)
+{
+    uint32_t id = (slave << 8) | periph, channels, n, found = ~0u;
+    vm_offset_t ch;
+    int val = -3;
+
+    if (arb_core == 0) {
+        arb_core = ml_io_map(ARB_CORE_PHYS, 0x1100);
+        arb_cnfg = ml_io_map(ARB_CNFG_PHYS, 0x1000);
+    }
+    if (arb_core == 0 || arb_cnfg == 0) {
+        return -1;
+    }
+    channels = *(volatile uint32_t *)(arb_core + ARB_FEATURES) & 0x7ff;
+    for (n = 0; n < channels; n++) {
+        uint32_t map = *(volatile uint32_t *)(arb_core + ARB_CHANNEL(n));
+        if (((map >> 8) & 0xfff) == id) {
+            if ((*(volatile uint32_t *)(arb_cnfg + ARB_OWNER(n)) & 7) == 0) { found = n; break; }
+            if (found == ~0u) { found = n; }
+        }
+    }
+    if (found == ~0u) {
+        return -2;
+    }
+    ch = ml_io_map(ARB_CHNLS_PHYS + 0x10000UL * found, 0x1000);
+    if (ch == 0) {
+        return -1;
+    }
+    hakios_spmi_lock();
+    *(volatile uint32_t *)(ch + CH_COMMAND) = CMD_READ_LONG | (uint32_t)reg << 4;   /* 1 byte */
+    __asm__ volatile ("dsb sy" ::: "memory");
+    for (int t = 0; t < 50; t++) {
+        uint32_t st = *(volatile uint32_t *)(ch + CH_STATUS);
+        if (st & 1u) { val = *(volatile uint32_t *)(ch + CH_RDATA0) & 0xff; break; }
+        if (st & 0xeu) { break; }
+        delay(40);
+    }
+    hakios_spmi_unlock();
+    return val;
+}
+
 /* a PM6150L GPIO (slave 4, GPIOn peripheral 0xc000 + (n-1)*0x100) to constant output-high, LV/MV, push-pull, no pull
  * (the bytes pinctrl-spmi-gpio.c writes: MODE_CTL 0x40=1 output, OUT_SOURCE 0x44=0x80 value-high, DIG_OUT 0x45 push-pull,
  * PULL 0x42=5 none, VIN 0x41=0, EN_CTL 0x46=0x80). */
@@ -487,6 +534,13 @@ pm6150l_gpio_high(unsigned gpio)
         snprintf(line, sizeof(line), "camera: PM6150L GPIO%u high: writes %d %d %d %d %d %d (0 ok)\n", gpio, b, c, a, d, e, f);
         camlog(line);
     }
+}
+
+/* drive the same GPIO's output value low (keeps it a configured push-pull output) - for a clean low->high toggle */
+static void
+pm6150l_gpio_low(unsigned gpio)
+{
+    (void)spmi_write8(4, 0xc0 + (gpio - 1), 0x44, 0x00);        /* OUT_SOURCE: value low */
 }
 
 
@@ -546,12 +600,12 @@ camcc_pll2_up(void)
     WR(b + PLL2_MODE, RD(b + PLL2_MODE) | 0x800000u); /* PLL_UPDATE_BYPASS (BIT23): required by configure */
     WR(b + PLL2_MODE, RD(b + PLL2_MODE) | 4u);        /* RESET_N (set in configure) */
     __asm__ volatile ("dsb sy" ::: "memory");
-    WR(b + PLL2_MODE, RD(b + PLL2_MODE) & ~1u); /* OUTCTRL off */
-    WR(b + PLL2_OPMODE, 0);                      /* STANDBY */
-    WR(b + PLL2_MODE, RD(b + PLL2_MODE) | 4u);   /* RESET_N */
+    /* clk_alpha_pll_enable: agera (camcc_pll2) uses the CLASSIC sequence, not fabia OPMODE -
+     * BYPASSNL, >=5 us, RESET_N, wait LOCK_DET, then OUTCTRL. Outputs are already enabled by USER_CTL=0x30b. */
+    WR(b + PLL2_MODE, RD(b + PLL2_MODE) | 2u);   /* BYPASSNL */
     __asm__ volatile ("dsb sy" ::: "memory");
-    delay(10);
-    WR(b + PLL2_OPMODE, 1);                       /* RUN */
+    delay(10);                                    /* udelay(5) */
+    WR(b + PLL2_MODE, RD(b + PLL2_MODE) | 4u);   /* RESET_N */
     __asm__ volatile ("dsb sy" ::: "memory");
     {
         int locked = 0;
@@ -560,7 +614,6 @@ camcc_pll2_up(void)
             if (RD(b + PLL2_MODE) & 0x80000000u) { locked = 1; break; }
             delay(10);
         }
-        WR(b + PLL2_USER_CTL, RD(b + PLL2_USER_CTL) | 0x7u);   /* enable outputs */
         WR(b + PLL2_MODE, RD(b + PLL2_MODE) | 1u);             /* OUTCTRL */
         __asm__ volatile ("dsb sy" ::: "memory");
         snprintf(line, sizeof(line), "camera: PLL2 %s (mode %#x)\n", locked ? "LOCKED" : "did NOT lock", RD(b + PLL2_MODE));
@@ -583,20 +636,36 @@ camcc_mclk0_on(void)
     if (camcc == 0) {
         return;
     }
-    camcc_pll2_up();            /* 24 MHz MCLK needs PLL2 (the IMX363 PLL tables assume 24 MHz) */
-    /* MCLK0 RCG: source PLL2_OUT_AUX (480 MHz), M/N 1/20, div 1 -> 24 MHz; then UPDATE; branch on */
+    camcc_pll2_up();            /* PLL2 for a 24 MHz MCLK (the IMX363 PLL tables assume 24 MHz) */
+    /* Try MCLK0 from PLL2_OUT_AUX (480 MHz), MND 1/20, /1 -> 24 MHz. */
     WR(camcc + MCLK0_M, 1);
-    WR(camcc + MCLK0_N, (uint32_t)(~(20u - 1)) & 0xff);        /* N stored as ~(N-1) */
-    WR(camcc + MCLK0_D, (uint32_t)(~(2u * 20u)) & 0xff);       /* 2*N */
-    WR(camcc + MCLK0_CFG_RCGR, (RD(camcc + MCLK0_CFG_RCGR) & ~0x371fu) | (5u << 8) | (2u << 12) | 0x00u); /* src 5 (AUX), M/N mode, div 1 */
+    WR(camcc + MCLK0_N, (uint32_t)(~(20u - 1)) & 0xff);        /* ~(n-m) */
+    WR(camcc + MCLK0_D, (uint32_t)(~(2u * 19u)) & 0xff);       /* ~(2*d), d=clamp(n,m,n-m)=19 */
+    WR(camcc + MCLK0_CFG_RCGR, (RD(camcc + MCLK0_CFG_RCGR) & ~0x37ffu) | (5u << 8) | (2u << 12) | 0x01u); /* src 5 (AUX), MND, /1 */
     WR(camcc + MCLK0_CMD_RCGR, RD(camcc + MCLK0_CMD_RCGR) | RCG_UPDATE);
     __asm__ volatile ("dsb sy" ::: "memory");
     for (int i = 0; i < 100 && (RD(camcc + MCLK0_CMD_RCGR) & RCG_UPDATE); i++) { delay(100); }
     WR(camcc + MCLK0_CBCR, RD(camcc + MCLK0_CBCR) | 1u);
     __asm__ volatile ("dsb sy" ::: "memory");
+    delay(1000);
+    /* If the branch did not start on AUX, fall back to the proven XO path (19.2 MHz, M1).
+     * The sensor tolerates 6-27 MHz; at 19.2 the MIPI link runs at 0.8x (settle count adjusts). */
+    if (RD(camcc + MCLK0_CBCR) & 0x80000000u) {
+        WR(camcc + MCLK0_CFG_RCGR, (RD(camcc + MCLK0_CFG_RCGR) & ~0x37ffu) | (0u << 8) | (0u << 12) | 0x01u); /* src 0 (TCXO), no MND, /1 */
+        WR(camcc + MCLK0_CMD_RCGR, RD(camcc + MCLK0_CMD_RCGR) | RCG_UPDATE);
+        __asm__ volatile ("dsb sy" ::: "memory");
+        for (int i = 0; i < 100 && (RD(camcc + MCLK0_CMD_RCGR) & RCG_UPDATE); i++) { delay(100); }
+        WR(camcc + MCLK0_CBCR, RD(camcc + MCLK0_CBCR) | 1u);
+        __asm__ volatile ("dsb sy" ::: "memory");
+        delay(1000);
+        cam_mclk_khz = 19200;
+    } else {
+        cam_mclk_khz = 24000;
+    }
     {
-        char line[112];
-        snprintf(line, sizeof(line), "camera: MCLK0 CBCR %#x (bit31=off), RCG cfg %#x\n", RD(camcc + MCLK0_CBCR), RD(camcc + MCLK0_CFG_RCGR));
+        char line[128];
+        snprintf(line, sizeof(line), "camera: MCLK0 %u kHz, CBCR %#x (bit31=off) cfg %#x | PLL2 mode %#x\n",
+            cam_mclk_khz, RD(camcc + MCLK0_CBCR), RD(camcc + MCLK0_CFG_RCGR), RD(camcc + PLL2 + PLL2_MODE));
         camlog(line);
     }
     /* GPIO 13 to the cam_mclk function (index 1), 4 mA */
@@ -709,6 +778,19 @@ camera_probe(void)
     pm6150l_gpio_high(4);       /* dlg,cs-gpios */
     pm6150l_gpio_high(6);
     delay(5000);
+    /* confirm the enable GPIOs actually latched high (SPMI write DONE != pin driven) */
+    {
+        char line[136];
+        unsigned g;
+        for (g = 1; g <= 5; g += 4) {           /* GPIO1 then GPIO5 */
+            unsigned p = 0xc0 + (g - 1);
+            snprintf(line, sizeof(line),
+                "camera: PM6150L GPIO%u readback MODE(40)=%#x OUT_SRC(44)=%#x DIG_OUT(45)=%#x EN(46)=%#x STATUS(08)=%#x\n",
+                g, spmi_read8(4, p, 0x40), spmi_read8(4, p, 0x44), spmi_read8(4, p, 0x45),
+                spmi_read8(4, p, 0x46), spmi_read8(4, p, 0x08));
+            camlog(line);
+        }
+    }
     {
         char line[96];
         int drv = i2c_ping(&slg, 0x5a);     /* the DRV2624 haptic, known present on this bus */
@@ -718,6 +800,19 @@ camera_probe(void)
     }
     camlog("camera: reading the SLG51000\n");
     r = i2c_read_reg16(&slg, SLG_ADDR, SLG_PATTERN_ID_B0, id, 3);
+    /* cold-boot tolerant: a cold SLG may need a clean enable rising edge. Toggle 1,5 low->high and retry. */
+    for (int attempt = 1; r != 0 && attempt <= 5; attempt++) {
+        char line[80];
+        pm6150l_gpio_low(1);
+        pm6150l_gpio_low(5);
+        delay(10000);
+        pm6150l_gpio_high(1);
+        pm6150l_gpio_high(5);
+        delay(10000 * (unsigned)attempt);
+        r = i2c_read_reg16(&slg, SLG_ADDR, SLG_PATTERN_ID_B0, id, 3);
+        snprintf(line, sizeof(line), "camera: SLG enable toggle retry %d -> %s\n", attempt, r == 0 ? "ACK" : "silent");
+        camlog(line);
+    }
     if (r == 0 && cam_level >= 2) {
         rear_sensor_probe(&slg);
     }
