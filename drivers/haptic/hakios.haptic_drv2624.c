@@ -230,6 +230,20 @@ i2c_read(bool more)
 static LCK_GRP_DECLARE(bus_lock_group, "hakios-sunfish-i2c");
 static LCK_MTX_DECLARE(bus_lock, &bus_lock_group);
 
+/* the bus is shared with the camera's PMIC (SLG51000, 0x75; drivers/camera/hakios.camera_sunfish.c): it takes this too */
+void hakios_se9_bus_lock(void);
+void hakios_se9_bus_unlock(void);
+void
+hakios_se9_bus_lock(void)
+{
+	lck_mtx_lock(&bus_lock);
+}
+void
+hakios_se9_bus_unlock(void)
+{
+	lck_mtx_unlock(&bus_lock);
+}
+
 static uint32_t taken_cfg[2], taken_io[2];
 
 static bool

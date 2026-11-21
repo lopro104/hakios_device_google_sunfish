@@ -363,7 +363,7 @@ static void camlog(const char *msg) { printf("%s", msg); for (const char *c = ms
 
 static uint32_t cam_level;
 static uint32_t cam_mclk_khz = 24000;   /* effective MCLK0 rate (24000 via PLL2, or 19200 XO fallback) */
-static struct { unsigned gpio; vm_offset_t va; } pin_map[8];
+static struct { unsigned gpio; vm_offset_t va; } pin_map[16];  /* both cameras' pins + the SLG bus */
 static unsigned pin_mapped;
 
 /* one 16 KB page per GPIO (a 3 MB tile map can fail on kmem_alloc; see the clocks driver) */
@@ -378,7 +378,7 @@ pin(unsigned gpio)
             return (volatile uint32_t *)(pin_map[i].va + (page - base));
         }
     }
-    if (pin_mapped < 8) {
+    if (pin_mapped < sizeof(pin_map) / sizeof(pin_map[0])) {
         vm_offset_t va = ml_io_map(base, 0x4000);
         if (va != 0) {
             pin_map[pin_mapped].gpio = gpio;
@@ -493,7 +493,7 @@ i2c_ping(struct i2c *b, uint8_t addr)
 }
 
 static int
-i2c_read_reg16(struct i2c *b, uint8_t addr, uint16_t reg, uint8_t *out, unsigned count)
+i2c_read_reg16_raw(struct i2c *b, uint8_t addr, uint16_t reg, uint8_t *out, unsigned count)
 {
     i2c_start(b);
     if (!i2c_write_byte(b, (uint8_t)(addr << 1)) || !i2c_write_byte(b, (uint8_t)(reg >> 8)) ||
@@ -514,7 +514,7 @@ i2c_read_reg16(struct i2c *b, uint8_t addr, uint16_t reg, uint8_t *out, unsigned
 }
 
 static int
-i2c_write_reg16(struct i2c *b, uint8_t addr, uint16_t reg, uint8_t value)
+i2c_write_reg16_raw(struct i2c *b, uint8_t addr, uint16_t reg, uint8_t value)
 {
     int ok;
 
@@ -525,6 +525,37 @@ i2c_write_reg16(struct i2c *b, uint8_t addr, uint16_t reg, uint8_t value)
     return ok ? 0 : -1;
 }
 
+
+/*
+ * The SLG51000's bus (GPIO 46/47) is the haptic DRV2624's too: a transaction there holds the haptic driver's bus lock,
+ * now that the camera powers its sensors up and down while the phone runs (and taps vibrate). The CCI pins are ours.
+ */
+extern void hakios_se9_bus_lock(void);
+extern void hakios_se9_bus_unlock(void);
+
+static int
+i2c_read_reg16(struct i2c *b, uint8_t addr, uint16_t reg, uint8_t *out, unsigned count)
+{
+    bool shared = b->sda == SLG_SDA_GPIO;
+    int r;
+
+    if (shared) { hakios_se9_bus_lock(); }
+    r = i2c_read_reg16_raw(b, addr, reg, out, count);
+    if (shared) { hakios_se9_bus_unlock(); }
+    return r;
+}
+
+static int
+i2c_write_reg16(struct i2c *b, uint8_t addr, uint16_t reg, uint8_t value)
+{
+    bool shared = b->sda == SLG_SDA_GPIO;
+    int r;
+
+    if (shared) { hakios_se9_bus_lock(); }
+    r = i2c_write_reg16_raw(b, addr, reg, value);
+    if (shared) { hakios_se9_bus_unlock(); }
+    return r;
+}
 
 /* ---- the SPMI arbiter (v5), to drive the PM6150L GPIOs that enable the SLG51000 (as the torch driver does) ---- */
 #define ARB_CORE_PHYS       0x0c440000UL
@@ -736,6 +767,7 @@ static const struct cam_hw *hw = &cam_back;
 #define CCI0_SDA_GPIO       (hw->sda)
 #define CCI0_SCL_GPIO       (hw->scl)
 static vm_offset_t camcc, titan;
+static void phy_clocks_on(void);
 
 /* set an SLG51000 LDO to vsel (voltage code), then enable the chosen LDOs (mask of BIT(ldo-1) in reg 0x110d). */
 static void
@@ -859,7 +891,11 @@ camcc_rcg_set(uint32_t cmd_off, uint32_t src_sel, uint32_t div_field)
 static void
 camss_top_on(void)
 {
-    vm_offset_t gcc_cam = ml_io_map(0x10b000UL, 0x1000);    /* GCC camera branches */
+    static vm_offset_t gcc_cam;                              /* GCC camera branches (mapped once: the I/O map space) */
+
+    if (gcc_cam == 0) {
+        gcc_cam = ml_io_map(0x10b000UL, 0x1000);
+    }
 
     if (gcc_cam != 0) {
         WR(gcc_cam + 0x020, RD(gcc_cam + 0x020) | 1u);     /* gcc_camera_hf_axi_clk */
@@ -886,6 +922,13 @@ camss_csiphy_clocks_on(void)
 {
     camcc_pll0_up();                    /* PLL0 first: camnoc_axi_src and the CSIPHY clocks use OUT_EVEN */
     camss_top_on();
+    phy_clocks_on();
+}
+
+/* the chosen camera's CSIPHY clocks (timer and branch), and CSIPHY0's, which every PHY needs */
+static void
+phy_clocks_on(void)
+{
     camcc_rcg_set(hw->phytimer_rcg, 2, 3);  /* csiNphytimer_src: src 2 (OUT_EVEN), /2 (field 2*2-1=3) */
     camcc_rcg_set(0xa064, 2, 3);        /* cphy_rx_src: src 2 (OUT_EVEN), /2 */
     WR(camcc + hw->phytimer_cbcr, RD(camcc + hw->phytimer_cbcr) | 1u);   /* csiNphytimer_clk branch */
@@ -1037,7 +1080,15 @@ csiphy0_init(void)
     int settle;
     char line[160];
 
-    csiphy0 = ml_io_map(hw->phy_pa, 0x4000);      /* 16 KB: covers lane regs + common block (CSIPHY0 or 2) */
+    {
+        static vm_offset_t phy_va[4];                   /* CSIPHY0..3, 0x2000 apart; each mapped once */
+        unsigned n = (unsigned)((hw->phy_pa - 0xace0000UL) / 0x2000UL) & 3u;
+
+        if (phy_va[n] == 0) {
+            phy_va[n] = ml_io_map(hw->phy_pa, 0x4000);  /* 16 KB: covers lane regs + common block */
+        }
+        csiphy0 = phy_va[n];
+    }
     if (csiphy0 == 0) {
         camlog("camera: CSIPHY0 map failed\n");
         return;
@@ -1285,6 +1336,7 @@ static struct cam_slot {
     vm_offset_t va;
     uint64_t    pa, seq, time, given;
     uint32_t    state, exposure, gain, frame_lines;
+    const struct cam_hw *shw;           /* the camera the frame came from (the header's size and sensor) */
 } slot[CAM_NBUF];
 static void ring_fill(void);
 
@@ -1455,18 +1507,24 @@ vfe0_report(void)
     }
 }
 
+/* titan top power domain on (clear SW_COLLAPSE bit0, wait bit31 powered) */
 static void
-camcc_mclk0_on(void)
+titan_gdsc_on(void)
 {
-    volatile uint32_t *g;
-
-    /* titan top power domain on (clear SW_COLLAPSE bit0, wait bit31 powered) */
     if (titan != 0) {
         volatile uint32_t *t = (volatile uint32_t *)titan;
         *t &= ~1u;
         __asm__ volatile ("dsb sy" ::: "memory");
         for (int i = 0; i < 100 && !(*t & 0x80000000u); i++) { delay(100); }
     }
+}
+
+static void
+camcc_mclk0_on(void)
+{
+    volatile uint32_t *g;
+
+    titan_gdsc_on();
     if (camcc == 0) {
         return;
     }
@@ -1552,6 +1610,16 @@ static uint32_t cur_lines = 0x0c52, cur_gain = IMX_GAIN_UNITY, cur_flines = 3170
 static uint32_t old_lines = 0x0c52, old_gain = IMX_GAIN_UNITY, old_flines = 3170;
 static uint64_t ring_eff_seq;
 static struct { bool pending; uint32_t lines, gain, flines; } cam_ask;
+/*
+ * On demand: the ring thread powers a sensor up when a read wants frames (cam_want = cam_choice) and down after
+ * CAM_IDLE_SECS without a read, or to change cameras (HAKIOS_CAMERA_SENSOR). cam_on / cam_want / cam_choice are
+ * header_sensor numbers (1 back, 2 front), 0 for none.
+ */
+#define CAM_IDLE_SECS   3
+static uint32_t cam_on, cam_want, cam_choice = 1;
+static uint64_t cam_last_read;
+static bool sensor_up(const struct cam_hw *want);
+static void sensor_down(void);
 
 #define CANARY_AT   (CAM_FRAME_BYTES - 64)      /* the frame's last 64 bytes: 0xa5 until the write master gets there */
 
@@ -1629,6 +1697,7 @@ ring_done(void)
     slot[done].state = SLOT_READY;
     slot[done].seq = ++ring_seq;
     slot[done].time = now;
+    slot[done].shw = hw;
     if (ring_seq >= ring_eff_seq) {
         slot[done].exposure = cur_lines;
         slot[done].gain = cur_gain;
@@ -1666,6 +1735,21 @@ imx_exposure(uint32_t lines, uint32_t gain, uint32_t flines)
     (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0204, (uint8_t)(code >> 8));
     (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0205, (uint8_t)code);
     (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0104, 0x00);
+    {
+        static unsigned said;
+        uint8_t b[4] = { 0, 0, 0, 0 }, g[2] = { 0, 0 };
+        char line[160];
+
+        if (said < 6) {
+            said++;
+            (void)i2c_read_reg16(&cam_cci, IMX_ADDR, 0x0340, b, 2);
+            (void)i2c_read_reg16(&cam_cci, IMX_ADDR, 0x0202, b + 2, 2);
+            (void)i2c_read_reg16(&cam_cci, IMX_ADDR, 0x0204, g, 2);
+            snprintf(line, sizeof(line), "camera: exposure written: frame %u lines %u code %u -> read back frame %u lines %u code %u\n",
+                flines, lines, code, (b[0] << 8) | b[1], (b[2] << 8) | b[3], (g[0] << 8) | g[1]);
+            camlog(line);
+        }
+    }
 }
 
 static void
@@ -1677,7 +1761,36 @@ ring_thread(__unused void *parameter, __unused wait_result_t result)
     lck_mtx_lock(&cam_mtx);
     for (;;) {
         struct timespec ts = { 0, 1000000 };
-        uint32_t st0 = VFE_RD(0x205c), st1 = VFE_RD(0x2060);
+        uint32_t st0, st1;
+
+        if (cam_on != 0 && cam_last_read != 0) {
+            uint64_t idle_ns;
+
+            absolutetime_to_nanoseconds(mach_absolute_time() - cam_last_read, &idle_ns);
+            if (idle_ns > CAM_IDLE_SECS * NSEC_PER_SEC) {
+                cam_want = 0;                   /* nobody reads: the sensor off */
+            }
+        }
+        if (cam_want != cam_on) {
+            uint32_t want = cam_want;
+            bool up = false;
+
+            lck_mtx_unlock(&cam_mtx);           /* (bus traffic and delays: not under the lock) */
+            if (cam_on != 0) {
+                sensor_down();
+            }
+            if (want != 0) {
+                up = sensor_up(want == 2 ? &cam_front : &cam_back);
+            }
+            lck_mtx_lock(&cam_mtx);
+            cam_on = up ? want : 0;
+            if (want != 0 && !up) {
+                cam_want = 0;                   /* (said by sensor_up; a later read tries again) */
+            }
+            continue;
+        }
+        st0 = VFE_RD(0x205c);
+        st1 = VFE_RD(0x2060);
 
         if (st0 | st1) {
             VFE_WR(0x2050, st0);
@@ -1748,12 +1861,17 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
     bool whole;
 
     lck_mtx_lock(&cam_mtx);
+    cam_last_read = mach_absolute_time();
     for (;;) {
         struct timespec ts = { 1, 0 };
 
         if (cam_fault) {
             lck_mtx_unlock(&cam_mtx);
             return EIO;
+        }
+        if (cam_want == 0) {
+            cam_want = cam_choice;              /* frames wanted: the ring thread powers the sensor up */
+            wakeup(&ring_on);
         }
         for (int i = 0; i < CAM_NBUF; i++) {
             if ((slot[i].state == SLOT_READY || slot[i].state == SLOT_READING) && slot[i].seq > ring_read_seq &&
@@ -1774,9 +1892,9 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
     bzero(&f, sizeof(f));
     memcpy(f.magic, HAKIOS_CAMERA_MAGIC, sizeof(f.magic));
     f.header_bytes = sizeof(f);
-    f.width = hw->width;
-    f.height = hw->height;
-    f.stride = CAM_LINE_BYTES;
+    f.width = slot[b].shw->width;
+    f.height = slot[b].shw->height;
+    f.stride = slot[b].shw->stride;
     f.format = 1;
     f.bayer = 0;                                /* RGGB (the first picture's colours) */
     f.black = 64;
@@ -1788,10 +1906,10 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
     f.gain_unity = IMX_GAIN_UNITY;
     f.gain_max = IMX_GAIN_MAX;
     f.frame_lines = slot[b].frame_lines;
-    f.frame_lines_min = IMX_FRAME_LINES;
-    f.frame_lines_max = IMX_FRAME_LINES_MAX;
-    f.margin = IMX_MARGIN;
-    f.sensor = hw->header_sensor;               /* 1 the wide (back), 2 the front camera, as camera_device.c's cameras[] */
+    f.frame_lines_min = slot[b].shw->frame_lines;
+    f.frame_lines_max = 4u * slot[b].shw->frame_lines;
+    f.margin = slot[b].shw->margin;
+    f.sensor = slot[b].shw->header_sensor;      /* 1 the wide (back), 2 the front camera, as camera_device.c's cameras[] */
     f.focus = HAKIOS_CAMERA_NO_FOCUS;
     whole = uio_resid(uio) > (user_ssize_t)sizeof(f);
     if (whole) {
@@ -1805,7 +1923,7 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
         return error;                           /* the header alone: the frame stays the next one to read */
     }
     if (error == 0 && uio_resid(uio) > 0) {
-        uint32_t n = (uint32_t)MIN((uint64_t)CAM_FRAME_BYTES, (uint64_t)uio_resid(uio));
+        uint32_t n = (uint32_t)MIN((uint64_t)slot[b].shw->stride * slot[b].shw->height, (uint64_t)uio_resid(uio));
 
         cache_flush(slot[b].va, n);             /* (what the write master wrote went past the caches) */
         error = uiomove((caddr_t)slot[b].va, (int)n, uio);
@@ -1874,7 +1992,17 @@ camdev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
         lck_mtx_unlock(&cam_mtx);
         return 0;
     case HAKIOS_CAMERA_SENSOR:
-        return c.a == hw->header_sensor ? 0 : EINVAL;  /* the camera chosen at boot only, so far (cam_sensor) */
+        if (c.a != 1 && c.a != 2) {
+            return EINVAL;                      /* 1 the back, 2 the front camera (no others on this phone) */
+        }
+        lck_mtx_lock(&cam_mtx);
+        cam_choice = c.a;
+        if (cam_want != 0) {
+            cam_want = c.a;                     /* streaming: the ring thread changes sensors */
+        }
+        lck_mtx_unlock(&cam_mtx);
+        wakeup(&ring_on);
+        return 0;
     case HAKIOS_CAMERA_FOCUS:
         return 0;                               /* (no lens motor driven yet) */
     case HAKIOS_CAMERA_KEEP:
@@ -1965,7 +2093,6 @@ rear_sensor_stream(struct i2c *cci)
         delay(200000);
         csid0_report("+205ms");
         csiphy_report("+205ms");
-        ring_start();
         return;
     }
     csid0_report("+5ms");
@@ -1992,6 +2119,20 @@ rear_sensor_probe(struct i2c *slg)
     }
     if (pin(CCI0_SDA_GPIO) == NULL || pin(CCI0_SCL_GPIO) == NULL || pin(CAM_RESET_GPIO) == NULL) {
         camlog("camera: could not map the sensor GPIOs\n");
+        return;
+    }
+    if (cam_level >= CAM_SERVE) {
+        /*
+         * cam=5: everything but a sensor now -- the power domain, PLLs, the camss fabric, a PHY, the CSID, the VFE and
+         * its ring, the ring thread. The sensors are powered by the thread, on demand (sensor_up, sensor_down).
+         */
+        titan_gdsc_on();
+        camss_csiphy_clocks_on();
+        csiphy0_init();
+        csid0_init();
+        vfe0_init();
+        cam_choice = hw->header_sensor;         /* the first camera reads get: cam_sensor's, else the back one */
+        ring_start();
         return;
     }
     /* the camera's rails (cam_hw: back LDO1/3/7/4, front LDO2/5/7) */
@@ -2031,6 +2172,88 @@ rear_sensor_probe(struct i2c *slg)
     if (r == 0 && cam_level >= 3) {
         rear_sensor_stream(&cci);
     }
+}
+
+
+/*
+ * cam=5, from the ring thread: one camera powered up and streaming into the ring (rails, MCLK, its PHY, the CSID's PHY
+ * select, reset, chip id, tables, stream on), or down again. False, with the camera left down, if it does not answer.
+ */
+static bool
+sensor_up(const struct cam_hw *want)
+{
+    struct i2c slg = { SLG_SDA_GPIO, SLG_SCL_GPIO }, cci;
+    volatile uint32_t *rst;
+    uint8_t v[2] = { 0, 0 };
+    char line[160];
+
+    lck_mtx_lock(&cam_mtx);
+    hw = want;
+    for (int i = 0; i < CAM_NBUF; i++) {
+        if (slot[i].state == SLOT_READY) {
+            slot[i].state = SLOT_FREE;          /* the other camera's last frame: not given out any more */
+        } else if (slot[i].state == SLOT_HW) {
+            memset((void *)(slot[i].va + CANARY_AT), 0xa5, 64);     /* (this camera's frame ends elsewhere) */
+            cache_flush(slot[i].va + CANARY_AT, 64);
+        }
+    }
+    lck_mtx_unlock(&cam_mtx);
+    cci.sda = hw->sda;
+    cci.scl = hw->scl;
+    cam_cci = cci;
+    if (pin(hw->sda) == NULL || pin(hw->scl) == NULL || pin(hw->reset) == NULL || pin(hw->mclk_gpio) == NULL) {
+        camlog("camera: could not map the sensor GPIOs\n");
+        return false;
+    }
+    for (unsigned i = 0; i < hw->nrails; i++) {
+        slg_ldo(&slg, hw->rails[i].ldo, hw->rails[i].vsel);
+    }
+    (void)i2c_write_reg16(&slg, SLG_ADDR, SLG_MATRIX_CONF_A, hw->ldo_mask);
+    delay(5000);
+    camcc_mclk0_on();
+    phy_clocks_on();
+    csiphy0_init();
+    CSID_WR(0x100, 3u | (0x3210u << 4) | (hw->phy_sel << 20));     /* the CSID listens to this camera's PHY */
+    __asm__ volatile ("dsb sy" ::: "memory");
+    delay(2000);
+    rst = pin(hw->reset);
+    rst[TLMM_IO / 4] = 2;                       /* reset high */
+    rst[TLMM_CFG / 4] = 1u << 9;
+    __asm__ volatile ("dsb sy" ::: "memory");
+    delay(10000);
+    sda_scl_init(hw->sda);
+    sda_scl_init(hw->scl);
+    delay(1000);
+    if (i2c_read_reg16(&cci, IMX_ADDR, IMX_CHIP_ID_REG, v, 2) != 0 || ((v[0] << 8) | v[1]) != hw->chip_id) {
+        snprintf(line, sizeof(line), "camera: %s did not answer (chip id %02x%02x): left down\n", hw->name, v[0], v[1]);
+        camlog(line);
+        sensor_down();
+        return false;
+    }
+    rear_sensor_stream(&cci);
+    snprintf(line, sizeof(line), "camera: %s up (asked for by a read)\n", hw->name);
+    camlog(line);
+    return true;
+}
+
+static void
+sensor_down(void)
+{
+    struct i2c slg = { SLG_SDA_GPIO, SLG_SCL_GPIO };
+    volatile uint32_t *rst = pin(hw->reset);
+    char line[96];
+
+    (void)i2c_write_reg16(&cam_cci, IMX_ADDR, 0x0100, 0x00);       /* stream off */
+    delay(60000);                               /* (the frame under way finishes: up to 1/24 s) */
+    if (rst != NULL) {
+        rst[TLMM_IO / 4] = 0;                   /* reset low */
+        __asm__ volatile ("dsb sy" ::: "memory");
+    }
+    WR(camcc + hw->mclk_cbcr, RD(camcc + hw->mclk_cbcr) & ~1u);    /* MCLK off */
+    (void)i2c_write_reg16(&slg, SLG_ADDR, SLG_MATRIX_CONF_A, 0x00); /* every camera rail off */
+    __asm__ volatile ("dsb sy" ::: "memory");
+    snprintf(line, sizeof(line), "camera: %s down\n", hw->name);
+    camlog(line);
 }
 
 static void
