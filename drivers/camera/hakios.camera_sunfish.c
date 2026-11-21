@@ -19,6 +19,8 @@
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
+#include <vm/vm_kern.h>
+#include <machine/machine_routines.h>
 
 /* ---- inlined imx363_regs.h (build copies only the .c into bsd/dev) ---- */
 /* Generated from sm7150-mainline drivers/media/i2c/imx363.c (binned 2016x1512, 642 Mbps/lane, 24 MHz, 4-lane). */
@@ -979,6 +981,10 @@ csid0_init(void)
     CSID_WR(0x328, 1); CSID_WR(0x324, 0);             /* pixel drop */
     CSID_WR(0x330, 1); CSID_WR(0x32c, 0);             /* line drop */
     CSID_WR(0x308, 0);
+    if (cam_level >= 7) {                            /* vertical crop lines 0..767: a frame of 768 x 2520 B fits 2 MiB */
+        CSID_WR(0x320, (767u << 16) | 0u);
+        CSID_WR(0x300, CSID_RD(0x300) | (1u << 6));
+    }
     CSID_WR(0x300, CSID_RD(0x300) | (1u << 31));     /* RDI0 enable */
     /* CSI2 RX: 4 lanes (3), lane assign 0x3210, PHY 0, D-PHY; ECC correction + MISR */
     CSID_WR(0x100, 3u | (0x3210u << 4) | (0u << 20));
@@ -1013,6 +1019,188 @@ csid0_report(const char *when)
         when, CSID_RD(0x128), CSID_RD(0x12c), CSID_RD(0x130), CSID_RD(0x134),
         CSID_RD(0x378), CSID_RD(0x37c), CSID_RD(0x380), CSID_RD(0x3e0), CSID_RD(0x3e4), CSID_RD(0x390));
     camlog(line);
+}
+
+
+/* a camcc FABIA PLL (fabia_ops: OPMODE enable), as camcc_pll0_up, for any offset/config (PLL3 for the IFE clock) */
+static void
+camcc_fabia_up(uint32_t off, uint32_t l, uint32_t alpha, uint32_t pd_mask, uint32_t pd_val, uint32_t test_ctl, const char *name)
+{
+    vm_offset_t b = camcc + off;
+    int locked = 0;
+    char line[96];
+
+    if (RD(b + PLL2_MODE) & 1u) {
+        snprintf(line, sizeof(line), "camera: %s already running (mode %#x)\n", name, RD(b + PLL2_MODE));
+        camlog(line);
+        return;
+    }
+    WR(b + PLL2_L_VAL, l);
+    if (alpha) { WR(b + PLL2_FRAC, alpha); }
+    if (test_ctl) { WR(b + PLL_TEST_CTL, test_ctl); }
+    WR(b + PLL2_USER_CTL, (RD(b + PLL2_USER_CTL) & ~pd_mask) | pd_val);
+    WR(b + PLL2_MODE, RD(b + PLL2_MODE) | 0x800000u);   /* UPDATE_BYPASS */
+    WR(b + PLL2_MODE, RD(b + PLL2_MODE) | 4u);          /* RESET_N */
+    __asm__ volatile ("dsb sy" ::: "memory");
+    WR(b + PLL2_MODE, RD(b + PLL2_MODE) & ~1u);
+    WR(b + PLL2_OPMODE, 0);
+    WR(b + PLL2_MODE, RD(b + PLL2_MODE) | 4u);
+    __asm__ volatile ("dsb sy" ::: "memory");
+    delay(10);
+    WR(b + PLL2_OPMODE, 1);
+    __asm__ volatile ("dsb sy" ::: "memory");
+    for (int i = 0; i < 500; i++) {
+        if (RD(b + PLL2_MODE) & 0x80000000u) { locked = 1; break; }
+        delay(10);
+    }
+    WR(b + PLL2_USER_CTL, RD(b + PLL2_USER_CTL) | 0x7u);
+    WR(b + PLL2_MODE, RD(b + PLL2_MODE) | 1u);
+    __asm__ volatile ("dsb sy" ::: "memory");
+    snprintf(line, sizeof(line), "camera: %s %s (mode %#x)\n", name, locked ? "LOCKED" : "did NOT lock", RD(b + PLL2_MODE));
+    camlog(line);
+}
+
+/* ---- VFE0 (Titan 170 IFE0, 0xacaf000): RDI0 -> bus write master 0 -> DMA into memory (camss-vfe-17x.c) ----
+ * The camera AXI goes through the apps SMMU, which faults unmatched streams and refuses bypass: the buffer is
+ * shown at a 32-bit IOVA through a translating bank of our own (hakios_sm7150_smmu_pages_masked, Wi-Fi driver). */
+extern int hakios_sm7150_smmu_pages_masked(const uint32_t *sids, const uint32_t *masks, unsigned n, uint64_t iova, uint64_t pa, uint32_t pages);
+extern void hakios_sm7150_smmu_status(uint32_t *fsr, uint64_t *far, uint32_t *gfsr, uint32_t *gfsynr1);
+extern uint64_t kvtophys(vm_offset_t va);
+
+#define CAM_IOVA        0x10000000ULL
+#define CAM_BUF_SIZE    0x200000u               /* 2 MiB: one SMMU L3 stretch */
+#define CAM_LINE_BYTES  2520u                   /* 2016 px of MIPI-packed RAW10 */
+static vm_offset_t vfe0;
+static vm_offset_t cam_buf;
+static uint64_t cam_buf_pa;
+static int cam_smmu_bank = -1;
+#define VFE_RD(o)       RD(vfe0 + (o))
+#define VFE_WR(o, v)    WR(vfe0 + (o), (v))
+
+static void
+vfe0_init(void)
+{
+    char line[200];
+    uint32_t st = 0;
+    int i;
+
+    /* IFE0 core clock: PLL3 760 MHz -> OUT_EVEN 380 MHz (ife_0_clk_src src 6, /1); XO is far too slow for 4-lane RDI */
+    camcc_fabia_up(0x3000, 0x27, 0x9555, 0xf00u, 0x100u, 0x40000000u, "PLL3");
+    camcc_rcg_set(0xa010, 6, 1);
+    WR(camcc + 0xa028, RD(camcc + 0xa028) | 1u);
+    __asm__ volatile ("dsb sy" ::: "memory");
+
+    vfe0 = ml_io_map(0xacaf000UL, 0x4000);
+    if (vfe0 == 0) {
+        camlog("camera: VFE0 map failed\n");
+        return;
+    }
+    /* global reset (vfe_global_reset): only RESET_ACK unmasked; core, camif, bus, bus bdg, regs, testgen, dsp,
+     * idle cgc, rdi0-3; then poll IRQ status 0 bit31 and clear it */
+    VFE_WR(0x05c, 1u << 31);
+    __asm__ volatile ("dsb sy" ::: "memory");
+    VFE_WR(0x018, 0x3f9fu);
+    for (i = 0; i < 200; i++) {
+        st = VFE_RD(0x06c);
+        if (st & (1u << 31)) { break; }
+        delay(50);
+    }
+    VFE_WR(0x064, 1u << 31);
+    VFE_WR(0x058, 1u);
+
+    /* DMA buffer: 2 MiB, physically contiguous and 2 MiB aligned, filled with 0xa5 so the written part shows */
+    if (kmem_alloc_contig(kernel_map, &cam_buf, CAM_BUF_SIZE, PAGE_MASK, 0, (CAM_BUF_SIZE >> PAGE_SHIFT) - 1,
+        KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+        camlog("camera: no DMA buffer\n");
+        return;
+    }
+    memset((void *)cam_buf, 0xa5, CAM_BUF_SIZE);
+    for (uint32_t o = 0; o < CAM_BUF_SIZE; o += 64) {
+        __asm__ volatile ("dc civac, %0" : : "r" ((uint8_t *)cam_buf + o) : "memory");
+    }
+    __asm__ volatile ("dsb sy" ::: "memory");
+    cam_buf_pa = kvtophys(cam_buf);
+    {
+        /* the IFE's stream groups (downstream msm_cam_smmu_ife, de-duplicated: the masks overlap) */
+        static const uint32_t sids[3]  = { 0x900, 0x880, 0x820 };
+        static const uint32_t masks[3] = { 0x460, 0x460, 0x440 };
+        cam_smmu_bank = hakios_sm7150_smmu_pages_masked(sids, masks, 3, CAM_IOVA, cam_buf_pa, CAM_BUF_SIZE >> 12);
+    }
+
+    /* bus write master 0 (RDI0), as vfe_wm_start: frame-based (width/stride 0xff01), MIPI raw */
+    VFE_WR(0x226c, (1u << 1) | (1u << 7));      /* WM debug status cfg */
+    VFE_WR(0x2080, 0);                          /* addr sync: frame header */
+    VFE_WR(0x200c, 0xfffffu);                   /* no clock gating at the bus input */
+    VFE_WR(0x211c, 0);                          /* test bus off */
+    VFE_WR(0x2084, 0xffffffu);                  /* addr no sync */
+    VFE_WR(0x225c, 0xfu);                       /* burst limit */
+    VFE_WR(0x221c, 0xff01u);                    /* buffer width: frame-based */
+    VFE_WR(0x2220, 0);                          /* buffer height */
+    VFE_WR(0x2224, 0);                          /* packer */
+    VFE_WR(0x2228, 0xff01u);                    /* stride: frame-based */
+    VFE_WR(0x2248, 0); VFE_WR(0x224c, 1);       /* irq subsample: every frame */
+    VFE_WR(0x2250, 0); VFE_WR(0x2254, 1);       /* frame drop: keep every frame */
+    VFE_WR(0x2214, (uint32_t)CAM_IOVA);         /* image address */
+    VFE_WR(0x2258, 0);                          /* frame increment 0: frames overwrite the one buffer, never walk past it */
+    /* status latching (no interrupt line is enabled at the GIC) */
+    VFE_WR(0x05c, ~0u); VFE_WR(0x060, ~0u);
+    VFE_WR(0x2044, ~0u); VFE_WR(0x2048, ~0u); VFE_WR(0x204c, ~0u);
+    VFE_WR(0x2208, 1u | (1u << 1));             /* WM0 enable, MIPI raw */
+    __asm__ volatile ("dsb sy" ::: "memory");
+    VFE_WR(0x4ac, 1u << 1);                     /* reg update: RDI0 */
+    __asm__ volatile ("dsb sy" ::: "memory");
+    snprintf(line, sizeof(line),
+        "camera: VFE0 init - ife clk cfg %#x cbcr %#x, reset %s (st0 %#x), buf pa %#llx, smmu bank %d, WM0 cfg %#x addr %#x\n",
+        RD(camcc + 0xa014), RD(camcc + 0xa028), (st & (1u << 31)) ? "ack" : "TIMEOUT", st, cam_buf_pa, cam_smmu_bank,
+        VFE_RD(0x2208), VFE_RD(0x2214));
+    camlog(line);
+}
+
+/* after the sensor has streamed a while: bus/WM status, SMMU faults, then stop WM0 and see what landed in the buffer */
+static void
+vfe0_report(void)
+{
+    char line[220];
+    uint32_t fsr, gfsr, gfsynr1, written = 0, first = ~0u, last = 0;
+    uint64_t far;
+    const uint8_t *p = (const uint8_t *)cam_buf;
+
+    if (vfe0 == 0 || cam_buf == 0) {
+        return;
+    }
+    hakios_sm7150_smmu_status(&fsr, &far, &gfsr, &gfsynr1);
+    snprintf(line, sizeof(line),
+        "camera: VFE0 irq st0 %#x st1 %#x | bus st %#x %#x %#x | WM0 st %#x %#x | violation %#x | smmu fsr %#x far %#llx gfsr %#x gfsynr1 %#x\n",
+        VFE_RD(0x06c), VFE_RD(0x070), VFE_RD(0x205c), VFE_RD(0x2060), VFE_RD(0x2064), VFE_RD(0x2200), VFE_RD(0x2204),
+        VFE_RD(0x07c), fsr, far, gfsr, gfsynr1);
+    camlog(line);
+    VFE_WR(0x2208, 0);                          /* WM0 off */
+    VFE_WR(0x4ac, 1u << 1);
+    __asm__ volatile ("dsb sy" ::: "memory");
+    delay(100000);
+    for (uint32_t o = 0; o < CAM_BUF_SIZE; o += 64) {
+        __asm__ volatile ("dc civac, %0" : : "r" ((uint8_t *)cam_buf + o) : "memory");
+    }
+    __asm__ volatile ("dsb sy" ::: "memory");
+    for (uint32_t o = 0; o < CAM_BUF_SIZE; o++) {
+        if (p[o] != 0xa5) {
+            written++;
+            if (first == ~0u) { first = o; }
+            last = o;
+        }
+    }
+    snprintf(line, sizeof(line), "camera: FRAME BUFFER - %u of %u bytes written (first %#x, last %#x = %u lines of %u B)\n",
+        written, CAM_BUF_SIZE, first, last, last / CAM_LINE_BYTES, CAM_LINE_BYTES);
+    camlog(line);
+    if (written) {
+        uint32_t sum = 0, o0 = first;
+        for (uint32_t o = 0; o < 4096 && o0 + o < CAM_BUF_SIZE; o++) { sum += p[o0 + o]; }
+        snprintf(line, sizeof(line),
+            "camera: FRAME BUFFER - bytes @%#x: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x; mean of 4 KiB %u\n",
+            o0, p[o0], p[o0 + 1], p[o0 + 2], p[o0 + 3], p[o0 + 4], p[o0 + 5], p[o0 + 6], p[o0 + 7],
+            p[o0 + 8], p[o0 + 9], p[o0 + 10], p[o0 + 11], p[o0 + 12], p[o0 + 13], p[o0 + 14], p[o0 + 15], sum / 4096);
+        camlog(line);
+    }
 }
 
 static void
@@ -1114,6 +1302,7 @@ rear_sensor_stream(struct i2c *cci)
     csid0_report("+205ms");
     delay(500000);
     csid0_report("+705ms");
+    vfe0_report();
 }
 
 static void
@@ -1150,6 +1339,9 @@ rear_sensor_probe(struct i2c *slg)
     }
     if (cam_level >= 6) {
         csid0_init();                   /* M2b: CSID0 RDI0 <- VC0/RAW10, armed before stream-on */
+    }
+    if (cam_level >= 7) {
+        vfe0_init();                    /* M2b: VFE0 RDI0 write master -> DMA into a 2 MiB buffer */
     }
     delay(2000);
     /* reset high */

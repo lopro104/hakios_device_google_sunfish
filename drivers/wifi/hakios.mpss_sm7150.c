@@ -2712,6 +2712,151 @@ hakios_sm7150_smmu_pages(uint32_t sid, uint64_t iova, uint64_t pa, uint32_t page
 	return (g_smmu[(0x800 + 4 * smr_i) / 4] == ((1u << 31) | sid)) && ((g_smmu[(0xc00 + 4 * smr_i) / 4] >> 16) & 3u) == 0;
 }
 
+/*
+ * For the camera driver (hakios.camera_sunfish.c): like hakios_sm7150_smmu_pages, but for a device that writes on
+ * several stream IDs it does not tell us exactly (the IFE: downstream msm_cam_smmu_ife lists masked groups). One
+ * translating bank with `pages' 4 KiB pages of `pa' at a 32-bit `iova' (one 2 MiB stretch), and one MASKED SMR per
+ * (sid, mask) pair, all pointing at that bank. A group that overlaps a valid SMR someone else owns is skipped (a
+ * double match would be a stream-match conflict fault). Returns the bank, or -1. hakios_sm7150_smmu_status() reads
+ * that bank's fault state and the global fault syndrome back.
+ */
+static uint32_t g_cam_cbo;
+int hakios_sm7150_smmu_pages_masked(const uint32_t *sids, const uint32_t *masks, unsigned n, uint64_t iova, uint64_t pa, uint32_t pages);
+int
+hakios_sm7150_smmu_pages_masked(const uint32_t *sids, const uint32_t *masks, unsigned n, uint64_t iova, uint64_t pa, uint32_t pages)
+{
+	uint32_t idr0, idr1, idr2, nsmr, ncb, page, cb_base, pasize;
+	uint32_t smr_for[8];
+	uint8_t used[128] = { 0 }, taken_smr[128] = { 0 };
+	vm_offset_t pt = 0;
+	volatile uint64_t *t;
+	uint64_t pt_pa;
+	int cb = -1;
+	unsigned tries = 0, mapped = 0;
+
+	if (n == 0 || n > 8 || pages == 0 || pages > 512 - ((iova >> 12) & 511) || ((iova | pa) & 0xfff) != 0 || iova >= (1ull << 32)) {
+		return -1;
+	}
+	if (g_smmu == NULL) {
+		g_smmu = (volatile uint32_t *)ml_io_map_unmappable(APPS_SMMU, 0x100000, WIMG_IO);
+		if (g_smmu == NULL) {
+			return -1;
+		}
+	}
+	idr0 = g_smmu[0x20 / 4];
+	idr1 = g_smmu[0x24 / 4];
+	idr2 = g_smmu[0x28 / 4];
+	nsmr = MIN(idr0 & 0xffu, 128u);
+	ncb = MIN(idr1 & 0xffu, 128u);
+	page = (idr1 >> 31) ? 0x10000 : 0x1000;
+	cb_base = (1u << (((idr1 >> 28) & 7u) + 1u)) * page;
+	pasize = MIN((idr2 >> 4) & 0xfu, 2u);
+	/* every group: an SMR of its own, or skipped if a valid SMR already covers any of its streams */
+	for (unsigned k = 0; k < n; k++) {
+		uint32_t id = sids[k] & 0x7fffu, mk = masks[k] & 0x7fffu, conflict = ~0u, mine = ~0u, free_i = ~0u;
+
+		smr_for[k] = ~0u;
+		for (uint32_t i = 0; i < nsmr; i++) {
+			uint32_t smr = g_smmu[(0x800 + 4 * i) / 4], s2cr = g_smmu[(0xc00 + 4 * i) / 4];
+			uint32_t sid_i = smr & 0x7fffu, mask_i = (smr >> 16) & 0x7fffu;
+
+			if (!(smr & (1u << 31))) {
+				if (free_i == ~0u && !taken_smr[i]) {
+					free_i = i;
+				}
+				continue;
+			}
+			if (((s2cr >> 16) & 3u) == 0 && (s2cr & 0xffu) < 128) {
+				used[s2cr & 0xffu] = 1;
+			}
+			if (sid_i == id && mask_i == mk) {
+				mine = i;                       /* the same group already has an entry: take it over */
+			} else if ((((id ^ sid_i) & ~(mk | mask_i)) & 0x7fffu) == 0) {
+				conflict = i;
+			}
+		}
+		if (mine != ~0u) {
+			smr_for[k] = mine;
+		} else if (conflict != ~0u) {
+			ev("SMMU cam: group %#x/%#x overlaps smr%u %#x s2cr %#x - skipped", id, mk, conflict,
+			    g_smmu[(0x800 + 4 * conflict) / 4], g_smmu[(0xc00 + 4 * conflict) / 4]);
+		} else if (free_i != ~0u) {
+			smr_for[k] = free_i;
+			taken_smr[free_i] = 1;
+		} else {
+			ev("SMMU cam: no free SMR for %#x/%#x", id, mk);
+		}
+	}
+	if (kmem_alloc_contig(kernel_map, &pt, 0x4000, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		return -1;
+	}
+	t = (volatile uint64_t *)pt;
+	pt_pa = kvtophys(pt);
+	t[(iova >> 39) & 511] = (pt_pa + 0x1000) | 3;                           /* L0 -> L1 */
+	t[0x1000 / 8 + ((iova >> 30) & 511)] = (pt_pa + 0x2000) | 3;            /* L1 -> L2 */
+	t[0x2000 / 8 + ((iova >> 21) & 511)] = (pt_pa + 0x3000) | 3;            /* L2 -> L3 */
+	for (uint32_t i = 0; i < pages; i++) {
+		t[0x3000 / 8 + ((iova >> 12) & 511) + i] = (pa + ((uint64_t)i << 12)) | (1u << 10) | (2u << 8) | (1u << 6) | 3u;
+	}
+	for (int o = 0; o < 0x4000; o += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" ((uint8_t *)pt + o) : "memory");
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (int b = (int)ncb - 1; b >= 0 && tries < 3; b--) {
+		uint32_t cbo = cb_base + (uint32_t)b * page;
+		if (used[b] || b == g_smmu_bank || cbo + page > 0x100000 || (g_smmu[(cbo + CB_SCTLR) / 4] & 1u)) {
+			continue;
+		}
+		tries++;
+		if (wlfw_smmu_bank_setup(page, cbo, (uint32_t)b, pasize, pt_pa)) {
+			cb = b;
+			g_cam_cbo = cbo;
+			break;
+		}
+	}
+	if (cb < 0) {
+		ev("SMMU cam: no context bank taken");
+		return -1;
+	}
+	for (unsigned k = 0; k < n; k++) {
+		uint32_t i = smr_for[k], want = (1u << 31) | ((masks[k] & 0x7fffu) << 16) | (sids[k] & 0x7fffu);
+
+		if (i == ~0u) {
+			continue;
+		}
+		smmu_wr(0xc00 + 4 * i, (uint32_t)cb);                                   /* S2CR: translate, bank */
+		smmu_wr(0x800 + 4 * i, want);                                           /* SMR: valid, masked */
+		ev("SMMU cam: %#x/%#x -> smr%u %#x s2cr %#x (bank %d)", sids[k], masks[k], i, g_smmu[(0x800 + 4 * i) / 4],
+		    g_smmu[(0xc00 + 4 * i) / 4], cb);
+		if (g_smmu[(0x800 + 4 * i) / 4] == want && ((g_smmu[(0xc00 + 4 * i) / 4] >> 16) & 3u) == 0) {
+			mapped++;
+		}
+	}
+	ev("SMMU cam: bank %d, %u of %u stream groups mapped, %u pages iova %#llx -> pa %#llx", cb, mapped, n, pages, iova, pa);
+	return mapped ? cb : -1;
+}
+
+/* the camera bank's fault status (FSR, FAR) and the global fault status + syndrome (GFSYNR1 low half = the stream) */
+void hakios_sm7150_smmu_status(uint32_t *fsr, uint64_t *far, uint32_t *gfsr, uint32_t *gfsynr1);
+void
+hakios_sm7150_smmu_status(uint32_t *fsr, uint64_t *far, uint32_t *gfsr, uint32_t *gfsynr1)
+{
+	*fsr = 0;
+	*far = 0;
+	*gfsr = 0;
+	*gfsynr1 = 0;
+	if (g_smmu == NULL) {
+		return;
+	}
+	if (g_cam_cbo != 0) {
+		*fsr = g_smmu[(g_cam_cbo + CB_FSR) / 4];
+		*far = smmu_rd64(g_cam_cbo + 0x60);
+	}
+	*gfsr = g_smmu[0x48 / 4];
+	*gfsynr1 = g_smmu[0x54 / 4];
+}
+
+
 #define CE_RX_BUF       2048
 
 /*
