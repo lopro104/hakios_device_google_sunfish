@@ -2316,7 +2316,13 @@ mic_up(void)
 	}
 	/* the TDM pins to the port (function 1, 8 mA, no pull, as Android's ter_tdm_active) */
 	for (unsigned i = 0; i < 4; i++) {
-		mic.west[i] = ml_io_map(TLMM_WEST_PA + 0x1000ul * (53 + i), 0x1000);
+		/* (mapped once: `mic' is wiped every start, and a map per start ran the 8 MB I/O map space out -- a panic) */
+		static vm_offset_t west_pins[4];
+
+		if (west_pins[i] == 0) {
+			west_pins[i] = ml_io_map(TLMM_WEST_PA + 0x1000ul * (53 + i), 0x1000);
+		}
+		mic.west[i] = west_pins[i];
 		if (mic.west[i] != 0) {
 			mic.pins_before[i] = *(volatile uint32_t *)mic.west[i];
 			*(volatile uint32_t *)mic.west[i] = 1u << 2 | 3u << 6;

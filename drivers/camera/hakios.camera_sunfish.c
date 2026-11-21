@@ -436,6 +436,29 @@ extern void hakios_spmi_unlock(void);
 static vm_offset_t arb_core, arb_cnfg;
 
 /* write one byte to (slave, peripheral<<8|reg) of a PMIC through the arbiter; 0 ok */
+/*
+ * A channel's registers, mapped once: the I/O map space is 8 MB of 16 KB pages for every driver, and a map per call
+ * (the probe makes ~35) used up half a megabyte of it -- the microphone's next map then failed (kmem_alloc panic).
+ */
+static vm_offset_t
+spmi_channel(uint32_t n)
+{
+    static struct { uint32_t n; vm_offset_t va; } chan[8];
+    static unsigned chans;
+
+    for (unsigned i = 0; i < chans; i++) {
+        if (chan[i].n == n) {
+            return chan[i].va;
+        }
+    }
+    if (chans == sizeof(chan) / sizeof(chan[0])) {
+        return 0;
+    }
+    chan[chans].n = n;
+    chan[chans].va = ml_io_map(ARB_CHNLS_PHYS + 0x10000UL * n, 0x1000);
+    return chan[chans].va != 0 ? chan[chans++].va : 0;
+}
+
 static int
 spmi_write8(unsigned slave, unsigned periph, unsigned reg, uint8_t value)
 {
@@ -467,7 +490,7 @@ spmi_write8(unsigned slave, unsigned periph, unsigned reg, uint8_t value)
     if (found == ~0u) {
         return -2;
     }
-    ch = ml_io_map(ARB_CHNLS_PHYS + 0x10000UL * found, 0x1000);
+    ch = spmi_channel(found);
     if (ch == 0) {
         return -1;
     }
@@ -514,7 +537,7 @@ spmi_read8(unsigned slave, unsigned periph, unsigned reg)
     if (found == ~0u) {
         return -2;
     }
-    ch = ml_io_map(ARB_CHNLS_PHYS + 0x10000UL * found, 0x1000);
+    ch = spmi_channel(found);
     if (ch == 0) {
         return -1;
     }
