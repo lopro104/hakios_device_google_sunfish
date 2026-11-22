@@ -1193,7 +1193,8 @@ to_memory(vm_offset_t start, vm_size_t size)
 	settle();
 }
 
-#define SPACE_TABLES            1024           /* 2 GB of addresses, were they all in use */
+#define SPACE_TABLES            2064           /* 4 GB of addresses: 2048 2 MB tables, the 4 they hang off, and the root (the
+                                               * whole 32-bit window; 1024 = 2 GB ran out under Maps on thyme, 7ee01dd) */
 
 struct gpu_space {
 	const char *name;
