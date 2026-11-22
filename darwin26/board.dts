@@ -10,7 +10,7 @@
 	// Nothing yet: a feature is listed once its driver has been seen to work on this board under Darwin 26/27
 	// (Documentation/porting.md goes through them in the order to try). The Darwin 16.5 port of this phone
 	// (lopro104/hakios_device_google_sunfish) has drivers for all of them; none is ported yet.
-	features = "cpufreq-epss", "touch-ftm5", "buttons-pmic", "battery-pm6150", "wifi-wcn3990"; // cpufreq-epss: either layout (soc.dtsi cpufreq { block = "osm" })
+	features = "cpufreq-epss", "touch-ftm5", "buttons-pmic", "battery-pm6150", "wifi-wcn3990", "gpu-a618"; // cpufreq-epss: either layout (soc.dtsi cpufreq { block = "osm" })
 
 	// The panel: qcom,mdss_dsi_sofef01_sdc_1080p_cmd ("sofef01 cmd mode dsi sdc panel")
 	backlight {
