@@ -2096,9 +2096,13 @@ rear_sensor_stream(struct i2c *cci)
         hw->height, s);
     camlog(line);
     if (cam_level >= CAM_SERVE) {
-        delay(200000);
-        csid0_report("+205ms");
-        csiphy_report("+205ms");
+        static unsigned reported;
+
+        if (reported++ < 2) {                   /* the receive path's counters, the first two times (debug) */
+            delay(200000);
+            csid0_report("+205ms");
+            csiphy_report("+205ms");
+        }
         return;
     }
     csid0_report("+5ms");
@@ -2408,10 +2412,21 @@ camera_init(void)
         }
     }
 
-    /* at 90 s, so the result reaches the run log (early kernel messages are lost); the camera is idle until then */
-    camlog("camera: cam set; probe in 90 s\n");
-    cam_call = thread_call_allocate(camera_run, NULL);
-    clock_interval_to_deadline(90, NSEC_PER_SEC, &deadline);
+    /*
+     * The probe's delay (boot-arg cam_after=S): 15 s with cam=5 (the camera is there for Camera.app soon after the home
+     * screen; its sensors power up only on demand), 90 s for the bring-up steps, whose messages must reach the run log
+     * (early kernel messages are lost).
+     */
+    {
+        uint32_t after = cam_level >= CAM_SERVE ? 15 : 90;
+        char line[64];
+
+        (void)PE_parse_boot_argn("cam_after", &after, sizeof(after));
+        snprintf(line, sizeof(line), "camera: cam set; probe in %u s\n", after);
+        camlog(line);
+        cam_call = thread_call_allocate(camera_run, NULL);
+        clock_interval_to_deadline(after, NSEC_PER_SEC, &deadline);
+    }
     thread_call_enter_delayed(cam_call, deadline);
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, camera_init);
