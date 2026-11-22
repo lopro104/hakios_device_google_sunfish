@@ -45,6 +45,18 @@
 	};
 
 
+	// The cores' frequency hardware: the OSM firmware's layout (qcom,cpufreq-hw era; sdmmagpie.dtsi), two groups --
+	// cores 0-5 (Cortex-A55) and 6-7 (Cortex-A76) -- 0x2800 apart. The Darwin 16.5 port's cpufreq_osm ran on
+	// these on the phone (devices/sunfish drivers/power/hakios.cpufreq_osm.c): table +0x110, rows 32 bytes apart,
+	// the row asked for +0x920.
+	cpufreq {
+		block = "osm";
+		epss = <0x18323000>;
+		epss-domain-size = <0x1400>;
+		domains = <0x18323000 0x18325800>;
+		domain-cores = <6 2>;
+	};
+
 	// What the loader (arch/arm64/boot/) tells the kernel of the machine, for boards with a loader { } section.
 	platform {
 		io-base = <0x00400000>;         // one window over the SoC's peripherals, never 0 (the 16.5 loader's, run on
