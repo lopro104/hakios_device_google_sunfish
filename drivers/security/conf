@@ -3,3 +3,7 @@
 driver QSEE_SM7150
 	file    bsd/dev/hakios.qsee_sm7150.c
 	help    the secure world for a program: /dev/hakios-tz, QSEE calls only, our own buffers only (qsee=1)
+
+driver PASSCODE
+	file    bsd/dev/hakios.passcode.c
+	help    a device passcode for Touch ID (redfin's sweet_passcode.c): an authentication gate, never an encryption key; kern.sweet_passcode, default 0 = none
