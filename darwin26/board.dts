@@ -1,0 +1,72 @@
+/dts-v1/;
+
+// Google Pixel 4a. Started by tools/boards.py new from phone.dts.
+// Every value here is to be checked against the device before it is relied on (Documentation/porting.md).
+/ {
+	name = "sunfish";                       // what the loader puts in /chosen/darwin-board
+	description = "Google Pixel 4a";
+	soc = "sm7150";
+
+	// Nothing yet: a feature is listed once its driver has been seen to work on this board under Darwin 26/27
+	// (Documentation/porting.md goes through them in the order to try). The Darwin 16.5 port of this phone
+	// (lopro104/hakios_device_google_sunfish) has drivers for all of them; none is ported yet.
+	features = <>;
+
+	// The panel: qcom,mdss_dsi_sofef01_sdc_1080p_cmd ("sofef01 cmd mode dsi sdc panel")
+	backlight {
+		type = "dcs";
+		panel-mode = "command";
+		min = <4>;
+		max = <1023>;
+		bytes = <2>;
+		byte-order = "lsb-first";
+	};
+
+	// The keys on the PMICs, for the feature "buttons-pmic": SPMI slave << 8 | the high byte of the
+	// peripheral's registers. Power and volume down are the PM6150's PON (slave 0, 0x800: what the 16.5 port's
+	// pm6150_keys driver reads); the tree's guess was the PM6150L's. Volume up: TO CHECK (gpio_keys).
+	buttons {
+		pon = <0x008>;
+		pon-name = "the PM6150's power-on block";
+		volume-up = <0x4c1>;
+		volume-up-name = "GPIO2 of the PM6150L";
+	};
+
+	// The PMIC's real-time clock, read once at boot (rtc=0 leaves it alone): SPMI slave << 8 | the high byte
+	// of its RTC_RW block's registers.
+	rtc {
+		peripheral = <0x060>;
+		name = "the PM6150's RTC";
+	};
+
+	// The audio DSP, for the feature "adsp": its reserved memory is from the tree; the directory with
+	// this phone's adsp.mdt and its parts is yours to name (arch/arm64/boot/dts/_template/board.dts).
+	// adsp {
+		// firmware = "fw-audio-sunfish";
+		// memory = <0x96b00000>;
+		// memory-size = <0x02200000>;
+	// };
+
+	// The microphones' codec, for the feature "mic-wcd938x": its reset pin is from the tree.
+	mic {
+		codec-reset = <29>;
+	};
+
+	// The loader under this phone's U-Boot (lopro104's hakios-uefi branch, sunfish): it tells boards apart by the
+	// framebuffer U-Boot reports (the 16.5 loader's platform_sunfish: 1080 x 2340 at 0x9c000000). No log partition.
+	loader {
+		fb-base = <0x9C000000>;
+		log-other-cpu;
+	};
+
+	// The first Darwin 26/27 runs: the kernel on a big core (7, a Cortex-A76) as on 16.5, the EL1 virtual timer on
+	// PPI 3 = interrupt 19 (the tree's arm,armv8-timer; with 27 the kernel waits for ever at its first timed sleep),
+	// and the command-mode panel's autorefresh so the screen follows the framebuffer.
+	boot {
+		fastboot-product = "sunfish";
+		cpus = <8>;
+		bootargs = "bootcpu=7", "vtimer_intid=19", "panel_autorefresh=1", "gpu=0", "metal=0", "wifi=0",
+		           "adsp=0", "sound=0", "cam=0", "touchscreen=0", "buttons=0", "battery=0",
+		           "launchd_unsecure_cache=1", "loader_return_after=0";
+	};
+};
