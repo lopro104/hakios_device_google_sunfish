@@ -10,7 +10,7 @@
 	// Nothing yet: a feature is listed once its driver has been seen to work on this board under Darwin 26/27
 	// (Documentation/porting.md goes through them in the order to try). The Darwin 16.5 port of this phone
 	// (lopro104/hakios_device_google_sunfish) has drivers for all of them; none is ported yet.
-	features = "cpufreq-epss", "touch-ftm5"; // cpufreq-epss: either layout (soc.dtsi cpufreq { block = "osm" })
+	features = "cpufreq-epss", "touch-ftm5", "buttons-pmic"; // cpufreq-epss: either layout (soc.dtsi cpufreq { block = "osm" })
 
 	// The panel: qcom,mdss_dsi_sofef01_sdc_1080p_cmd ("sofef01 cmd mode dsi sdc panel")
 	backlight {
@@ -24,7 +24,7 @@
 
 	// The keys on the PMICs, for the feature "buttons-pmic": SPMI slave << 8 | the high byte of the
 	// peripheral's registers. Power and volume down are the PM6150's PON (slave 0, 0x800: what the 16.5 port's
-	// pm6150_keys driver reads); the tree's guess was the PM6150L's. Volume up: TO CHECK (gpio_keys).
+	// pm6150_keys driver reads, run on the phone); volume up GPIO2 of the PM6150L (SID 4, status 0xc110, low pressed).
 	buttons {
 		pon = <0x008>;
 		pon-name = "the PM6150's power-on block";
@@ -66,7 +66,7 @@
 		fastboot-product = "sunfish";
 		cpus = <8>;
 		bootargs = "bootcpu=7", "vtimer_intid=19", "panel_autorefresh=1", "gpu=0", "metal=0", "wifi=0",
-		           "adsp=0", "sound=0", "cam=0", "touchscreen=1", "touch_delay=3", "buttons=0", "battery=0",
+		           "adsp=0", "sound=0", "cam=0", "touchscreen=1", "touch_delay=3", "buttons=1", "battery=0",
 		           "launchd_unsecure_cache=1", "loader_return_after=0";
 	};
 };
