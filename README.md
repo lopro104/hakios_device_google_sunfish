@@ -1,5 +1,10 @@
 # Device: Qualcomm Technologies, Inc. SDMMAGPIE SoC (sunfish)
 
+> **iOS 27.2 runs on the Pixel 4a**: lock screen and home screen, touch, buttons, battery, Wi-Fi with SSH, and the
+> Adreno 618 drawing Liquid Glass through Metal. The board package for it is [`darwin26/`](darwin26/README.md); the
+> kernel is lopro104/hakios_kernel_google_sunfish, branch `sunfish-27`. The rest of this repository is the Darwin
+> 16.5 port (the old tree).
+
 Made by `tools/new-device.py` on 2026-11-04, from the file dtb. Edit it as the port goes.
 
 | What | Value |
