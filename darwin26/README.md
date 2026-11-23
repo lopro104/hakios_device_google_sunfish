@@ -15,6 +15,7 @@ Pixel 4a's drivers is lopro104/hakios_kernel_google_sunfish, branch `sunfish-27`
 | Touch, buttons, battery | `touchscreen=1 touch_delay=3 buttons=1 pm6150_battery=1` |
 | Wi-Fi | `mpss=1 wlanprobe=8 mpss_no_shutdown=1`: scan, WPA2 join from Settings, DHCP, Safari, SSH. Firmware read from `darwin`'s fourth container (the 16.5 install's) on `/hakios/fw`. |
 | GPU | `gpu=1 metal=1 metal_procs=backboardd`: the Adreno 618 and the Metal plug-in built `CHIP=618` (`HAKIOS_METAL_CHIP=618 darwin/userland/metal.sh`); backboardd draws with Metal, Liquid Glass included. SpringBoard and apps still draw in software. |
+| Storage | `ufs_write=2 var_store=1 var_store_dev=dsudata var_store_keychain=1`: `/private/var` (settings, joined networks, the keychain, unencrypted) packed into the DSU install's `userdata_gsi` (2 GiB, two 1 GiB slots) every 5 minutes and unpacked at boot. Not into `darwin`: from 8 GiB on it is iOS 16.5's data volume. A DSU reinstall empties it. |
 | Not yet | Flashlight, sound, camera, cellular, Bluetooth, the system in the phone's own partition. |
 
 ## How it was made
