@@ -11,11 +11,11 @@ Pixel 4a's drivers is lopro104/hakios_kernel_google_sunfish, branch `sunfish-27`
 | Boot | From RAM: `fastboot boot` of U-Boot + the HakiOS loader, nothing flashed. Lock screen about 80 s after the kernel starts. |
 | System | An Android DSU image (installed with Android's DSU, served by the loader as `ufs=2`; `init/stage0dsu.c`). The 4.29 GB system image does not fit the 3.87 GB RAM window, and `darwin` still holds the 16.5 install. |
 | CPU | 8 cores, `bootcpu=7`, OSM frequency scaling (`cpufreq=1`: 1804 / 2208 MHz). |
-| Display | Command-mode panel, `panel_autorefresh=1`. No brightness control yet. |
+| Display | Command-mode panel, `panel_autorefresh=1`; brightness slider with `backlight=2` (DCS 0x51, 10 bits, high byte first). |
 | Touch, buttons, battery | `touchscreen=1 touch_delay=3 buttons=1 pm6150_battery=1` |
 | Wi-Fi | `mpss=1 wlanprobe=8 mpss_no_shutdown=1`: scan, WPA2 join from Settings, DHCP, Safari, SSH. Firmware read from `darwin`'s fourth container (the 16.5 install's) on `/hakios/fw`. |
 | GPU | `gpu=1 metal=1 metal_procs=backboardd`: the Adreno 618 and the Metal plug-in built `CHIP=618` (`HAKIOS_METAL_CHIP=618 darwin/userland/metal.sh`); backboardd draws with Metal, Liquid Glass included. SpringBoard and apps still draw in software. |
-| Not yet | Brightness, flashlight, sound, camera, cellular, Bluetooth, the system in the phone's own partition. |
+| Not yet | Flashlight, sound, camera, cellular, Bluetooth, the system in the phone's own partition. |
 
 ## How it was made
 

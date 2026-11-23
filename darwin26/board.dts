@@ -19,7 +19,7 @@
 		min = <4>;
 		max = <1023>;
 		bytes = <2>;
-		byte-order = "lsb-first";
+		byte-order = "msb-first";   // high byte first: the 16.5 port's cmdbright, which ran on this panel
 	};
 
 	// The keys on the PMICs, for the feature "buttons-pmic": SPMI slave << 8 | the high byte of the
